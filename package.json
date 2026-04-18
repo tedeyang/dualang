@@ -8,7 +8,8 @@
     "build:dev": "node build.mjs --dev",
     "watch": "node build.mjs --watch",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepare": "git config core.hooksPath .githooks"
   },
   "devDependencies": {
     "chrome-types": "^0.1.425",

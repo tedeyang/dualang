@@ -1,0 +1,49 @@
+#!/bin/sh
+# Pre-commit hook: block commits containing real API keys
+# Scans staged files for sk-... patterns that look like real keys
+
+set -e
+
+# Patterns that are NOT real keys (placeholders, test keys, docs)
+EXCLUDE_PATTERNS='sk-xxxx|sk-test|sk-your-|sk-kimi-test|sk-sf-test|sk-sf-fast|sk-sf-fallback|sk-sf-hedge|sk-sf-not-called|sk-sf-both-fail|sk-sf-race'
+
+# Get list of staged files (excluding deleted)
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+
+if [ -z "$STAGED_FILES" ]; then
+    exit 0
+fi
+
+FOUND=""
+
+for file in $STAGED_FILES; do
+    # Skip binary files and generated files
+    case "$file" in
+        *.png|*.jpg|*.jpeg|*.gif|*.ico|*.svg|*.woff|*.woff2|*.ttf|*.eot)
+            continue
+            ;;
+    esac
+
+    # Scan staged content for real-looking API keys
+    # Pattern: sk- followed by 20+ alphanumeric chars
+    MATCHES=$(git show ":$file" 2>/dev/null | grep -nE "sk-[a-zA-Z0-9]{20,}" | grep -vE "$EXCLUDE_PATTERNS" || true)
+
+    if [ -n "$MATCHES" ]; then
+        FOUND="$FOUND\n  $file:\n$MATCHES"
+    fi
+done
+
+if [ -n "$FOUND" ]; then
+    echo "========================================"
+    echo "ERROR: Potential API key detected!"
+    echo ""
+    echo "The following real-looking API keys were found in staged files:"
+    printf "%b\n" "$FOUND"
+    echo ""
+    echo "If these are intentional (e.g. in .gitignored files),"
+    echo "use 'git commit --no-verify' to bypass this check."
+    echo "========================================"
+    exit 1
+fi
+
+exit 0
