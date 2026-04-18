@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect } from 'vitest';
-import { isAlreadyTargetLanguage, shouldSkipContent, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, rebuildParagraphs } from './utils';
+import { isAlreadyTargetLanguage, shouldSkipContent, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, rebuildParagraphs, splitParagraphsByDom } from './utils';
 
 // ========== isAlreadyTargetLanguage ==========
 
@@ -338,5 +338,93 @@ describe('rebuildParagraphs', () => {
     expect(paras.length).toBe(3);
     // 6 句平均 2 句/段
     expect(paras[0].endsWith('you!')).toBe(true);
+  });
+});
+
+// ========== splitParagraphsByDom ==========
+
+describe('splitParagraphsByDom', () => {
+  function el(html: string): Element {
+    const div = document.createElement('div');
+    div.innerHTML = html;
+    return div;
+  }
+
+  it('单段纯文本：一个 fragment', () => {
+    const parts = splitParagraphsByDom(el('Hello world'));
+    expect(parts.length).toBe(1);
+    expect(parts[0].textContent).toBe('Hello world');
+  });
+
+  it('文本节点里 \\n\\n 拆成两段', () => {
+    // innerHTML 里 \n\n 会保留在 text node 里
+    const node = document.createElement('div');
+    node.appendChild(document.createTextNode('First paragraph.\n\nSecond paragraph.'));
+    const parts = splitParagraphsByDom(node);
+    expect(parts.length).toBe(2);
+    expect(parts[0].textContent).toBe('First paragraph.');
+    expect(parts[1].textContent).toBe('Second paragraph.');
+  });
+
+  it('保留链接 HTML', () => {
+    const node = document.createElement('div');
+    node.appendChild(document.createTextNode('Click '));
+    const a = document.createElement('a');
+    a.href = '/foo';
+    a.textContent = '#tag';
+    node.appendChild(a);
+    node.appendChild(document.createTextNode(' now.\n\nSecond.'));
+    const parts = splitParagraphsByDom(node);
+    expect(parts.length).toBe(2);
+    const frag0 = document.createElement('div');
+    frag0.appendChild(parts[0]);
+    expect(frag0.querySelector('a')?.getAttribute('href')).toBe('/foo');
+    expect(frag0.textContent).toBe('Click #tag now.');
+    expect(parts[1].textContent).toBe('Second.');
+  });
+
+  it('连续 <br><br> 视为段落分隔', () => {
+    const parts = splitParagraphsByDom(el('A<br><br>B'));
+    expect(parts.length).toBe(2);
+    expect(parts[0].textContent).toBe('A');
+    expect(parts[1].textContent).toBe('B');
+  });
+
+  it('单个 <br> 保留为行内换行，不分段', () => {
+    const parts = splitParagraphsByDom(el('Line 1<br>Line 2'));
+    expect(parts.length).toBe(1);
+    const frag = document.createElement('div');
+    frag.appendChild(parts[0]);
+    expect(frag.querySelector('br')).not.toBeNull();
+  });
+
+  it('纯空白段落被过滤', () => {
+    const node = document.createElement('div');
+    node.appendChild(document.createTextNode('Content.\n\n   \n\nMore.'));
+    const parts = splitParagraphsByDom(node);
+    expect(parts.length).toBe(2);
+    expect(parts[0].textContent).toBe('Content.');
+    expect(parts[1].textContent).toBe('More.');
+  });
+
+  it('3 段实测：含 emoji img 和 @mention', () => {
+    const node = document.createElement('div');
+    node.appendChild(document.createTextNode('First '));
+    const img = document.createElement('img');
+    img.alt = '🔥';
+    node.appendChild(img);
+    node.appendChild(document.createTextNode('\n\nSecond.\n\nThird '));
+    const mention = document.createElement('a');
+    mention.textContent = '@user';
+    node.appendChild(mention);
+    const parts = splitParagraphsByDom(node);
+    expect(parts.length).toBe(3);
+    const holder = document.createElement('div');
+    holder.appendChild(parts[0]);
+    expect(holder.querySelector('img')?.alt).toBe('🔥');
+    expect(parts[1].textContent).toBe('Second.');
+    const holder2 = document.createElement('div');
+    holder2.appendChild(parts[2]);
+    expect(holder2.textContent).toBe('Third @user');
   });
 });

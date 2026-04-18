@@ -31,11 +31,11 @@
         <label for="preset">模型提供方</label>
         <select id="preset">
           <optgroup label="⭐ 推荐（bench v2 实测）">
+            <option value="siliconflow-glm-4-9b">SiliconFlow GLM-4-9B · 1.9s · 质量 8.7 · 免费（默认）</option>
             <option value="moonshot-v1-8k">Moonshot v1-8k · 1.8s · 质量 8.9（需付费 Key）</option>
-            <option value="siliconflow-glm-4-9b">SiliconFlow GLM-4-9B · 1.9s · 质量 8.7 · 免费</option>
           </optgroup>
-          <optgroup label="免费主力">
-            <option value="siliconflow-qwen2.5-7b">SiliconFlow Qwen2.5-7B · ~1.5s · 质量 8.8 · 低温专用</option>
+          <optgroup label="其他免费（有局限）">
+            <option value="siliconflow-qwen2.5-7b">SiliconFlow Qwen2.5-7B · ~1.5s · 禁流式（CJK 偶发乱码）、数字易错</option>
             <option value="siliconflow-qwen3-8b">SiliconFlow Qwen3-8B · 4.0s · 质量 8.5</option>
           </optgroup>
           <optgroup label="离线（无需 Key）">
@@ -84,11 +84,16 @@
       </div>
       <p class="hint" style="margin-top:-8px; margin-bottom:10px;">关闭后每条推文显示「译」按钮手动触发</p>
 
-      <div class="form-group toggle-group">
-        <label class="toggle"><input type="checkbox" id="bilingualMode"><span class="slider"></span></label>
-        <span class="toggle-label">保留原文对照</span>
+      <div class="form-group">
+        <label for="displayMode">展示模式</label>
+        <select id="displayMode">
+          <option value="append">译文下方（保留原文）</option>
+          <option value="translation-only">仅译文（不显示原文）</option>
+          <option value="inline">段落对照（原文 + 译文逐段交错）</option>
+          <option value="bilingual">整体对照（原文 + 译文分块）</option>
+        </select>
+        <p class="hint">模式切换后，已翻译的推文保留旧模式；刷新页面可全量应用新模式。</p>
       </div>
-      <p class="hint" style="margin-top:-8px; margin-bottom:4px;">开启后在译文上方显示原文段落</p>
     </div>
 
     <!-- ===== Tab: 兜底 & 加速 ===== -->
@@ -105,9 +110,9 @@
           <select id="fallbackPreset">
             <optgroup label="⭐ 推荐兜底">
               <option value="siliconflow-glm-4-9b">SiliconFlow GLM-4-9B · 1.9s · 最稳 · 免费</option>
-              <option value="siliconflow-qwen2.5-7b">SiliconFlow Qwen2.5-7B · ~1.5s · 低温专用 · 免费</option>
             </optgroup>
             <option value="siliconflow-qwen3-8b">SiliconFlow Qwen3-8B · 4.0s · 免费</option>
+            <option value="siliconflow-qwen2.5-7b">SiliconFlow Qwen2.5-7B · 禁流式、数字易错、仅降级备用</option>
             <option value="custom">自定义</option>
           </select>
         </div>

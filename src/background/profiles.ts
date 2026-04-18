@@ -156,13 +156,16 @@ const QWEN3_PROFILE: ProviderProfile = {
 //   - 温度敏感：实测 T=0.3 在 280+ 字符输入上约 30% 概率陷入退化循环，4422 token 爆 max_tokens；
 //     T=0.7/1.0 更不稳定。T=0.1 是唯一能稳定处理长文本的温度（bench v2 实测）。
 //     并且 T=0.1 也减少短文本的数字类错误（如 "2028 年"→"208 年"）。
+//   - 流式输出偶发乱码（输出里出现 U+FFFD / `�`）：SiliconFlow 上的 Qwen2.5-7B 在 CJK
+//     翻译中有小概率在 SSE 分片边界切断多字节 UTF-8 字符，服务端下发时已带 `�`。
+//     禁用 streaming 强制走 `response.json()` 整包解码，这个问题消失。
 const QWEN_LEGACY_PROFILE: ProviderProfile = {
   id: 'qwen-legacy',
   matchModel: /qwen/i,  // 排序放在 QWEN3 之后，先匹配 qwen3，兜住 qwen2.5 / qwen1.5 / Pro/Qwen 等
   endpointPath: '/chat/completions',
-  temperature: () => 0.1,  // ← 关键修复：从 0.3 降到 0.1
+  temperature: () => 0.1,  // 从 0.3 降到 0.1：bench v2 实测稳定门槛
   thinkingControl: 'omit',
-  supportsStreaming: true,
+  supportsStreaming: false,  // 流式下发偶发 `�` 乱码，禁用
   systemPromptSingle: SINGLE_PROMPT,
   systemPromptBatch: BATCH_PROMPT,
 };

@@ -9,28 +9,55 @@
   word-wrap: break-word;
 }
 
+/* 段落间保留空行视觉（与 X.com 原生推文段落间距一致）；
+ * 过小的 margin（4px）会让多段译文挤成一坨，不利于阅读 */
 .dualang-para + .dualang-para {
-  margin-top: 4px;
+  margin-top: 1em;
 }
 
-/* ===== 双语对照模式 ===== */
-.dualang-bilingual .dualang-pair {
-  margin-top: 6px;
-}
-
-.dualang-bilingual .dualang-pair + .dualang-pair {
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid #2f3336;
-}
-
-.dualang-original {
-  color: #71767b;
-  font-size: 14px;
-  line-height: 1.5;
+/* ===== 原文克隆块（inline / bilingual 模式下替代 tweetText 的显示位置）=====
+ * 保留原 tweetText 的 pre-wrap + 段落格式，但不着色灰暗（与 tweet 原色保持一致）
+ */
+.dualang-original-html {
   white-space: pre-wrap;
   word-wrap: break-word;
-  margin-bottom: 4px;
+  line-height: 1.4;
+  font-size: 15px;
+}
+
+/* translation-only / inline / bilingual 模式下隐藏原 tweetText；
+ * append 模式（data-dualang-mode="append" 或未设置）保持可见。
+ */
+article[data-dualang-mode="translation-only"] [data-testid="tweetText"],
+article[data-dualang-mode="inline"] [data-testid="tweetText"],
+article[data-dualang-mode="bilingual"] [data-testid="tweetText"] {
+  display: none;
+}
+
+/* 对照模式下的译文配色：
+ * 用偏冷一点的浅色（#c5ccd3，luminance 约 80%），相比原文的纯白（#e7e9ea）
+ * 有微妙色温差异可辨识"这是译文"，同时避免过暗影响阅读。
+ * 旧值 #8b98a5 太暗（luminance ~60%），已被用户反馈难读。
+ */
+.dualang-inline .dualang-inline-pair .dualang-para,
+.dualang-bilingual .dualang-para {
+  color: #c5ccd3;
+}
+
+/* ===== 段落对照模式（inline）===== */
+.dualang-inline .dualang-inline-pair + .dualang-inline-pair {
+  margin-top: 1em;  /* pair 间的段落分隔与原推文空行视觉对齐 */
+}
+
+.dualang-inline .dualang-inline-pair .dualang-para {
+  margin-top: 4px;  /* pair 内：原文段落与对应译文间保持紧凑 */
+}
+
+/* ===== 整体对照模式（bilingual）===== */
+.dualang-bilingual .dualang-original-html {
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #2f3336;
 }
 
 /* ===== 手动翻译按钮 ===== */

@@ -195,3 +195,50 @@ export function extractText(el: Element): string {
   const raw = ((clone as HTMLElement).innerText || clone.textContent || '').trim();
   return raw.replace(/[^\S\n]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
 }
+
+/**
+ * 把 tweetText 元素按段落边界切成 N 个 DocumentFragment，保留原 HTML
+ * （`<a>` / `<img alt>` / `<span>` 等），供"段落对照"模式用来克隆原文段落。
+ *
+ * 段落分隔识别两种形态（X.com 实际见到的混合）：
+ *   1. 文本节点里出现 `\n\n`（最常见，pre-wrap 推文）
+ *   2. 连续的 `<br><br>`（少数富文本推文）
+ *
+ * 纯空白段（去 trim 后 length=0）会被过滤。返回数组长度即段落数。
+ */
+export function splitParagraphsByDom(el: Element): DocumentFragment[] {
+  const doc = el.ownerDocument || document;
+  const groups: Node[][] = [[]];
+  const nodes = Array.from(el.childNodes);
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i];
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent || '';
+      const parts = text.split(/\n\s*\n/);
+      for (let p = 0; p < parts.length; p++) {
+        if (parts[p].length > 0) {
+          groups[groups.length - 1].push(doc.createTextNode(parts[p]));
+        }
+        if (p < parts.length - 1) groups.push([]);
+      }
+    } else if ((node as Element).tagName === 'BR') {
+      // 连续 <br><br> 视为段落分隔；单个 <br> 当作行内换行保留
+      const next = nodes[i + 1];
+      if (next && (next as Element).tagName === 'BR') {
+        groups.push([]);
+        i++;  // 跳过第二个 <br>
+      } else {
+        groups[groups.length - 1].push(node.cloneNode(true));
+      }
+    } else {
+      groups[groups.length - 1].push(node.cloneNode(true));
+    }
+  }
+  return groups
+    .filter((group) => group.some((n) => (n.textContent || '').trim().length > 0))
+    .map((group) => {
+      const f = doc.createDocumentFragment();
+      group.forEach((n) => f.appendChild(n));
+      return f;
+    });
+}

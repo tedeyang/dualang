@@ -163,6 +163,9 @@ async function parseStream(response: Response) {
     }
   }
 
+  // 流结束后 flush decoder 的内部字节缓冲，避免最后一个多字节字符残留成 `�`
+  buffer += decoder.decode();
+
   if (buffer.trim().startsWith('data:')) {
     const data = buffer.trim().slice(5).trim();
     if (data && data !== '[DONE]') {
@@ -313,6 +316,9 @@ export async function doTranslateBatchStream(
       } catch (_) {}
     }
   }
+
+  // 流结束后 flush decoder 的内部字节缓冲，避免最后一个多字节字符残留成 `�`
+  sseBuffer += decoder.decode();
 
   // SSE buffer 残留
   if (sseBuffer.trim().startsWith('data:')) {

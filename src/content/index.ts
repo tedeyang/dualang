@@ -1,7 +1,14 @@
-import { shouldSkipContent, isAlreadyTargetLanguage, extractText, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, rebuildParagraphs } from './utils';
+import { shouldSkipContent, isAlreadyTargetLanguage, extractText, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, rebuildParagraphs, splitParagraphsByDom } from './utils';
 import { getModelMeta } from '../shared/model-meta';
 
 type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCache?: boolean };
+
+// 展示模式：
+//   append         —— 原文保留，译文附在下方（默认，最轻量）
+//   translation-only — 仅显示译文，原文 tweetTextEl 被隐藏
+//   inline         —— 段落翻译：原文 HTML 克隆 + 译文逐段交错；tweetTextEl 隐藏
+//   bilingual      —— 整体对照：克隆整段原文 HTML + 整段译文；tweetTextEl 隐藏
+type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
 
 (async function () {
   'use strict';
@@ -9,7 +16,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
   let enabled = true;
   let targetLang = 'zh-CN';
   let autoTranslate = true;
-  let bilingualMode = false;
+  let displayMode: DisplayMode = 'append';
   let enableStreaming = false;
   let providerType: 'openai' | 'browser-native' = 'openai';
 
@@ -93,6 +100,14 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       translatingSetSize: translatingSet.size
     });
   }, 10000);
+
+  const VALID_DISPLAY_MODES: DisplayMode[] = ['append', 'translation-only', 'inline', 'bilingual'];
+  function normalizeDisplayMode(mode: unknown, legacyBilingual: unknown): DisplayMode {
+    if (typeof mode === 'string' && (VALID_DISPLAY_MODES as string[]).includes(mode)) {
+      return mode as DisplayMode;
+    }
+    return legacyBilingual ? 'inline' : 'append';
+  }
 
   // ========== 事件驱动调度器 ==========
   // 统一管理 flush 时机，替代散落各处的 scheduleFlush() 调用
@@ -275,6 +290,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       enabled: true,
       targetLang: 'zh-CN',
       autoTranslate: true,
+      displayMode: null,  // null 哨兵：未设时根据老 bilingualMode 迁移
       bilingualMode: false,
       enableStreaming: false,
       providerType: 'openai'
@@ -282,11 +298,12 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     enabled         = settings.enabled;
     targetLang      = settings.targetLang   || 'zh-CN';
     autoTranslate   = settings.autoTranslate !== false;
-    bilingualMode   = !!settings.bilingualMode;
+    // 迁移：老用户 displayMode 未设，根据 bilingualMode 推导；bilingualMode=true → 'inline'（升级到段落对照）
+    displayMode     = normalizeDisplayMode(settings.displayMode, settings.bilingualMode);
     enableStreaming  = !!settings.enableStreaming;
     providerType    = settings.providerType === 'browser-native' ? 'browser-native' : 'openai';
     perfLog('init', {
-      enabled, targetLang, autoTranslate, bilingualMode,
+      enabled, targetLang, autoTranslate, displayMode,
       initCostMs: (performance.now() - t0).toFixed(2)
     });
     ensureBgPort();
@@ -317,7 +334,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     if (area !== 'sync') return;
     if (changes.targetLang)                  targetLang     = changes.targetLang.newValue    || 'zh-CN';
     if (changes.autoTranslate !== undefined)  autoTranslate  = changes.autoTranslate.newValue !== false;
-    if (changes.bilingualMode !== undefined)  bilingualMode  = !!changes.bilingualMode.newValue;
+    if (changes.displayMode !== undefined)    displayMode    = normalizeDisplayMode(changes.displayMode.newValue, false);
     if (changes.enableStreaming !== undefined) enableStreaming = !!changes.enableStreaming.newValue;
     if (changes.providerType !== undefined) {
       const v = changes.providerType.newValue;
@@ -1185,12 +1202,21 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
   }
 
   // ========== 渲染翻译块 ==========
+  // 4 种展示模式：
+  //   append          —— 原文 tweetText 保留可见，译文 card 追加在其下方
+  //   translation-only —— 原文隐藏（CSS 通过 article[data-dualang-mode] 控制），只显示译文
+  //   inline          —— 原文隐藏；card 内逐段交错：[克隆的原文段落 HTML] + [对应译文]
+  //   bilingual       —— 原文隐藏；card 内先显示整段原文 HTML 克隆，下方跟整段译文
+  // 为什么需要 data-dualang-mode 属性：mode 切换时旧推文保留老模式、新推文用新模式，
+  // CSS 的 :has 或属性选择器根据 article 的 mode 决定是否隐藏 tweetTextEl。
   function renderTranslation(article, tweetTextEl, translatedText, originalText) {
     const t0 = performance.now();
     if (article.querySelector('.dualang-translation')) return;
 
     const card = document.createElement('div');
     card.className = 'dualang-translation';
+    const mode = displayMode;
+    article.setAttribute('data-dualang-mode', mode);
 
     let translatedParas = translatedText
       .split(/(?:\n\s*\n|---PARA---)/)
@@ -1211,36 +1237,52 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       }
     }
 
-    if (bilingualMode && originalText) {
-      card.classList.add('dualang-bilingual');
-      const originalParas = originalText.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
-      if (originalParas.length === 0) originalParas.push(originalText.trim());
-
-      for (let i = 0; i < translatedParas.length; i++) {
-        const pair = document.createElement('div');
-        pair.className = 'dualang-pair';
-
-        if (originalParas[i]) {
+    if (mode === 'inline') {
+      // 段落对照：按 DOM 边界克隆原文各段，紧接对应译文；段数不对等时取原文段数为准，
+      // 多出的译文段落作为最后一段译文块；少的译文位置留空（用户能看到原文提示模型漏译）
+      card.classList.add('dualang-inline');
+      const originalParas = splitParagraphsByDom(tweetTextEl);
+      if (originalParas.length === 0) {
+        // 没拆出段落就退化为 append 行为（只渲染译文）
+        appendTranslationParas(card, translatedParas);
+      } else {
+        for (let i = 0; i < originalParas.length; i++) {
+          const pair = document.createElement('div');
+          pair.className = 'dualang-inline-pair';
           const orig = document.createElement('div');
-          orig.className = 'dualang-original';
-          orig.textContent = originalParas[i];
+          orig.className = 'dualang-original-html';
+          orig.appendChild(originalParas[i]);
           pair.appendChild(orig);
+          if (translatedParas[i]) {
+            const trans = document.createElement('div');
+            trans.className = 'dualang-para';
+            trans.textContent = translatedParas[i];
+            pair.appendChild(trans);
+          }
+          card.appendChild(pair);
         }
-
-        const trans = document.createElement('div');
-        trans.className = 'dualang-para';
-        trans.textContent = translatedParas[i];
-        pair.appendChild(trans);
-
-        card.appendChild(pair);
+        // 译文多出的尾段：按一段译文块追加
+        for (let i = originalParas.length; i < translatedParas.length; i++) {
+          const trans = document.createElement('div');
+          trans.className = 'dualang-para';
+          trans.textContent = translatedParas[i];
+          card.appendChild(trans);
+        }
       }
+    } else if (mode === 'bilingual') {
+      // 整体对照：克隆整段原文 HTML（保留链接/emoji/@/#）+ 整段译文
+      card.classList.add('dualang-bilingual');
+      const origBlock = document.createElement('div');
+      origBlock.className = 'dualang-original-html';
+      for (const child of Array.from(tweetTextEl.childNodes) as Node[]) {
+        origBlock.appendChild(child.cloneNode(true));
+      }
+      card.appendChild(origBlock);
+      appendTranslationParas(card, translatedParas);
     } else {
-      for (const para of translatedParas) {
-        const p = document.createElement('div');
-        p.className = 'dualang-para';
-        p.textContent = para;
-        card.appendChild(p);
-      }
+      // 'append' 和 'translation-only' 共享译文-only 的 card 结构；
+      // 区别只在 CSS 是否隐藏 tweetTextEl（由 data-dualang-mode 控制）
+      appendTranslationParas(card, translatedParas);
     }
 
     tweetTextEl.parentNode.insertBefore(card, tweetTextEl.nextSibling);
@@ -1248,7 +1290,18 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     const cost = performance.now() - t0;
     perfCounters.renderCalls++;
     perfCounters.renderTotalTime += cost;
-    perfLog('render', { paras: translatedParas.length, bilingualMode, costMs: cost.toFixed(2) });
+    perfLog('render', { paras: translatedParas.length, mode, costMs: cost.toFixed(2) });
+  }
+
+  // 渲染整段译文：把多个段落合并回一个 pre-wrap 块，\n\n 由 CSS 的 white-space 原生渲染为
+  // 一整行空行（与 X.com 原生 tweetText 的段落间距视觉一致）。
+  // 旧做法是每段一个 <div> + margin-top 近似，但 margin 值永远对不齐 line-height 撑出的空行。
+  function appendTranslationParas(card: HTMLElement, translatedParas: string[]) {
+    if (translatedParas.length === 0) return;
+    const p = document.createElement('div');
+    p.className = 'dualang-para';
+    p.textContent = translatedParas.join('\n\n');
+    card.appendChild(p);
   }
 
   init();

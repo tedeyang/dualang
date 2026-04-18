@@ -220,3 +220,27 @@
 - [x] **JSON 硬化**（日志 `"[\nned 1詹森夸大..."`）：Qwen2.5 偶发返回"JSON 外壳乱码 + 正文完整中文"。两层修复：(1) `body.response_format = {type:'json_object'}` 让服务端约束输出合法 JSON；(2) 新增 `salvageSingleTranslation(raw)`，`texts.length===1` 时从杂乱输出里救出 `"translated"` 值或纯 CJK 文本，要求 ≥10 CJK 字符才接受 ✅
 - [x] **段落崩塌**（截图 Image 4：4 段原文 → 1 坨译文）：三层治理：(1) BATCH_PROMPT / STRICT_PROMPT 把"段落必须 1:1 保留、用 \\n\\n 分隔"升到规则 #1 硬指令；(2) 已有 `hasSuspiciousLineMismatch` 段落坍缩规则触发 strict retry；(3) 新增 `rebuildParagraphs(text, targetCount)` 客户端兜底 — 译文仍 1 段但原文 ≥3 段时，按中英文句末标点拆句、按目标段数均匀分组 ✅
 - [x] **测试**：`utils.test.ts` 新增 16 条（URL 扣除 3 条、`isWrongLanguage` 8 条、`rebuildParagraphs` 5 条）；`real-scenarios.spec.ts` 新增"质量重试用严格 prompt"e2e 验证 API 收到 `strictMode=true` ✅
+
+### P26 — 抛弃 JSON 批量格式（分隔符 + 纯文本）
+
+- [x] **问题背景**：7-9B 参数小模型（Qwen2.5-7B / GLM-4-9B）同时处理 JSON 语法 + 翻译 + 段落保留认知负担过重。实测 bug：prompt 占位符被原样照抄（"第一条翻译"）、段落坍缩、偶发 JSON 外壳乱码（`"[\nned 1..."`）、`response_format:{type:'json_object'}` 也救不回来 ✅
+- [x] **单条翻译零结构**：`isSingle=true` 时 user content 就是原文，system prompt 是 `SINGLE_PROMPT`，返回即译文；只在响应开头像 `{` / `[` / `===N===` 时才走 fallback 解析。去掉 `salvageSingleTranslation` 和 `response_format` ✅
+- [x] **批量翻译 `===N===` 分隔符**（`src/background/profiles.ts`）：输入 `===0===\n文本\n\n===1===\n文本`，要求模型按同格式回写；段落分隔用真实空行保留不需转义；`BATCH_PROMPT` 显式"不要 JSON、不要 markdown"；占位符写成 `<TRANSLATION_0>` 且注明"占位符不可照抄"避免小模型抄袭 ✅
+- [x] **`composeSystemPrompt(profile, lang, {batch, strict})`**：strict 前缀 `STRICT_PREFIX` 独立成模块变量，按需拼接到 single / batch 任一 base 前；profile 不再维护单独的 `systemPromptStrict` 字段 ✅
+- [x] **`parseDelimitedBatch(raw, expectedCount)`**：主路径 `split(/^===\s*(\d+)\s*===\s*$\n?/m)` 取偶数索引作为 index、奇数索引作为内容；支持前置噪声 / 乱序 index / 内部空格 / 超出 expectedCount 忽略。降级 fallback 兼容 JSON 返回（强模型偶发 + 旧测试 mock）并能剥离 markdown 代码块 ✅
+- [x] **api.ts 重写**：`doTranslateBatchRequest` 按 `isSingle` 分流；`doTranslateBatchStream` 按行检测 `===N===` 边界做流式增量推送；删除旧 `extractCompletedEntries` JSON 花括号计数器 ✅
+- [x] **测试**：`profiles.test.ts` 新增 9 条 `parseDelimitedBatch`（标准 / 多段 / 前置噪声 / 乱序 / 越界 / 空格 / 无分隔符 / JSON fallback / markdown 包裹）+ 4 条 `composeSystemPrompt`（单条 / 批量 / 严格前缀位置）；8 个 e2e mock 文件的 tweet 计数正则改为 `/===\s*\d+\s*===|推文 \d+:/g` 兼容新旧格式；`real-scenarios` 质量重试断言改为在 prompts 数组里找含严格前缀的任一请求（不假定下标 1）— 3 轮全套 e2e 45/45 稳定通过 ✅
+
+### P27 — 展示模式 4 选 1（替代 bilingualMode 布尔）
+
+- [x] **新设置 `displayMode: 'append' | 'translation-only' | 'inline' | 'bilingual'`** 替代旧 `bilingualMode` 布尔。4 种模式语义：
+  - `append`（默认）— 原文 tweetText 保留，译文 card 附加在下方
+  - `translation-only` — 原文隐藏（CSS via `article[data-dualang-mode]`），仅显示译文
+  - `inline`（段落对照，新）— 按 DOM 边界克隆原文各段 HTML（保留 `<a>` / `<img alt>` / `@` / `#`）+ 译文逐段交错渲染
+  - `bilingual`（整体对照，升级自旧 bilingualMode）— 整段原文 HTML 克隆 + 整段译文分块 ✅
+- [x] **`splitParagraphsByDom(tweetTextEl)` 新工具**（`src/content/utils.ts`）：按文本节点里的 `\n\n` 或连续 `<br><br>` 切段，返回 DocumentFragment 数组，保留段内 rich HTML（链接、emoji img、mention）；jsdom 下 7 条单元测试覆盖单段 / 文本节点 \n\n 拆段 / 保留链接 / 双 br / 单 br 不分段 / 纯空白段过滤 / 含 emoji+mention 的 3 段混排 ✅
+- [x] **`article[data-dualang-mode]` 属性驱动 CSS**：每次 renderTranslation 时把当前模式打到 article 上，CSS 按属性选择器决定是否隐藏 `[data-testid="tweetText"]`。切换模式只影响新翻译的推文，已渲染的推文保留旧模式直到页面刷新（避免重绘抖动）✅
+- [x] **迁移策略**：老用户若只有 `bilingualMode=true` 且无 `displayMode` → 自动映射到 `inline`（内容脚本 `normalizeDisplayMode(mode, legacyBilingual)` + popup 加载逻辑双端对齐）。`null` 哨兵避免 chrome.storage API 对 `undefined` 默认值的歧义 ✅
+- [x] **Popup UI**：`bilingualMode` checkbox → `displayMode` select 4 选 1，提示"模式切换后，已翻译的推文保留旧模式；刷新页面可全量应用新模式" ✅
+- [x] **CSS**：新增 `.dualang-original-html`（保留原文 pre-wrap + font-size）、`.dualang-inline-pair` / `.dualang-inline` 间距；`article[data-dualang-mode="translation-only"|"inline"|"bilingual"] [data-testid="tweetText"] { display: none; }` 精准隐藏原文 ✅
+- [x] **测试**：`manual-and-bilingual.spec.ts` 重构为 5 个 describe（append / translation-only / inline / bilingual / 持久化+迁移），9 条 e2e 全绿；全套 e2e 48/48（两轮稳定）、vitest 124 条（原 117 + 7 新增 splitParagraphsByDom）✅

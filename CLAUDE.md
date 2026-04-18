@@ -45,7 +45,13 @@ The extension has three runtime contexts communicating via `chrome.runtime.sendM
 - `MutationObserver` detects dynamically loaded tweets (`article[data-testid="tweet"]`) and "Show more" expansions
 - `IntersectionObserver` (rootMargin `0px 0px 600px 0px`) pre-queues tweets before they enter the viewport
 - **Translation modes**: if `autoTranslate=true`, tweets are queued automatically; if `false`, a `<button class="dualang-btn">译</button>` is injected for manual translation
-- **Bilingual mode** (`bilingualMode=true`): `renderTranslation()` creates `.dualang-bilingual > .dualang-pair > [.dualang-original + .dualang-para]` structure showing original and translation side-by-side
+- **Display modes** (`displayMode` setting, 4 values; replaces the old boolean `bilingualMode`):
+  - `'append'` (default) — original tweetText stays, translation appended below
+  - `'translation-only'` — original hidden via `article[data-dualang-mode]` CSS selector; only translation shown
+  - `'inline'` (段落对照) — `splitParagraphsByDom(tweetTextEl)` clones each original paragraph's DOM (preserves `<a>` / `<img>` / `@mention`), rendered as `.dualang-inline > .dualang-inline-pair > [.dualang-original-html + .dualang-para]` below the hidden tweetText
+  - `'bilingual'` (整体对照) — full original HTML clone + full translation as `.dualang-bilingual > [.dualang-original-html + .dualang-para...]`
+  - Legacy migration: old `bilingualMode=true` (no `displayMode` set) → `'inline'`; otherwise `'append'`
+  - `data-dualang-mode` is set per article at render time, so mode switching only affects newly-translated tweets — existing cards keep their original mode until page reload
 - Queue uses `pendingQueue` (Array) + `pendingQueueSet` (Set) for O(1) deduplication
 - `BATCH_SIZE=20` tweets dequeued per flush, split into `SUB_BATCH_SIZE=5` parallel API calls — first 5 results render immediately
 - Retries failed sub-batches up to 2× with 2s delay (5s on 429/rate-limit)
@@ -53,10 +59,10 @@ The extension has three runtime contexts communicating via `chrome.runtime.sendM
 - `shouldSkipContent(text)` skips URL-only tweets (stripped < 6 chars) and pure emoji/symbol tweets
 
 **`popup.js` / `popup.html`**
-- Settings: API endpoint, API key, model, reasoning effort, max tokens, target language (10 options), auto-translate toggle, bilingual mode toggle
+- Settings: API endpoint, API key, model, reasoning effort, max tokens, target language (10 options), auto-translate toggle, `displayMode` (4 options: 译文下方 / 仅译文 / 段落对照 / 整体对照)
 - All settings persisted via `chrome.storage.sync`
 
-**`styles.css`** — injected into X.com pages; styles `.dualang-translation`, `.dualang-btn`, `.dualang-original`, `.dualang-pair` to match X.com's dark theme
+**`styles.css`** — injected into X.com pages; styles `.dualang-translation`, `.dualang-btn`, `.dualang-original-html`, `.dualang-inline-pair`, `.dualang-bilingual` and uses `article[data-dualang-mode]` attribute selectors to hide the original `[data-testid="tweetText"]` for non-`append` modes
 
 ## Test Structure
 
@@ -68,7 +74,7 @@ e2e/
     translation.spec.ts      # Core translation, batch, paragraph splitting
     cache.spec.ts            # L1/L2 cache hit behavior
     target-lang.spec.ts      # Target language setting + API prompt content
-    manual-and-bilingual.spec.ts  # autoTranslate=false button, bilingualMode=true display
+    manual-and-bilingual.spec.ts  # autoTranslate=false button + 4 displayMode variants
     skip-and-extract.spec.ts      # Skip conditions (zh/url/emoji), extractText with links/imgs
 ```
 

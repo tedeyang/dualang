@@ -8,7 +8,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const enableStreamingCheckbox = document.getElementById('enableStreaming');
   const targetLangSelect = document.getElementById('targetLang');
   const autoTranslateCheckbox = document.getElementById('autoTranslate');
-  const bilingualModeCheckbox = document.getElementById('bilingualMode');
+  const displayModeSelect = document.getElementById('displayMode');
   const fallbackEnabledCheckbox = document.getElementById('fallbackEnabled');
   const fallbackPresetSelect = document.getElementById('fallbackPreset');
   const fallbackBaseUrlInput = document.getElementById('fallbackBaseUrl');
@@ -85,6 +85,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     enableStreaming: false,
     targetLang: 'zh-CN',
     autoTranslate: true,
+    // displayMode 替代旧 bilingualMode（布尔）。老用户若只有 bilingualMode，
+    // 下面的加载逻辑会把 bilingualMode=true 迁移为 'inline'。
+    // 用 null 作为"未设置"哨兵，避免 chrome.storage API 对 undefined 默认值的序列化歧义。
+    displayMode: null,
     bilingualMode: false,
     fallbackEnabled: false,
     fallbackBaseUrl: 'https://api.siliconflow.cn/v1',
@@ -102,7 +106,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   enableStreamingCheckbox.checked = settings.enableStreaming;
   targetLangSelect.value = settings.targetLang;
   autoTranslateCheckbox.checked = settings.autoTranslate;
-  bilingualModeCheckbox.checked = settings.bilingualMode;
+  // 迁移：displayMode 未设 + 老 bilingualMode=true → 'inline'；否则默认 'append'
+  const VALID_DISPLAY_MODES = ['append', 'translation-only', 'inline', 'bilingual'];
+  const resolvedDisplayMode = VALID_DISPLAY_MODES.includes(settings.displayMode)
+    ? settings.displayMode
+    : (settings.bilingualMode ? 'inline' : 'append');
+  displayModeSelect.value = resolvedDisplayMode;
   presetSelect.value = detectPreset(settings.baseUrl, settings.model);
 
   // Fallback 配置
@@ -203,7 +212,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       enableStreaming: enableStreamingCheckbox.checked,
       targetLang: targetLangSelect.value,
       autoTranslate: autoTranslateCheckbox.checked,
-      bilingualMode: bilingualModeCheckbox.checked,
+      displayMode: displayModeSelect.value,
+      // 旧 bilingualMode 字段设回 false，防止未来其他代码路径误读老值
+      bilingualMode: false,
       fallbackEnabled: fallbackEnabledCheckbox.checked,
       fallbackBaseUrl: (fallbackBaseUrlInput.value || 'https://api.siliconflow.cn/v1').trim(),
       fallbackApiKey: fallbackApiKeyInput.value.trim(),
