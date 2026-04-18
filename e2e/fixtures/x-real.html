@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>X.com Realistic Mock</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; background: #000; color: #e7e9ea; margin: 0; padding: 0; }
+    #timeline { max-width: 600px; margin: 0 auto; border-left: 1px solid #2f3336; border-right: 1px solid #2f3336; min-height: 100vh; }
+    [data-testid="cellInnerDiv"] { border-bottom: 1px solid #2f3336; padding: 12px 16px; }
+    article { display: block; position: relative; }
+    article a { color: #1d9bf0; text-decoration: none; }
+    [data-testid="tweetText"] { line-height: 1.4; font-size: 15px; white-space: pre-wrap; }
+    [data-testid="tweet-text-show-more-link"] { color: #1d9bf0; cursor: pointer; margin-top: 4px; display: inline-block; font-size: 15px; }
+    [data-testid="User-Name"] { display: flex; gap: 6px; align-items: baseline; margin-bottom: 4px; }
+    [data-testid="User-Name"] .display { font-weight: 700; }
+    [data-testid="User-Name"] .handle, [data-testid="User-Name"] time { color: #71767b; font-size: 14px; }
+    .quoted { border: 1px solid #2f3336; border-radius: 12px; padding: 10px 12px; margin-top: 8px; }
+    .engagement { display: flex; gap: 40px; margin-top: 8px; color: #71767b; }
+    .engagement button { background: none; border: 0; color: inherit; font-size: 13px; cursor: pointer; }
+    .avatar-col { display: none; } /* 简化：隐藏头像列，聚焦文本流 */
+    #controls { position: fixed; top: 8px; right: 8px; background: #16181c; border: 1px solid #2f3336; padding: 8px; font-size: 12px; z-index: 999; }
+    #controls button { display: block; margin: 4px 0; }
+    .twemoji { width: 1.2em; height: 1.2em; vertical-align: middle; display: inline-block; }
+  </style>
+</head>
+<body>
+  <div id="timeline" role="region" aria-label="Timeline: Home"></div>
+
+  <div id="controls">
+    <div>Dev controls</div>
+    <button onclick="xSim.expandShowMore('1001', 'append')">expand 1001 (append)</button>
+    <button onclick="xSim.expandShowMore('1002', 'replace')">expand 1002 (replace)</button>
+    <button onclick="xSim.expandShowMore('1003', 'wrapper')">expand 1003 (wrapper)</button>
+    <button onclick="xSim.appendTweet(xSim.mkTweet())">append random</button>
+  </div>
+
+  <script>
+    // ========== 推文数据 ==========
+    // text: 初始可见文本（可能被截断）
+    // fullText: 点 show-more 后的完整文本
+    // lang: 用于 isAlreadyTargetLanguage 逻辑（目标 zh-CN 时跳过已是中文的）
+    // quoted: 嵌套引用推文
+    const TWEETS = [
+      {
+        id: '1001', user: 'alice', displayName: 'Alice',
+        text: 'Working on a new experiment with ',
+        textHtml: 'Working on a new experiment with <a href="/search?q=%23AI">#AI</a> tooling — early results look promising.',
+        fullText: 'Working on a new experiment with #AI tooling — early results look promising. Full thread explaining our evaluation methodology, the benchmarks we ran, why the baseline is weaker than what papers claim, and what next steps we are considering in the next two weeks.',
+        lang: 'en',
+        hasShowMore: true
+      },
+      {
+        id: '1002', user: 'beatrice', displayName: 'Beatrice',
+        textHtml: 'Shipping the <a href="/search?q=%23dualang">#dualang</a> launch today. Huge thanks to <a href="/charlie">@charlie</a> and the reviewers.',
+        fullText: 'Shipping the #dualang launch today. Huge thanks to @charlie and the reviewers. Detailed postmortem on the race conditions we chased: MV3 SW restarts are nasty, virtual DOM recycling is nastier, rate-limit TOCTOU is the quiet killer. Writeup link in replies.',
+        lang: 'en',
+        hasShowMore: true
+      },
+      {
+        id: '1003', user: 'carlos', displayName: 'Carlos',
+        textHtml: 'New blog post <a href="https://t.co/shortcode">writer.sh/x</a> about long-context eval.',
+        fullText: 'New blog post writer.sh/x about long-context eval. tl;dr: needle-in-a-haystack is misleading, multi-step retrieval is where real systems fail, and the gap between 128k and 1M is narrower than marketing suggests for most workloads.',
+        lang: 'en',
+        hasShowMore: true
+      },
+      {
+        id: '1004', user: 'dora_cn', displayName: '朵拉',
+        textHtml: '今天终于把后端那个诡异的重试循环修好了 — 原因居然是两个 storage.get 并发读同一个 key 然后各自写回 🫠',
+        lang: 'zh-CN',
+        hasShowMore: false  // 中文，应被 isAlreadyTargetLanguage 跳过
+      },
+      {
+        id: '1005', user: 'erika', displayName: 'Erika',
+        textHtml: 'Quote-tweet test:',
+        lang: 'en',
+        quoted: { id: '991', user: 'frank', displayName: 'Frank', text: 'Original thought about distributed consensus.' },
+        hasShowMore: false
+      },
+      {
+        id: '1006', user: 'gina', displayName: 'Gina',
+        // 纯 emoji + URL → shouldSkipContent 应跳过
+        textHtml: '<img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="🎉" class="twemoji"> <a href="https://t.co/x">t.co/x</a>',
+        lang: 'en',
+        hasShowMore: false
+      },
+      {
+        id: '1007', user: 'henrik', displayName: 'Henrik',
+        // 与 mentions/hashtags 混排，extractText 应保留可读文本
+        textHtml: 'Catching up with <a href="/ivan">@ivan</a> about the <a href="/search?q=%23rustlang">#rustlang</a> async runtime rewrite. Surprising takeaways — ask me anything.',
+        lang: 'en',
+        hasShowMore: false
+      }
+    ];
+
+    // ========== 渲染 ==========
+    function renderTweet(data) {
+      const cell = document.createElement('div');
+      cell.dataset.testid = 'cellInnerDiv';
+      cell.setAttribute('data-testid', 'cellInnerDiv');
+      cell.id = `cell-${data.id}`;
+
+      cell.innerHTML = `
+        <article data-testid="tweet" role="article" tabindex="0" id="tweet-${data.id}">
+          <div class="tweet-outer">
+            <div class="tweet-row" style="display:flex;">
+              <div class="avatar-col">avatar</div>
+              <div class="tweet-body" style="flex:1; min-width:0;">
+                <div data-testid="User-Name">
+                  <a href="/${data.user}"><span class="display">${escapeHtml(data.displayName)}</span></a>
+                  <a href="/${data.user}"><span class="handle">@${data.user}</span></a>
+                  <span class="handle">·</span>
+                  <a href="/${data.user}/status/${data.id}"><time datetime="2026-04-17T10:00:00Z">3h</time></a>
+                </div>
+                <div class="tweet-text-wrapper">
+                  <div data-testid="tweetText" lang="${data.lang || 'en'}" dir="auto">${data.textHtml}</div>
+                  ${data.hasShowMore ? `<div role="button" data-testid="tweet-text-show-more-link" tabindex="0" onclick="xSim.expandShowMore('${data.id}', window.__xSimMode || 'append')"><span>Show more</span></div>` : ''}
+                </div>
+                ${data.quoted ? renderQuoted(data.quoted) : ''}
+                <div role="group" class="engagement">
+                  <button data-testid="reply">Reply</button>
+                  <button data-testid="retweet">Retweet</button>
+                  <button data-testid="like">Like</button>
+                  <button data-testid="bookmark">Bookmark</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </article>
+      `;
+      return cell;
+    }
+
+    function renderQuoted(q) {
+      // 嵌套引用推文：内部也是 article[data-testid=tweet]，触发选择器重复匹配
+      return `
+        <div class="quoted">
+          <article data-testid="tweet" role="article" id="quoted-${q.id}">
+            <div data-testid="User-Name">
+              <span class="display">${escapeHtml(q.displayName)}</span>
+              <span class="handle">@${q.user}</span>
+              <a href="/${q.user}/status/${q.id}"><time datetime="2026-04-16T10:00:00Z">1d</time></a>
+            </div>
+            <div data-testid="tweetText" lang="en" dir="auto">${escapeHtml(q.text)}</div>
+          </article>
+        </div>
+      `;
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    // 初始渲染
+    const timeline = document.getElementById('timeline');
+    TWEETS.forEach(t => timeline.appendChild(renderTweet(t)));
+
+    // ========== 模拟器 API ==========
+    window.xSim = {
+      /**
+       * Show-more 展开。三种模式模拟 X.com 在不同场景下的 DOM 操作：
+       * - 'append'  : 最简单 — tweetText 尾部追加新 span
+       * - 'replace' : tweetText.innerHTML 整个替换，旧子节点全部移除，新子节点全部添加
+       * - 'wrapper' : 替换 tweetText 的父 .tweet-text-wrapper 整块，tweetText 变成全新 DOM 节点
+       */
+      expandShowMore(id, mode = 'append') {
+        const article = document.getElementById(`tweet-${id}`);
+        if (!article) return;
+        const tweet = TWEETS.find(t => t.id === id);
+        if (!tweet || !tweet.fullText) return;
+
+        if (mode === 'append') {
+          const textEl = article.querySelector('[data-testid="tweetText"]');
+          const extra = document.createElement('span');
+          const delta = tweet.fullText.slice(textEl.textContent.length);
+          extra.textContent = delta;
+          textEl.appendChild(extra);
+          article.querySelector('[data-testid="tweet-text-show-more-link"]')?.remove();
+        } else if (mode === 'replace') {
+          const textEl = article.querySelector('[data-testid="tweetText"]');
+          // innerHTML 替换：一次性触发 childList mutation（removedNodes + addedNodes）
+          textEl.innerHTML = escapeHtml(tweet.fullText);
+          article.querySelector('[data-testid="tweet-text-show-more-link"]')?.remove();
+        } else if (mode === 'wrapper') {
+          // React 式再渲染：替换 tweetText 的父 div，新的 tweetText 是全新 DOM 节点
+          const oldWrap = article.querySelector('.tweet-text-wrapper');
+          if (!oldWrap) return;
+          const newWrap = document.createElement('div');
+          newWrap.className = 'tweet-text-wrapper';
+          newWrap.innerHTML = `
+            <div data-testid="tweetText" lang="${tweet.lang || 'en'}" dir="auto">${escapeHtml(tweet.fullText)}</div>
+          `;
+          oldWrap.parentNode.replaceChild(newWrap, oldWrap);
+        }
+      },
+
+      /**
+       * 虚拟 DOM 回收：取一个现有 article DOM 节点，把它的身份切换成另一条推文。
+       * 模拟 X.com 在长列表滚动时把同一 DOM 节点重绑到不同 props。
+       */
+      recycleArticle(oldId, newTweetData) {
+        const oldCell = document.getElementById(`cell-${oldId}`);
+        if (!oldCell) return;
+        // 保留 cell DOM 节点本身，仅替换内部 innerHTML（article 节点复用）
+        oldCell.id = `cell-${newTweetData.id}`;
+        const article = oldCell.querySelector('article');
+        article.id = `tweet-${newTweetData.id}`;
+        // 更新 status 链接（getTweetId 依赖它）
+        const statusLinks = article.querySelectorAll('a[href*="/status/"]');
+        statusLinks.forEach(l => l.setAttribute('href', `/${newTweetData.user}/status/${newTweetData.id}`));
+        // 更新用户名 / handle / 文本
+        const nameEls = article.querySelectorAll('[data-testid="User-Name"] .display');
+        nameEls.forEach(e => e.textContent = newTweetData.displayName);
+        const handleEls = article.querySelectorAll('[data-testid="User-Name"] .handle');
+        if (handleEls[0]) handleEls[0].textContent = `@${newTweetData.user}`;
+        const textEl = article.querySelector('[data-testid="tweetText"]');
+        textEl.innerHTML = newTweetData.textHtml || escapeHtml(newTweetData.text);
+        textEl.setAttribute('lang', newTweetData.lang || 'en');
+      },
+
+      /** 模拟无限滚动：追加新推文到列表底部 */
+      appendTweet(tweetData) {
+        TWEETS.push(tweetData);
+        timeline.appendChild(renderTweet(tweetData));
+        return tweetData.id;
+      },
+
+      /** 模拟虚拟化：从顶部移除一个推文（DOM 节点删除） */
+      removeTweet(id) {
+        const cell = document.getElementById(`cell-${id}`);
+        cell?.remove();
+      },
+
+      /** 随机生成一条推文（用于 append 测试） */
+      mkTweet() {
+        const id = String(Date.now());
+        return {
+          id, user: 'randy', displayName: 'Randy',
+          textHtml: `Randomly generated tweet ${id} for testing pipeline capacity.`,
+          lang: 'en', hasShowMore: false
+        };
+      },
+
+      /** 给 tests 读取的内部状态 */
+      getTweetData(id) { return TWEETS.find(t => t.id === id); }
+    };
+  </script>
+</body>
+</html>

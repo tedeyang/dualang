@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Dualang 手动测试页</title>
+  <style>
+    body {
+      background: #000;
+      color: #e7e9ea;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      max-width: 600px;
+      margin: 40px auto;
+      padding: 0 20px;
+    }
+    h1 { color: #1d9bf0; }
+    .tweet {
+      border: 1px solid #2f3336;
+      border-radius: 16px;
+      padding: 16px;
+      margin-bottom: 24px;
+    }
+    article[data-testid="tweet"] {
+      border: 1px solid #2f3336;
+      border-radius: 16px;
+      padding: 16px;
+      margin-bottom: 24px;
+    }
+    .tweet-text {
+      font-size: 15px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+    /* 注入的样式已在内联 styles.css 中 */
+  </style>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <h1>Dualang 手动测试页</h1>
+  <p style="color:#71767b">此页面用于本地验证 DOM 注入与双语对照渲染。请在 Chrome 扩展的开发者工具中加载 content.js 进行测试。</p>
+
+  <article data-testid="tweet">
+    <div style="font-weight:bold;margin-bottom:8px;">@elonmusk</div>
+    <div data-testid="tweetText" class="tweet-text">
+      Mars is going to be amazing.
+
+      We are going to make life multiplanetary.
+    </div>
+  </article>
+
+  <article data-testid="tweet">
+    <div style="font-weight:bold;margin-bottom:8px;">@sama</div>
+    <div data-testid="tweetText" class="tweet-text">
+      AI is the most important technology humanity has ever developed.
+      
+      We need to make sure it benefits all of humanity.
+      
+      The future is going to be wild.
+    </div>
+  </article>
+
+  <article data-testid="tweet">
+    <div style="font-weight:bold;margin-bottom:8px;">@test_user</div>
+    <div data-testid="tweetText" class="tweet-text">
+      单段落推文，没有换行，测试紧凑模式。
+    </div>
+  </article>
+
+  <script>
+    // Mock chrome APIs for manual testing in plain browser
+    if (typeof chrome === 'undefined' || !chrome.storage) {
+      window.chrome = {
+        storage: {
+          sync: {
+            get: () => Promise.resolve({
+              apiKey: 'sk-test',
+              targetLang: 'zh-CN',
+              model: 'moonshot-v1-8k',
+              autoTranslate: false,
+              showOriginal: true
+            }),
+            set: () => Promise.resolve()
+          },
+          local: {
+            get: () => Promise.resolve({}),
+            set: () => Promise.resolve()
+          }
+        },
+        runtime: {
+          sendMessage: async (msg) => {
+            // Simulate translation with para markers
+            const text = msg.payload.text;
+            const paragraphs = text.split(/\n\s*\n/).filter(Boolean);
+            const translated = paragraphs.map((p, i) => {
+              const maps = {
+                'Mars is going to be amazing.': '火星将会令人惊叹。',
+                'We are going to make life multiplanetary.': '我们将让生命成为多行星物种。',
+                'AI is the most important technology humanity has ever developed.': '人工智能是人类有史以来开发的最重要的技术。',
+                'We need to make sure it benefits all of humanity.': '我们需要确保它惠及全人类。',
+                'The future is going to be wild.': '未来将会非常狂野。',
+                '单段落推文，没有换行，测试紧凑模式。': 'Single-paragraph tweet with no line breaks, testing compact mode.'
+              };
+              return maps[p.trim()] || `[译文] ${p.trim()}`;
+            }).join(' ---PARA--- ');
+            return { success: true, data: { translated } };
+          },
+          onMessage: { addListener: () => {} }
+        }
+      };
+    }
+  </script>
+  <script src="content.js"></script>
+</body>
+</html>

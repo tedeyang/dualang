@@ -1,0 +1,153 @@
+/* ===== 翻译结果容器 ===== */
+.dualang-translation {
+  margin-top: 8px;
+}
+
+/* ===== 普通模式：纯译文段落 ===== */
+.dualang-para {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.dualang-para + .dualang-para {
+  margin-top: 4px;
+}
+
+/* ===== 双语对照模式 ===== */
+.dualang-bilingual .dualang-pair {
+  margin-top: 6px;
+}
+
+.dualang-bilingual .dualang-pair + .dualang-pair {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #2f3336;
+}
+
+.dualang-original {
+  color: #71767b;
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  margin-bottom: 4px;
+}
+
+/* ===== 手动翻译按钮 ===== */
+.dualang-btn {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 2px 12px;
+  border: 1px solid #2f3336;
+  border-radius: 9999px;
+  background: transparent;
+  color: #71767b;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+  user-select: none;
+}
+
+.dualang-btn:hover:not(:disabled) {
+  border-color: #1d9bf0;
+  color: #1d9bf0;
+}
+
+.dualang-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* ===== 翻译状态指示器 ===== */
+.dualang-status {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  height: 16px;
+  margin-top: 4px;
+  opacity: 1;
+  transition: opacity 0.25s ease;
+}
+
+.dualang-status--hiding {
+  opacity: 0;
+}
+
+.dualang-status-icon {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+}
+
+/* 排队中：空心圆圈 */
+.dualang-status--queued .dualang-status-icon {
+  border: 1.5px solid #3a3f44;
+}
+
+/* 翻译中：蓝色旋转圆圈 */
+.dualang-status--loading .dualang-status-icon {
+  border: 1.5px solid #3a3f44;
+  border-top-color: #1d9bf0;
+  animation: dualang-spin 0.7s linear infinite;
+}
+
+/* 已跳过：短横线 */
+.dualang-status--pass .dualang-status-icon {
+  width: 8px;
+  height: 2px;
+  border-radius: 1px;
+  background: #3a3f44;
+}
+
+/* 失败：红色圆底 + 白色重试箭头（SVG via mask），点击重新翻译 */
+.dualang-status--fail {
+  cursor: pointer;
+}
+
+.dualang-status--fail .dualang-status-icon {
+  position: relative;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #f4212e;
+  /* 白色 refresh / retry 箭头 — 用 mask-image 把 SVG 作为蒙版，保证在深浅主题下都可见 */
+  -webkit-mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none'><path d='M4 12a8 8 0 0 1 13.5-5.8L20 4v6h-6l2.2-2.2a6 6 0 1 0 1.5 6.2l1.9.6A8 8 0 0 1 4 12Z' fill='black'/></svg>");
+          mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none'><path d='M4 12a8 8 0 0 1 13.5-5.8L20 4v6h-6l2.2-2.2a6 6 0 1 0 1.5 6.2l1.9.6A8 8 0 0 1 4 12Z' fill='black'/></svg>");
+  -webkit-mask-size: 10px 10px;
+          mask-size: 10px 10px;
+  -webkit-mask-position: center;
+          mask-position: center;
+  -webkit-mask-repeat: no-repeat;
+          mask-repeat: no-repeat;
+  background-color: #f4212e;
+  transition: transform 0.18s ease;
+}
+
+.dualang-status--fail:hover .dualang-status-icon {
+  transform: rotate(-90deg);
+}
+
+/* 成功：模型品牌图标（16px），点击跳转到 API 部署方控制台 */
+.dualang-status--success {
+  cursor: pointer;
+}
+
+.dualang-status-icon--brand {
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  object-fit: contain;
+  opacity: 0.85;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.dualang-status--success:hover .dualang-status-icon--brand {
+  opacity: 1;
+  transform: scale(1.08);
+}
+
+@keyframes dualang-spin {
+  to { transform: rotate(360deg); }
+}

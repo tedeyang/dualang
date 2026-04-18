@@ -1,0 +1,222 @@
+# Dualang 优化 TODO
+
+## 待办（Code Review 遗留）
+
+### Required
+
+- [ ] **content/index.ts 类型补全**：`scanAndQueue` / `queueTranslation` / `handleSubBatchError` / `flushQueue` 局部变量 / `showStatus` / `hideStatus` / `showPassAndHide` / `showFail` / `injectTranslateButton` / `renderTranslation` / `perfLog` 仍为隐式 `any`。`TweetArticle` 已声明但 `(article as any)._dualangContentId` 处仍做 cast，要么全用 `TweetArticle`，要么删 `TweetArticle`。
+- [ ] **删除 `_dualangEnqueueTime`** 或启用为"排队等待时长"遥测（当前仅写入从未读取，是死状态）。真正被用到的是 `_dualangIsHighPriority` / `_dualangContentId` / `_dualangLastText` / `_dualangShowMoreTimer` / `_dualangQualityRetried`。
+- [ ] **统一单条与批量 API 的 system prompt**：`api.ts` 里 `doTranslateSingle` 和 `doTranslateBatchRequest` / `doTranslateBatchStream` 各自写死一版 prompt，语义相同但措辞不同 — 抽成 `buildTranslatePrompt({ batch: boolean, lang })`。手动按钮走单条路径、自动走批量，同一条推文在两条路径下翻译风格可能不一致。
+- [ ] **合并两处 `chrome.runtime.onInstalled` 监听**（background/index.ts:27 和 :38），空的 `chrome.alarms.onAlarm` handler 加一行注释说明"alarm 触发本身就是 keep-alive 的副作用，body 故意留空"。
+
+### Suggestions
+
+- [ ] **`setCache` 批量化**：`handleTranslateBatch` 成功路径里一个 for 循环串行 `await setCache`，每次都 `storage.get + storage.set`。加一个 `setCacheBatch(entries)`，合并成一次读 + 一次写。
+- [ ] **`translationCache` 改真 LRU**：当前是 insertion-order FIFO，热门推文会被冷门推文的最近一次写入挤掉；`memCacheMap` 在 cache.ts 里做了 delete+reinsert 的 LRU，两边应一致。
+- [ ] **`batchHash` 分隔符改 `\u0000`**：现在用 `\n---BATCH---\n`，如果推文正文含此字面值则会与另一批哈希碰撞（病态但非零概率）。
+- [ ] **`LANG_DISPLAY['zh-TW']` 改为繁体字面**：`'繁体中文（台湾正体）'` 用简体字描述繁体，内部不一致 — 改成 `'繁體中文（台灣正體）'`。
+- [ ] **`handleSubBatchError` 重试总是 `unshift` 到队首**：所有类型的重试都无条件进队列最前，可能让低优先级 retry 抢在新进视窗的高优之前。要么按原优先级重入队，要么加注释说明"重试优先于新请求是故意的"。
+- [ ] **`inFlight` Map 无上限**：`background/index.ts:89` 的 `inFlight` 靠 `.finally()` 清理；绝大多数情况 SW 重启会一并清空。加一行注释说明这点，避免后人"修复"成 LRU 反而破坏不变式。
+
+---
+
+## 已完成
+
+### P0 — 速度：消除关键路径 IO 瓶颈
+
+- [x] **设置内存缓存**：`background.js` 每次翻译都 `chrome.storage.sync.get`，改为模块级变量缓存，`chrome.storage.onChanged` 时失效 ✅
+- [x] **翻译两层缓存**：在 `chrome.storage.local`（L2）之上加内存 Map（L1，LRU 200 条），cache hit 零 IO 返回 ✅
+- [x] **批量缓存并行读**：`handleTranslateBatch` 的串行 `for await getCache()` 改为一次 `getCacheBatch(hashes)`，单次 storage 读取 + 内存查表 ✅
+
+### P1 — Token：减少无效 API 调用
+
+- [x] **拆分并行 batch**：20 条一个请求改为每 5 条一批并行发送，首批 5 条结果先到先渲染 ✅
+- [x] **完善语言检测**：补全繁体扩展区、区分日文（平假名/片假名）、阈值从 70% 降至 40% ✅
+- [x] **文本规范化再 hash**：`normalizeText()` + `cacheKey()` 封装，两端（content/background）一致 ✅
+
+### P2 — Token：更多跳过场景 & 测试修复
+
+- [x] **扩展 skip 条件**：纯 URL（去 URL 后 < 6 字符）、纯 emoji/符号（无字母/汉字）跳过 ✅
+- [x] **修复 mock HTML**：补全 `<a>` 链接、`<img alt>` emoji、操作栏、Show more、中文/繁体/纯 URL 推文 ✅
+- [x] **补充测试场景**：简体中文跳过、繁体中文跳过、纯 URL 跳过、emoji img 提取、a 链接提取、Show more 重翻 ✅
+- [x] **修复旧 mock 返回格式**：`---PARA---` 改为 `\n\n` ✅
+- [x] **playwright.config.ts**：`python3` 改为 `uv run python3`（本地环境要求） ✅
+
+### P3 — 功能完善
+
+- [x] **实现目标语言设置**：popup 加 10 语言 `<select>`，background `LANG_DISPLAY` 动态 prompt，hash key 用真实 lang，content.js `isAlreadyTargetLanguage()` 感知目标语言 ✅
+- [x] **手动翻译按钮 + 双语对照模式**：popup 加 `autoTranslate` 和 `bilingualMode` 开关；关闭自动翻译时显示「译」按钮；双语模式在译文上方插入原文段落 ✅
+- [x] **支持 SiliconFlow GLM-4-9B-0414**：popup 加「快速配置」下拉框，一键切换 SiliconFlow 免费模型，manifest 新增 host_permissions ✅
+
+### P4 — 批量翻译 & 速率控制
+
+- [x] **整页批量翻译**：视口内推文合并为一次 API 请求（batch 20 / sub-batch 5），大幅降低并发请求数 ✅
+- [x] **RateLimiter**：background.js 内实现并发/TPM/RPM/TPD 限流器，约束值：100 并发、500 RPM、3M TPM、无 TPD 限制 ✅
+- [x] **首屏加速**：初始化扫描从 500ms 提前到 150ms，flush 调度从 50ms 降到 20ms，预加载边距 ±1 屏，请求 fire-and-forget ✅
+- [x] **Show more 初版检测**：MutationObserver 检测推文文本区新增节点，自动移除旧翻译并重新排队（后在 P13 重构）✅
+
+### P5 — 样式 & 渲染
+
+- [x] **简化翻译样式**：删除蓝色背景、边框、padding、动画，翻译块继承 x.com 原生字体颜色，仅保留段落间距 ✅
+- [x] **段落级翻译**：按 `\n\n` / `---PARA---` 拆分译文，每个段落独立 `<div class="dualang-para">`，保持阅读连续性 ✅
+- [x] **失败图标**：右下角红色圆点带 ×，点击后高优先级重试；失败状态阻止自动入队 ✅
+
+### P6 — API 错误处理 & 诊断
+
+- [x] **Kimi API 错误分类捕获**：按官方文档处理 400/401/403/404/429/500+，区分 `engine_overloaded_error`（重试）、`exceeded_current_quota_error`（立即失败）、`rate_limit_reached_error`（按返回时间等待后重试）✅
+- [x] **自动重试**：可重试错误最多 3 次指数退避，不可重试错误立即抛出中文提示 ✅
+- [x] **性能日志**：content.js 内建 `perfCounters` + `perfLog`，每 10 秒输出 summary，覆盖 Observer 触发、队列、API RTT、渲染耗时等关键指标 ✅
+
+### P7 — 配置管理
+
+- [x] **外部配置文件**：新增 `config.json` 存放 Moonshot / SiliconFlow API Key，`.gitignore` 排除，代码通过 `chrome.runtime.getURL('config.json')` 动态读取 ✅
+- [x] **配置模板**：新增 `config.example.json` 供开发者参考，不泄露真实 Key ✅
+
+### P8 — 稳定性 & 性能补完
+
+- [x] **Unobserve 已处理推文**：翻译完成或 pass/fail 后调用 `viewportObserver.unobserve()` + `preloadObserver.unobserve()`，避免长滚动中大量无效 Observer 回调 ✅
+- [x] **Service Worker Keep-Alive**：content.js 建立持久 `chrome.runtime.connect` 端口；background.js 监听端口 + `chrome.alarms` 每分钟唤醒兜底；manifest 加 `alarms` 权限 ✅
+- [x] **预加载防抖最大等待上限**：scheduleFlush 加 `_timerCreatedAt` 记录首次建 timer 时间；低优先级 timer 重置时检查已过 800ms 则立即 flush ✅
+- [x] **补充测试**：新增 `status-and-reliability.spec.ts`，覆盖 pass 状态生命周期、loading→翻译完成、401 fail 点击重试、fallback popup 配置保存、fallback 自动切换共 5 个场景 ✅
+- [x] **错误状态上报 popup**：background.js `reportFatalError()` 写入 `dualang_error_v1`；popup 打开时读取并展示红色可点击横幅，保存设置时自动清除；badge 红色 `!` 提示 ✅
+- [x] **硅基流动免费 API 兜底**：`getSettings()` 加载 fallback 配置；`handleTranslateBatch` 在主 API 不可重试错误时自动切到 fallback；popup 新增兜底 API 配置区（开关/预设/Key/模型）；fallback 激活时 badge 显示橙色 `FB` ✅
+
+### P9 — 架构重构
+
+- [x] **esbuild + TypeScript 构建**：src/ 下 TypeScript 模块化开发，esbuild 打包为 IIFE 格式 content.js / background.js，globalSetup 自动构建，`@ts-nocheck` 全部移除，chrome-types 类型检查通过 ✅
+- [x] **background.js 模块化**：拆分为 `cache.ts` / `settings.ts` / `rate-limiter.ts` / `api.ts` / `error-report.ts` + `index.ts` 薄编排层 ✅
+- [x] **content.js 模块化 + withSlot RAII**：纯函数提取到 `utils.ts`，`withSlot()` 替代手动 activeRequests++/-- 消除漂移 bug ✅
+- [x] **推文 ID 缓存**：`getTweetId()` 从 `/status/<id>` 链接提取推文 ID，`translationCache` Map 缓存翻译结果（500 条），虚拟 DOM 回收后重现的 article 零 IO 恢复翻译 ✅
+- [x] **事件驱动调度器**：`scheduler.request(urgent?)` 替代 7 处散落的 `scheduleFlush()` 调用，`withSlot` 释放槽位时自动 drain 队列（urgent 80ms / normal 200ms / 满批次立即 / 800ms 硬上限）✅
+- [x] **vitest 单元测试**：55 个测试覆盖 `isAlreadyTargetLanguage`、`shouldSkipContent`、`getTweetId`、`normalizeText`、`classifyApiError` 的所有分支 ✅
+- [x] **流式批量翻译**：`enableStreaming=true` 时 content.js 通过 `chrome.runtime.connect('translate-stream')` 端口与 background 通信，SSE 流式解析 + `extractCompletedEntries()` 花括号计数增量 JSON 提取，每条翻译完成立即 `port.postMessage({action:'partial'})` 推送到 content 逐条渲染 ✅
+
+### P10 — 压力测试发现的 4 个 bug
+
+- [x] **不可重试错误传播**：`retryable` flag 在 background → content 完整传递，401/403/404 直接 showFail 不浪费 3 次重试 ✅
+- [x] **JSON 截断部分恢复**：`doTranslateBatchRequest` 解析失败时调 `extractCompletedEntries` 做 partial recovery，能拿回的子批次先展示 ✅
+- [x] **`scanAndQueue` 限流**：`pendingScanRoots` 只收集含 `article[data-testid="tweet"]` 的根节点，避免 X.com 每次 style/attr 变更都过一遍 querySelectorAll ✅
+- [x] **`max_tokens` 估算**：非流式和流式两处统一为 `Math.max(maxTokens * texts.length, inputChars/3 + 80 * texts.length)`，既不浪费也不截断 ✅
+
+### P11 — 用户操作优先级（三步走）
+
+- [x] **Step 1：用户可见操作统一走 `translateImmediate`**：`showFail` 重试 / 手动翻译按钮 / Show more 全部走 priority 2 的立即翻译通道（绕过队列和并发上限）；`preloadObserver` 离开视窗时从 `pendingQueue` 摘除非高优推文，节省配额 ✅
+- [x] **Step 2：priority ≥ 2 绕过限流冷却**：`RateLimiter._process` 对 priority 2+ 跳过 `_checkLimits` 和 `_withIoLock`，宁可让服务端返 429 也不让用户眼前的内容在本地等锁 ✅
+- [x] **Step 3：并发赛跑（UI 勾选）**：popup 新增 `hedgedRequestEnabled` 开关（兜底 API 已开启时可见），background `raceMainAndFallback` 用 `Promise.any` 并发请求主+兜底 API，败者 abort 节省配额；priority ≥ 1（视窗内/show-more/手动）生效，preload 不赛跑 ✅
+
+### P12 — Code Review 三项 blocking
+
+- [x] **Fix #1：流式模式 `activeRequests` slot 泄漏**：`flushQueueStreaming` 加 `slotReleased` flag，`done`/`error`/`timeout`/`onDisconnect` 四路任一触发时恰好一次释放，解决 SW 冷重启在任何消息到达前就 disconnect 的场景 ✅
+- [x] **Fix #2：DOM 回收竞态**：`BatchItem` 入队时捕获 `tweetId`，`renderAndCacheResult` / `translateImmediate` / 手动按钮在 await 返回后比较当前 `getTweetId(article)`，不匹配则丢弃结果记 `recycleDrop` 日志，避免把 A 推文的翻译渲染到 X.com 复用后的 B 推文下 ✅
+- [x] **Fix #3：RateLimiter TOCTOU + 多 victim 抢占**：`_withIoLock` 用 promise 链串行化 `_checkLimits` + `_persistAdd` 的 read-modify-write；`_preemptionPending` flag 防止并发高优 acquire 各自 abort 不同 victim ✅
+
+### P13 — Show more 结构化检测（取代 P4 初版）
+
+- [x] **长度差检测代替 containment 检查**：`_dualangLastTextLength` 基线在 `scanAndQueue` / `flushQueue` / `translateImmediate` / `renderAndCacheResult` 四处维护；MutationObserver 对 dualang-touched article 比较当前 vs 基线长度，任意层级的 mutation 都能命中 ✅
+- [x] **静默期去抖（取代固定时长）**：`_dualangShowMoreTimer` 每次新 mutation 重置 80ms 定时器，语义从"X.com 动画总时长假设"变为"mutation 批次间的静默间隔"（基于浏览器事件循环特性）；合并 X.com 多次 mutation 为一次处理，消除状态闪烁和重复 API 调用 ✅
+- [x] **`characterData` 观察**：MutationObserver 加 `characterData: true`，覆盖 X.com 就地替换文本节点 data 的场景 ✅
+- [x] **渲染前重取 `tweetTextEl`**：`translateImmediate` 和 `renderAndCacheResult` 在 await 返回后重新 `article.querySelector('[data-testid="tweetText"]')`，避免 X.com wrapper swap 后渲染到 detached 节点 ✅
+
+### P14 — 真实 X.com 本地 mock + 场景测试
+
+- [x] **`x-real.html`**：接近 X.com 真实结构（cellInnerDiv / 嵌套 wrapper / `data-testid="tweet-text-show-more-link"` / User-Name / 引用推文嵌套 article / Twemoji img / mentions / hashtags / 中文+英文+URL 混排）；`window.xSim` 模拟器暴露三种 show-more 展开模式（append / innerHTML replace / wrapper swap）+ 虚拟 DOM 回收 + 追加/删除推文 ✅
+- [x] **`real-scenarios.spec.ts` 6 个场景测试**：innerHTML 替换触发重翻、wrapper swap 触发重翻、中文跳过、mentions/hashtags 提取、嵌套引用推文各自独立翻译、DOM 回收中途触发 `recycleDrop`；对应 P11-P13 修复的回归守护 ✅
+
+### P15 — 状态图标品牌化（成功=模型 favicon，失败=重试箭头）
+
+- [x] **真实品牌 favicon 打包**：`icons/kimi.png` / `icons/moonshot.png`（月之暗面 platform.moonshot.cn favicon）、`icons/zai.svg`（z.ai CDN logo）、`icons/siliconflow.png`。`manifest.json` 加 `web_accessible_resources` 让 content script 在 x.com 上可用 `chrome.runtime.getURL()` 加载 ✅
+- [x] **`src/shared/model-meta.ts`**：`getModelMeta(model, baseUrl)` 将模型 → { modelName, modelDescription, iconUrl, apiDeployUrl }。品牌图标随模型作者走（GLM 永远显示 z.ai），点击 URL 随 API 部署方走；后又调整为统一指向品牌官网首页（kimi.com / z.ai / siliconflow.cn） ✅
+- [x] **`showSuccess(article, meta)`**：翻译完成后状态从 loading 变为模型品牌图标（16px），hover tooltip 显示模型名 + 一句话介绍 + 本次消耗 tokens（或"缓存命中"），点击 `window.open` 到官网；在 `renderAndCacheResult` / `translateImmediate` / `scanAndQueue` 的缓存恢复路径都接入 ✅
+- [x] **失败状态改为重试箭头图标**：CSS 用 SVG mask 在红底上画刷新箭头，hover 时 -90° 旋转；tooltip 包含模型名和错误原因，点击重试 ✅
+- [x] **Token 数据贯通**：`api.ts` 捕获 `response.usage`；`handleTranslateBatch` 返回 `{ translations, usage, model, baseUrl, fromCache }`；hedged 模式下返回胜者的 model/baseUrl；流式路径在每个 `partial` / `done` 消息里带上 model/baseUrl ✅
+- [x] **测试**：`status-and-reliability.spec.ts` 加 2 个场景（成功图标验证 `<img src>` + tooltip + 点击打开；fail tooltip 含模型/错误/"点击重新翻译"）✅
+
+### P16 — 翻译完整性保障（质量检查 + 陈旧缓存失效）
+
+- [x] **`hasSuspiciousLineMismatch(original, translated)`**（`src/content/utils.ts`）：对 ≥ 150 字符的原文做三重检查 — 字符数急剧缩减（< 14%）、行数坍缩（原文 ≥ 3 行而译文不到一半）、段落严重合并（≥ 3 段变 1 段）。门槛避免误伤短推文的自然段落合并 ✅
+- [x] **一次性质量重试**：翻译结果可疑 → 设 `_dualangQualityRetried` → 走 `translateImmediate(..., isQualityRetry=true)` 重试。`isQualityRetry` 触发 `sendMessage({ skipCache: true })`，`handleTranslateBatch` 绕过 `getCacheBatch`，避免刚写入的坏翻译把自己的重试吃掉。重试一次后不论结果都接受 ✅
+- [x] **重试后仍不理想 → 显示 fail 图标而非 success**：`renderAndCacheResult` / `translateImmediate` 在 retry 用尽仍可疑时渲染结果但挂上 fail 图标，tooltip "译文与原文段落数差异过大，点击强制重新翻译"。用户可手动点击再试一次（点击会 reset `_dualangQualityRetried` + skipCache） ✅
+- [x] **缓存返回不做质量检查**：`meta.fromCache=true` 时跳过 `hasSuspiciousLineMismatch`，缓存是已落盘的决策，重试只会浪费 API 调用 ✅
+- [x] **`scanAndQueue` 陈旧缓存识别**：通过 tweetId 恢复翻译时比较 `extractText(currentTweetTextEl).length` 与 `cached.original.length`，当前文本 > 1.3× 则视为陈旧（例如截断→全文、列表→详情页、show-more 展开后 DOM 重建），删除缓存条目 → 回到正常排队路径 → 重新翻译；日志为 `cacheInvalidateStale` ✅
+- [x] **`translationCache` 扩展**：条目加入 `{ model, baseUrl }`，`scanAndQueue` 恢复时 `showSuccess` 能展示正确的品牌图标 ✅
+- [x] **测试**：7 条新增单元测试覆盖 `hasSuspiciousLineMismatch` 边界（字符比 / 行坍缩 / 段合并 / 短推文不触发 / 空译文 / 正常多行译文）；3 条新增场景测试（`qualityRetry` 日志 + 2 次 API + 最终展示新结果；两次都坏时 fail 图标可见；同 tweetId 长度暴涨触发 `cacheInvalidateStale` + 重翻）✅
+
+### P17 — Cache ID 泛化（面向多站点）
+
+- [x] **`getTweetId` → `getContentId`，策略链实现**（`src/content/utils.ts`）：按优先级尝试 `/status/<id>` (X) → `/statuses/<id>` (Mastodon) → `/comments/<id>` (Reddit) → `/item?id=<id>` (HN) → `?v=<11-char>` (YouTube) → `/post/<id>` (Bluesky) → `data-postId/commentId/messageId/entryId/threadId` 属性 → 元素自身 `id`；未命中返回 null，调用方对 null 情况跳过按 ID 的缓存优化（L2 文本哈希缓存不受影响）✅
+- [x] **内部重命名**：`_dualangTweetId` → `_dualangContentId`，`tweetId` / `currentTweetId` / `prevTweetId` / `originalTweetId` → `contentId` / `currentContentId` / `prevContentId` / `originalContentId`，`BatchItem.tweetId` 字段、perfLog 键一并改名；`getTweetId` 保留为 `getContentId` 的别名以支持旧外部 import ✅
+- [x] **9 条新增单元测试**：覆盖每种策略（X / Mastodon / Reddit / HN / YouTube / Bluesky / data 属性 / id 回退 / 全空返回 null）+ URL 模式优先于 data 属性的优先级检查 ✅
+
+### P18 — 缓存验证改为精确文本匹配
+
+- [x] **`_dualangLastText: string` 替代 `_dualangLastTextLength: number`**：4 处写入点（scanAndQueue / flushQueue / translateImmediate / renderAndCacheResult）统一存 `textContent`，不再只存长度 ✅
+- [x] **MutationObserver 精确比较**：`currentText === prevText` 代替 `currentLen === prevLen`，捕获"长度不变但内容变"的编辑（X.com 编辑推文、同字数替换等）✅
+- [x] **`scanAndQueue` 恢复路径严格校验**：用 `extractText(currentTweetTextEl) !== cached.original` 替代 1.3× 长度阈值。任何差异都作废缓存条目，`cacheInvalidateStale` perfLog 新增 `reason` 字段（`'edit'` / `'length-diff'` / `'no-baseline'`）✅
+- [x] **新增 e2e**：同 contentId 下把文本从 "I really enjoy eating ... apples ..." 换为同长度的 "... grapes ..."，期望 `cacheInvalidateStale` 以 `reason: 'edit'` 触发，第二次 API 被调用，最终渲染新译文 ✅
+
+### P19 — 三个免费翻译提供方 + providerType 架构
+
+- [x] **SiliconFlow Qwen3-8B 预设**：`PRESETS['siliconflow-qwen3-8b']`，走既有 HTTP / OpenAI 兼容路径；fallback 预设也加了一份；`model-meta.ts` 识别 `qwen` 名称 → SiliconFlow 图标 + "阿里通义千问 — 开源中英文通用大模型（SiliconFlow 免费托管）"描述，点击跳 siliconflow.cn ✅
+- [x] **Chrome 138+ / Edge Canary 143+ 浏览器本地 Translator API**：同一 W3C 标准接口 `self.Translator.create({sourceLanguage, targetLanguage})`，无需 API Key、完全离线、无 token 计费；runtime 用 `/Edg\//` 检测 UA 选图标（`chrome.svg` / `edge.svg`）和品牌 ✅
+- [x] **新增 `providerType: 'openai' \| 'browser-native'` 设置**：popup 切到浏览器本地预设时，API Key / baseUrl / model / maxTokens / 流式 / fallback 开关整体置灰；settings.ts 默认 'openai' 保持向后兼容 ✅
+- [x] **`requestTranslation()` 统一分发**（`src/content/index.ts`）：根据 `providerType` 走本地 Translator（无 background、无 rateLimiter）或 `chrome.runtime.sendMessage`；`flushQueueSendMessage` / `translateImmediate` / 手动按钮 / 质量重试都通过这个入口 ✅
+- [x] **会话缓存**：`ensureBrowserSession(sourceLang, targetLang)` 按语言对复用 Translator session，切换语言或 providerType 时销毁老 session ✅
+- [x] **`src/shared/model-meta.ts` 新增品牌映射**：qwen → SiliconFlow；browser-native → Chrome/Edge 按 UA 选 ✅
+- [x] **文档 & 源码注释**：README 新增"参考资料"章节列出 SiliconFlow pricing / Moonshot platform / z.ai / Chrome Translator API / Edge Translator API / W3C explainer；`content/index.ts` 和 `model-meta.ts` 添加指向对应 spec / 定价页面的注释 ✅
+
+### P20 — Popup 三 Tab 布局 + 自适应延迟赛马
+
+- [x] **三 Tab 布局**（`popup.html` + `popup.css` + `popup.js`）：**主**（preset / key / model / 目标语言 / 自动翻译 / 双语） + **兜底 & 加速**（fallback 配置 / hedging 开关 / hedgedDelayMode） + **高级**（推理强度 / maxTokens / 流式）。`.tab-button` 驱动 `.tab-panel.active`，保存按钮跨 tab 共享 ✅
+- [x] **延迟式赛马（hedged request）**：`raceMainAndFallback` 不再同时发两路；主立刻发起，延迟 `hedgeDelayMs` 后若主未返回才启动兜底；主在延迟内成功 → 兜底永不发起（节省配额）；主在延迟内失败 → 立即启动兜底（fallback 语义优先于赛跑）✅
+- [x] **自适应延迟（`hedgedDelayMs: 'auto'`，默认）**：滚动窗口保留最近 20 次主 API 成功 RTT，返回 p95 夹在 `[HEDGE_FLOOR_MS=300, HEDGE_CEILING_MS=3000]`；样本不足时用 `HEDGE_BOOTSTRAP_MS=500` 保底 ✅
+- [x] **UI 读数**：popup 通过新增 `getHedgeStats` 消息查询当前样本数 / p95 / 上下限，实时显示"自适应当前值：XXXms（主 API 最近 N 次 RTT 的 p95，夹在 300–3000ms 之间）" ✅
+- [x] **测试**：
+  - `延迟启动：主 API 足够快时兜底不发起` — `hedgedDelayMs=1000` + 主快速成功，断言 fallback 未被调用
+  - `popup 暴露 getHedgeStats 接口` — 验证消息通道
+  - `赛马败者被 abort 不触发 popup 错误横幅` — 防回归上面 P20 的 bug
+  - 原有赛跑 / 双失败测试仍通过 ✅
+- [x] **Fix: AbortError 不再进 fatal banner**（`src/background/api.ts`）：`callWithRetry` 将 `err.name === 'AbortError'` 与 `err.preempted` 同等处理 — 预期取消，不重试、不写 `dualang_error_v1`。修复 hedged 败者被 abort / rateLimiter 抢占时 popup 出现 "⚠️ signal is aborted without reason" 的 false alarm ✅
+- [x] **E2e 基础设施**：`expandAllTabPanels(page)` helper 通过 `addInitScript` 注入 `.tab-panel { display: block !important }` CSS 覆盖，使 Playwright 能操作所有 tab 下的 input；popupPage fixture 自动应用，自建 popup 的测试（如 target-lang）调用 helper ✅
+
+### P21 — 品牌收尾（改名 / 营销文案 / Qwen 图标 / 扩容）
+
+- [x] **插件改名 X 光速翻译**：`manifest.json` `name` / `popup.html` `<title>` + `<h1>` / `README.md` 标题全部换掉；内部 CSS 类名、storage key、日志前缀保留为 dualang（避免升级破坏用户缓存和错误状态）✅
+- [x] **描述营销化**：manifest `description` → "刷 X 不被翻译拖慢。视窗即译、点击秒回，多家模型并发赛跑，主 API 卡？自动切兜底 — 译文永远追得上你的滚动。"；popup 副标题 → "译文追得上你的滚动"；README 开篇 → "刷 X 时，译文应该像空气一样不被察觉。"✅
+- [x] **Qwen 品牌视觉归位**：从 `assets.alicdn.com/g/qwenweb/qwen-chat-fe/0.2.40/favicon.png` 下载真 favicon → `icons/qwen.png` (64×64)；`model-meta.ts` 里 Qwen 条目改用自己的图标 + `apiDeployUrl: https://chat.qwen.ai/`（不再借 SiliconFlow 的），描述去掉"SiliconFlow 免费托管"尾巴；规则归一为"图标跟模型作者 / 点击跳模型作者" ✅
+- [x] **默认缓存 ×10**：L1 内存 `MEM_CACHE_MAX` 200 → 2000；L2 storage `CACHE_MAX_SIZE` 500 → 5000；content-side tweetId `TRANSLATION_CACHE_MAX` 500 → 5000。`manifest.json` 追加 `unlimitedStorage` 权限以支撑 L2 更大容量（升级时 Chrome 会提示新权限）✅
+
+### P22 — 监控系统化（日志分级 + 业务语义 + Stats tab）
+
+- [x] **日志分级**：新增 `perfLog`（`console.debug`，verbose 内部埋点）与 `logBiz`（`console.log/warn/error`，业务事件）两个函数；DevTools Default 级不再被 `enqueue` / `scan` / `render` 刷屏，关键业务事件保留在默认输出 ✅
+- [x] **业务语义 tag**：事件名从缩略重命名为 dot-分隔语义 — `translation.request.ok` / `translation.request.fail` / `translation.immediate.fail` / `translation.quality.retry` / `translation.quality.give_up` / `cache.invalidate.stale` / `cache.hit.full` / `dom.recycle.drop` / `fallback.activated` / `hedged.winner`。content 与 background 两端统一。原有 perfLog 事件若不属于业务事件则保留短名但降级为 debug ✅
+- [x] **`src/background/stats.ts` 新模块**：内存累加 → debounce 2s → `chrome.storage.local.dualang_stats_v1`；SW 重启从 storage 恢复；三个消息接口 `getStats` / `resetStats` / `recordQualityRetry`；模型 key 归一（`browser-native` 不按 Chrome/Edge 拆分）✅
+- [x] **插桩点**：`handleTranslateBatch` 成功/失败路径记录 `recordRequest(model, ok, rttMs, usage)`；fallback-on-fatal 用 fallback 模型独立记录；全/部分缓存命中记录 `recordCacheHit`；content 质量重试时 sendMessage(`recordQualityRetry`) ✅
+- [x] **Popup "统计" tab**：宽度从 320 → 360；顶部三汇总卡（请求总数 / tokens 合计 / 缓存命中率）；各模型行带品牌图标 + `avg Xms` / `tokens Xk` / `请求 N` + 五色成功率条（≥95% 绿 / ≥80% 橙 / <80% 红）；下方最近错误 `<ul>` 展示 HH:MM:SS + 模型 + 红色错误文本；刷新 / 重置按钮；切到该 tab 立即拉一次 + 停留时每 3s 自动刷新；纯 CSS 可视化无 chart 库 ✅
+- [x] **测试**：新增 `统计 tab：成功请求后展示模型行、tokens、成功率；错误进入日志` — 一次 200 + usage、一次 401，打开 popup 断言 tokens 非空、模型行可见、错误日志含 401 message；原 3 条依赖旧事件名的 e2e 更新为新 tag ✅
+
+### P23 — 兜底优先 & 思考关闭 & Provider profile 抽象
+
+- [x] **Fallback 优先于重试**：当配置了兜底 API 且不在 hedged 模式，主 API 只尝试 1 次（`maxRetries=0`），任何失败（retryable 或 fatal）立刻切兜底，跳过主上 3 次指数退避。主失败 5xx 的最坏情况从 ~14s 缩到 ~1s ✅
+- [x] **思考模式默认关闭**：popup 推理强度改名"思考模式"，新增"关闭思考（推荐）"选项并设为默认；`settings.ts` 默认 `reasoningEffort='none'`；api.ts `applyThinkingMode` 按 profile 策略分发：Qwen3 → `enable_thinking:false`；GLM-4.6+ → `thinking:{type:disabled}`；Moonshot/通用 → 省略 `reasoning_effort` ✅
+- [x] **Provider profile 注册表**（`src/background/profiles.ts`）：把 per-provider 的 endpoint / temperature / thinkingControl / supportsStreaming / system prompt 全部登记到 `ProviderProfile` 数组，`getProfile(settings)` 按 `matchBaseUrl` substring / `matchModel` regex 首匹配返回。api.ts 的三个 body builder 变成无分支的组装器。扩展新 provider = 加一行 profile 不用改主流程 ✅
+- [x] **Profile 拆分**：`/qwen3|qwq/i` 走 QWEN3_PROFILE（enable_thinking:false），`/qwen/i` 兜底走 QWEN_LEGACY_PROFILE（**不**传 thinking 字段 — Qwen2.5 API 不支持该参数，误传会诱发 "on on on" 退化循环，bench v2 实测确认）✅
+
+### P24 — Benchmark v2：Claude 评审 + 模型配置 UI 升级
+
+- [x] **`scripts/benchmark-v2.mjs`**：Claude 人工评审替代 LLM 自评；短文本 ≤100 字符用 simple prompt；Qwen2.5 4 温度网格（0.1 / 0.3 / 0.7 / 1.0）；2.5s/req 节流；`/tmp/bench_v2_*.json` 输出 ✅
+- [x] **Bench v2 三大发现** → `models_benchmark.md` 重写：
+  - kimi-k2.5 必须 temperature=1（Moonshot API 拒绝其他温度；v1 报告 §6.1 建议无效）
+  - Qwen2.5 在 T≥0.3 时约 30% 概率陷入 "on" 退化循环，**T=0.1 是唯一稳定温度** → `QWEN_LEGACY_PROFILE.temperature` 从 0.3 改 0.1
+  - GLM-4-9B 是最稳定的免费主力（1.9s / 质量 8.7），推荐作为默认 ✅
+- [x] **Popup 模型列表分组重组**：`<optgroup>` 按 bench 层级分 4 组（⭐ 推荐 / 免费主力 / 离线 / 实验慢），每个 `<option>` 带 `延迟 · 质量 · 成本` 三要素；fallback 下拉同步；默认主模型 `Qwen/Qwen2.5-7B-Instruct` → `THUDM/GLM-4-9B-0414`（稳定性优先）✅
+
+### P25 — 翻译质量问题治理（日志 + 截图驱动）
+
+- [x] **质量重试死循环**（日志 2045339181501866069）：223 字原文 → 22 字译文反复 give_up。根因：`hasSuspiciousLineMismatch` 未扣除 URL/@/#。修复：新增 `translatableCharCount`，长度门槛和字符比例都按"可翻译字符"计算 ✅
+- [x] **重试复用原 prompt 无效**：首次压缩出短译文，重试仍然是同一 prompt 所以同结果。修复：profile 新增 `systemPromptStrict`（"不得省略、合并、总结"），`translate` 消息带 `strictMode: boolean`，质量重试自动带 `skipCache + strictMode` 双开 ✅
+- [x] **Prompt 占位符被模型抄袭**（截图 Image 2 "这条翻译"）：BATCH_PROMPT 里 `{"translated":"第一条翻译"}` 示例被 7-9B 模型当 template 原样填充。修复：删除所有可被抄的示例文本，改成纯 schema 描述。附 "⚠️ 历史教训" 注释 ✅
+- [x] **语言识别错误**（截图 Image 1 "codex is becoming a security agencyic IDE"）：37 字短文本避开 150 字门槛，输出根本不是中文还是放行。修复：新增 `isWrongLanguage(translated, targetLang)` — CJK 目标语下剥离 URL/@/#/标点/数字后 CJK 占比 <30% 判定语言错。加入质量检查：`suspicious = lineMismatch || wrongLanguage` ✅
+- [x] **prompt 强化语言要求**：SINGLE_PROMPT 和 BATCH_PROMPT 规则 #1 改成 "输出必须完全是 {lang}；专有名词可音译或保留原样，但不得整句保留原文英文" ✅
+- [x] **JSON 硬化**（日志 `"[\nned 1詹森夸大..."`）：Qwen2.5 偶发返回"JSON 外壳乱码 + 正文完整中文"。两层修复：(1) `body.response_format = {type:'json_object'}` 让服务端约束输出合法 JSON；(2) 新增 `salvageSingleTranslation(raw)`，`texts.length===1` 时从杂乱输出里救出 `"translated"` 值或纯 CJK 文本，要求 ≥10 CJK 字符才接受 ✅
+- [x] **段落崩塌**（截图 Image 4：4 段原文 → 1 坨译文）：三层治理：(1) BATCH_PROMPT / STRICT_PROMPT 把"段落必须 1:1 保留、用 \\n\\n 分隔"升到规则 #1 硬指令；(2) 已有 `hasSuspiciousLineMismatch` 段落坍缩规则触发 strict retry；(3) 新增 `rebuildParagraphs(text, targetCount)` 客户端兜底 — 译文仍 1 段但原文 ≥3 段时，按中英文句末标点拆句、按目标段数均匀分组 ✅
+- [x] **测试**：`utils.test.ts` 新增 16 条（URL 扣除 3 条、`isWrongLanguage` 8 条、`rebuildParagraphs` 5 条）；`real-scenarios.spec.ts` 新增"质量重试用严格 prompt"e2e 验证 API 收到 `strictMode=true` ✅

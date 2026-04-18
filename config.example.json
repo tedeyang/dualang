@@ -1,0 +1,10 @@
+{
+  "providers": {
+    "moonshot": {
+      "apiKey": "sk-your-moonshot-api-key"
+    },
+    "siliconflow": {
+      "apiKey": "sk-your-siliconflow-api-key"
+    }
+  }
+}

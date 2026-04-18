@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>X 光速翻译 · 设置</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <div id="errorBanner" class="error-banner" style="display:none;"></div>
+    <div class="header">
+      <h1>X 光速翻译</h1>
+      <p class="subtitle">译文追得上你的滚动</p>
+    </div>
+
+    <div class="hint" style="margin-bottom:10px; color:#71767b; font-size:12px;">
+      右键页面空白处可快速开启/关闭翻译
+    </div>
+
+    <div class="tabs" role="tablist">
+      <button class="tab-button active" data-tab="main" role="tab">主</button>
+      <button class="tab-button" data-tab="speed" role="tab">兜底 & 加速</button>
+      <button class="tab-button" data-tab="stats" role="tab">统计</button>
+      <button class="tab-button" data-tab="advanced" role="tab">高级</button>
+    </div>
+
+    <!-- ===== Tab: 主 ===== -->
+    <div class="tab-panel active" data-panel="main">
+      <div class="form-group">
+        <label for="preset">模型提供方</label>
+        <select id="preset">
+          <optgroup label="⭐ 推荐（bench v2 实测）">
+            <option value="moonshot-v1-8k">Moonshot v1-8k · 1.8s · 质量 8.9（需付费 Key）</option>
+            <option value="siliconflow-glm-4-9b">SiliconFlow GLM-4-9B · 1.9s · 质量 8.7 · 免费</option>
+          </optgroup>
+          <optgroup label="免费主力">
+            <option value="siliconflow-qwen2.5-7b">SiliconFlow Qwen2.5-7B · ~1.5s · 质量 8.8 · 低温专用</option>
+            <option value="siliconflow-qwen3-8b">SiliconFlow Qwen3-8B · 4.0s · 质量 8.5</option>
+          </optgroup>
+          <optgroup label="离线（无需 Key）">
+            <option value="browser-native">浏览器本地 · Chrome 138+ / Edge Canary 143+</option>
+          </optgroup>
+          <optgroup label="实验 / 慢">
+            <option value="moonshot-k2.5">Moonshot Kimi k2.5 · 28s · 推理模型，翻译过杀</option>
+          </optgroup>
+          <option value="custom">自定义</option>
+        </select>
+        <p class="hint">延迟与质量来自 <code>scripts/benchmark-v2.mjs</code> 实测（2026-04-18）。详见 <code>models_benchmark.md</code>。</p>
+      </div>
+      <div class="form-group">
+        <label for="baseUrl">API 地址</label>
+        <input type="text" id="baseUrl" placeholder="https://api.moonshot.cn/v1">
+      </div>
+      <div class="form-group">
+        <label for="apiKey">API Key</label>
+        <input type="password" id="apiKey" placeholder="sk-...">
+        <p class="hint" id="apiKeyHint">在 <a href="https://www.kimi.com/" target="_blank">Kimi</a> 或 <a href="https://cloud.siliconflow.cn/" target="_blank">SiliconFlow</a> 获取 API Key</p>
+      </div>
+      <div class="form-group">
+        <label for="model">模型名</label>
+        <input type="text" id="model" placeholder="moonshot-v1-8k">
+      </div>
+
+      <div class="form-group">
+        <label for="targetLang">目标语言</label>
+        <select id="targetLang">
+          <option value="zh-CN">简体中文</option>
+          <option value="zh-TW">繁体中文</option>
+          <option value="en">English（英语）</option>
+          <option value="ja">日本語（日语）</option>
+          <option value="ko">한국어（韩语）</option>
+          <option value="fr">Français（法语）</option>
+          <option value="de">Deutsch（德语）</option>
+          <option value="es">Español（西班牙语）</option>
+          <option value="ru">Русский（俄语）</option>
+          <option value="pt">Português（葡萄牙语）</option>
+        </select>
+      </div>
+
+      <div class="form-group toggle-group">
+        <label class="toggle"><input type="checkbox" id="autoTranslate"><span class="slider"></span></label>
+        <span class="toggle-label">自动翻译推文</span>
+      </div>
+      <p class="hint" style="margin-top:-8px; margin-bottom:10px;">关闭后每条推文显示「译」按钮手动触发</p>
+
+      <div class="form-group toggle-group">
+        <label class="toggle"><input type="checkbox" id="bilingualMode"><span class="slider"></span></label>
+        <span class="toggle-label">保留原文对照</span>
+      </div>
+      <p class="hint" style="margin-top:-8px; margin-bottom:4px;">开启后在译文上方显示原文段落</p>
+    </div>
+
+    <!-- ===== Tab: 兜底 & 加速 ===== -->
+    <div class="tab-panel" data-panel="speed">
+      <div class="form-group toggle-group">
+        <label class="toggle"><input type="checkbox" id="fallbackEnabled"><span class="slider"></span></label>
+        <span class="toggle-label">启用兜底 API</span>
+      </div>
+      <p class="hint" style="margin-top:-8px; margin-bottom:10px;">主 API 返回 401 / 额度耗尽时自动切换到此 API</p>
+
+      <div id="fallbackConfig">
+        <div class="form-group">
+          <label for="fallbackPreset">兜底提供方</label>
+          <select id="fallbackPreset">
+            <optgroup label="⭐ 推荐兜底">
+              <option value="siliconflow-glm-4-9b">SiliconFlow GLM-4-9B · 1.9s · 最稳 · 免费</option>
+              <option value="siliconflow-qwen2.5-7b">SiliconFlow Qwen2.5-7B · ~1.5s · 低温专用 · 免费</option>
+            </optgroup>
+            <option value="siliconflow-qwen3-8b">SiliconFlow Qwen3-8B · 4.0s · 免费</option>
+            <option value="custom">自定义</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="fallbackBaseUrl">兜底 API 地址</label>
+          <input type="text" id="fallbackBaseUrl" placeholder="https://api.siliconflow.cn/v1">
+        </div>
+        <div class="form-group">
+          <label for="fallbackApiKey">兜底 API Key</label>
+          <input type="password" id="fallbackApiKey" placeholder="sk-...">
+        </div>
+        <div class="form-group">
+          <label for="fallbackModel">兜底模型</label>
+          <input type="text" id="fallbackModel" placeholder="THUDM/GLM-4-9B-0414">
+        </div>
+
+        <div class="form-group toggle-group">
+          <label class="toggle"><input type="checkbox" id="hedgedRequestEnabled"><span class="slider"></span></label>
+          <span class="toggle-label">赛马（主 + 兜底竞争）</span>
+        </div>
+        <p class="hint" style="margin-top:-8px; margin-bottom:10px;">用户可见的推文同时或错峰请求两个 API，谁先返回用谁，败者中止以节省配额</p>
+
+        <div class="form-group">
+          <label for="hedgedDelayMode">赛马启动时机</label>
+          <select id="hedgedDelayMode">
+            <option value="auto">自适应（依据主 API 最近 RTT 的 p95，推荐）</option>
+            <option value="0">即时并发（主 + 兜底同时发起，高体验高消耗）</option>
+            <option value="300">延迟 300ms</option>
+            <option value="600">延迟 600ms</option>
+            <option value="1000">延迟 1000ms</option>
+            <option value="2000">延迟 2000ms</option>
+          </select>
+          <p class="hint" id="hedgedDelayReadout">自适应：首屏前几条请求按 500ms 固定延迟；收集到样本后自动收敛到 p95</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Tab: 统计 ===== -->
+    <div class="tab-panel" data-panel="stats">
+      <div class="stats-summary">
+        <div class="stats-card">
+          <div class="stats-num" id="statTotalReqs">–</div>
+          <div class="stats-label">请求总数</div>
+        </div>
+        <div class="stats-card">
+          <div class="stats-num" id="statTotalTokens">–</div>
+          <div class="stats-label">Tokens 合计</div>
+        </div>
+        <div class="stats-card">
+          <div class="stats-num" id="statCacheHitRate">–</div>
+          <div class="stats-label">缓存命中</div>
+        </div>
+      </div>
+
+      <div class="stats-section-title">按模型 · 成功率 / 速度 / 消耗</div>
+      <div id="modelStatsList" class="model-stats-list">
+        <div class="stats-empty">尚无数据，打开 X.com 浏览几条推文后再来看。</div>
+      </div>
+
+      <div class="stats-section-title" style="margin-top:14px;">最近错误</div>
+      <ul id="errorLogList" class="error-log">
+        <li class="stats-empty-li">暂无错误</li>
+      </ul>
+
+      <div style="display:flex; gap:8px; margin-top:12px;">
+        <button id="refreshStatsBtn" class="btn-secondary">刷新</button>
+        <button id="resetStatsBtn" class="btn-secondary btn-danger">重置</button>
+      </div>
+    </div>
+
+    <!-- ===== Tab: 高级 ===== -->
+    <div class="tab-panel" data-panel="advanced">
+      <div class="form-group">
+        <label for="reasoningEffort">思考模式</label>
+        <select id="reasoningEffort">
+          <option value="none">关闭思考（推荐，翻译任务不需要推理）</option>
+          <option value="low">Low · 开启轻量思考</option>
+          <option value="medium">Medium · 中等思考</option>
+          <option value="high">High · 深度思考</option>
+        </select>
+        <p class="hint">翻译任务不需要模型"想"—— 关闭后省 token、省延迟。支持 Qwen / GLM-4.6+ 的模型会额外显式关闭 thinking 字段。</p>
+      </div>
+      <div class="form-group">
+        <label for="maxTokens">最大输出 Token / 条</label>
+        <input type="number" id="maxTokens" min="1" max="128000" step="1">
+      </div>
+      <div class="form-group toggle-group">
+        <label class="toggle"><input type="checkbox" id="enableStreaming"><span class="slider"></span></label>
+        <span class="toggle-label">启用流式输出（SSE）</span>
+      </div>
+      <p class="hint" style="margin-top:-8px; margin-bottom:4px;">逐条翻译结果实时渲染，但缓存对此模式不生效</p>
+    </div>
+
+    <button id="saveBtn" class="btn-primary" style="margin-top:16px;">保存设置</button>
+    <div id="status" class="status"></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

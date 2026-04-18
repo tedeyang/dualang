@@ -1,0 +1,28 @@
+# API keys and local configuration
+config.json
+
+# Dependencies and build outputs
+node_modules/
+dist/
+build/
+/content.js
+/background.js
+package-lock.json
+
+# Sessions and caches
+sessions/
+*.pma
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*

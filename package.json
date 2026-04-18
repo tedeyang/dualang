@@ -1,0 +1,20 @@
+{
+  "name": "dualang",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "build:dev": "node build.mjs --dev",
+    "watch": "node build.mjs --watch",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "chrome-types": "^0.1.425",
+    "esbuild": "^0.25.0",
+    "jsdom": "^29.0.2",
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.4"
+  }
+}
