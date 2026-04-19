@@ -52,10 +52,12 @@ export function initBubble(callbacks: Callbacks): void {
 
   root.addEventListener('pointerdown', (e) => {
     const parsedTop = parseFloat(root.style.top);
-    dragState = {
-      startY: e.clientY,
-      startTop: isNaN(parsedTop) ? e.clientY : parsedTop,
-    };
+    let baseline = parsedTop;
+    if (isNaN(baseline)) {
+      const computed = parseFloat(getComputedStyle(root).top);
+      baseline = isNaN(computed) ? e.clientY : computed;
+    }
+    dragState = { startY: e.clientY, startTop: baseline };
     moved = false;
     try { root.setPointerCapture(e.pointerId); } catch (_) {}
   });
