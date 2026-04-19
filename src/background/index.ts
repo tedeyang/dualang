@@ -363,6 +363,7 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
       const start = ci * CHUNK;
       const chunk = paragraphs.slice(start, start + CHUNK);
       try {
+        const pushedIndices = new Set<number>();
         await doTranslateBatchStream(
           chunk,
           settings,
@@ -370,17 +371,21 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
           (subIndex, translated) => {
             if (disconnected) return;
             const globalIndex = start + subIndex;
+            pushedIndices.add(subIndex);
             port.postMessage({ action: 'partial', index: globalIndex, translated });
             completedParagraphs++;
           },
           true, // strictMode：提示保留段落结构，减少模型压缩
         ).then((result) => {
-          // 补推流式未覆盖的条目（通常最后一条）
+          // 补推流式未覆盖的条目（通常是最后一条）
           for (let i = 0; i < result.translations.length; i++) {
-            const globalIndex = start + i;
+            if (pushedIndices.has(i)) continue;
             const t = result.translations[i];
-            if (t && completedParagraphs < start + i + 1) {
-              // 已经推过就不重推；用 completedParagraphs 粗略判断
+            if (!t) continue;
+            const globalIndex = start + i;
+            if (!disconnected) {
+              port.postMessage({ action: 'partial', index: globalIndex, translated: t });
+              completedParagraphs++;
             }
           }
         });

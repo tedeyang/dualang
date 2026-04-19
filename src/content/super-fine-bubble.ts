@@ -78,6 +78,7 @@ export function initBubble(callbacks: Callbacks): void {
     const nextTop = dragState.startTop + dy;
     const clamped = Math.max(20, Math.min(window.innerHeight - 60, nextTop));
     root.style.top = `${clamped}px`;
+    panel.style.top = `${clamped}px`;
   };
 
   const onPointerUp = () => {
@@ -100,6 +101,7 @@ export function initBubble(callbacks: Callbacks): void {
     <button class="dualang-bubble-panel-retry">重翻</button>
   </div>
 `;
+  if (!isNaN(savedTop)) panel.style.top = `${savedTop}px`;
   document.body.appendChild(panel);
   document.body.appendChild(root);
 
