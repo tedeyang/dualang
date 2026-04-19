@@ -48,10 +48,10 @@ export function initBubble(callbacks: Callbacks): void {
 
 export function trackArticle(article: Element): void {
   if (!ctx) return;
-  if (ctx.tracked.has(article)) return;
-  ctx.tracked.add(article);
   const id = article.getAttribute('data-dualang-article-id');
   if (!id) return;
+  if (ctx.tracked.has(article)) return;
+  ctx.tracked.add(article);
   ctx.currentArticleId = id;
   ctx.root.classList.remove('dualang-bubble--hidden');
   setBubbleState(id, 'idle');
