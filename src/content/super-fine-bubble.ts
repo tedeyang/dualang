@@ -8,7 +8,6 @@ interface Callbacks {
 interface BubbleCtx {
   root: HTMLElement;
   ring: SVGCircleElement;
-  label: HTMLElement;
   panel: HTMLElement;
   tracked: WeakSet<Element>;
   currentArticleId: string | null;
@@ -36,7 +35,16 @@ export function initBubble(callbacks: Callbacks): void {
       <circle class="dualang-bubble-ring-track" cx="20" cy="20" r="17" fill="none"/>
       <circle class="dualang-bubble-ring" cx="20" cy="20" r="17" fill="none" data-progress="0"/>
     </svg>
-    <div class="dualang-bubble-label">🌐</div>
+    <svg class="dualang-bubble-logo" viewBox="0 0 40 40" aria-label="X→文">
+      <text class="dualang-bubble-logo-x" x="14" y="20"
+            font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
+            font-size="13" font-weight="900"
+            text-anchor="middle" dominant-baseline="central">X</text>
+      <text class="dualang-bubble-logo-wen" x="26" y="20"
+            font-family="'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', 'Microsoft YaHei', system-ui, sans-serif"
+            font-size="11.5" font-weight="700"
+            text-anchor="middle" dominant-baseline="central">文</text>
+    </svg>
   `;
 
   // Read saved position from localStorage
@@ -108,7 +116,6 @@ export function initBubble(callbacks: Callbacks): void {
   ctx = {
     root,
     ring: root.querySelector('.dualang-bubble-ring')!,
-    label: root.querySelector('.dualang-bubble-label')!,
     panel,
     tracked: new WeakSet(),
     currentArticleId: null,
@@ -201,14 +208,13 @@ export function setBubbleState(
   if (state === 'translating' && progress && progress.total > 0) {
     const p = progress.completed / progress.total;
     ctx.ring.setAttribute('data-progress', p.toFixed(2));
-    ctx.label.textContent = `${Math.round(p * 100)}%`;
     ctx.root.style.setProperty('--progress', String(p));
-  } else if (state === 'idle') {
-    ctx.label.textContent = '🌐';
-  } else if (state === 'done') {
-    ctx.label.textContent = '✓';
-  } else if (state === 'failed') {
-    ctx.label.textContent = '↻';
+  } else {
+    // 非 translating 状态：把 --progress 重置为对应状态的目标值
+    // idle → 0（X 主色 / 文 muted）
+    // done → 1（X muted / 文 主色，配合背景 blue 完成感）
+    // failed → 不用 --progress（整块红底，字符白色，由专属 class 控制）
+    ctx.root.style.setProperty('--progress', state === 'done' ? '1' : '0');
   }
   // 面板内容随状态变化重新渲染（panel 可见时）
   if (ctx.panel.classList.contains('dualang-bubble-panel--visible')) renderPanel();

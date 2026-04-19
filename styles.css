@@ -232,12 +232,40 @@ article[data-dualang-mode="bilingual"] [data-testid="tweetText"] {
   0%, 100% { transform: translateY(-50%) scale(1); }
   50% { transform: translateY(-50%) scale(1.04); }
 }
-.dualang-bubble--idle .dualang-bubble-label { color: #71767b; font-size: 18px; }
-.dualang-bubble--translating .dualang-bubble-label { color: #1d9bf0; font-size: 12px; font-weight: 600; }
+/* ===== 浮球 Logo（X / 文）— 通过 --progress 颜色插值表达翻译阶段 =====
+ * idle: X 品牌蓝 / 文 muted 灰（source→target 方向提示）
+ * translating: 随 --progress 0→1 插值——X 从蓝色退到灰；文 从灰色进蓝
+ * done: X muted / 文 白色加粗，整体配蓝底（成果感）
+ * failed: 红底 + 字符白色（醒目错误态）
+ */
+.dualang-bubble-logo {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+.dualang-bubble-logo-x,
+.dualang-bubble-logo-wen {
+  transition: fill 0.35s ease;
+}
+/* 颜色插值：color-mix 按 --progress 线性混色（现代 Chrome 支持）。
+ * --progress=0 → X 品牌蓝、文 muted；--progress=1 → X muted、文 品牌蓝。
+ */
+.dualang-bubble-logo-x {
+  fill: color-mix(in srgb, #1d9bf0 calc((1 - var(--progress, 0)) * 100%), #71767b);
+}
+.dualang-bubble-logo-wen {
+  fill: color-mix(in srgb, #1d9bf0 calc(var(--progress, 0) * 100%), #71767b);
+}
+
 .dualang-bubble--done { background: #1d9bf0; border-color: #1d9bf0; }
-.dualang-bubble--done .dualang-bubble-label { color: #fff; font-size: 18px; font-weight: 700; }
+.dualang-bubble--done .dualang-bubble-logo-x { fill: rgba(255, 255, 255, 0.55); }
+.dualang-bubble--done .dualang-bubble-logo-wen { fill: #ffffff; font-weight: 800; }
+
 .dualang-bubble--failed { background: #f4212e; border-color: #f4212e; }
-.dualang-bubble--failed .dualang-bubble-label { color: #fff; font-size: 18px; }
+.dualang-bubble--failed .dualang-bubble-logo-x,
+.dualang-bubble--failed .dualang-bubble-logo-wen { fill: #ffffff; }
 
 /* ===== Mini 面板 ===== */
 .dualang-bubble-panel {
