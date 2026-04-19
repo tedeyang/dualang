@@ -511,4 +511,32 @@ describe('extractAnchoredBlocks', () => {
     const blocks = extractAnchoredBlocks(document.querySelector('article')!);
     expect(blocks).toHaveLength(1);
   });
+
+  it('多图同 figure：所有非空 alt 合并进一个 block', () => {
+    document.body.innerHTML = `
+      <article>
+        <figure>
+          <img alt="Before redesign">
+          <img alt="After redesign">
+        </figure>
+      </article>`;
+    const blocks = extractAnchoredBlocks(document.querySelector('article')!);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].kind).toBe('img-alt');
+    expect(blocks[0].text).toContain('Before redesign');
+    expect(blocks[0].text).toContain('After redesign');
+  });
+
+  it('figure 内一张有 alt 一张无 alt：只取有 alt 的', () => {
+    document.body.innerHTML = `
+      <article>
+        <figure>
+          <img src="x.jpg">
+          <img alt="Only this one">
+        </figure>
+      </article>`;
+    const blocks = extractAnchoredBlocks(document.querySelector('article')!);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].text).toBe('Only this one');
+  });
 });

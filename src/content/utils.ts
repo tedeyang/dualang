@@ -249,9 +249,12 @@ export function extractAnchoredBlocks(el: Element): AnchoredBlock[] {
     const blockChildren = Array.from(node.children).filter((c) => BLOCK_TAGS.has(c.tagName));
     if (blockChildren.length === 0) {
       // 叶子 block：优先识别图片
-      const img = node.querySelector('img[alt]');
-      if (img && (img.getAttribute('alt') || '').trim()) {
-        blocks.push({ el: node, kind: 'img-alt', text: img.getAttribute('alt')!.trim() });
+      // img[alt] CSS selector matches presence of attr; filter rejects alt=""
+      const imgs = Array.from(node.querySelectorAll('img[alt]'))
+        .map((img) => (img.getAttribute('alt') || '').trim())
+        .filter((alt) => alt.length > 0);
+      if (imgs.length > 0) {
+        blocks.push({ el: node, kind: 'img-alt', text: imgs.join(' ') });
         return;
       }
       const t = (node.textContent || '').trim();
