@@ -191,6 +191,7 @@ export function setBubbleState(
     const p = progress.completed / progress.total;
     ctx.ring.setAttribute('data-progress', p.toFixed(2));
     ctx.label.textContent = `${Math.round(p * 100)}%`;
+    ctx.root.style.setProperty('--progress', String(p));
   } else if (state === 'idle') {
     ctx.label.textContent = '🌐';
   } else if (state === 'done') {
