@@ -19,6 +19,8 @@ interface BubbleCtx {
 
 let ctx: BubbleCtx | null = null;
 
+const visibleArticles = new Set<Element>();
+
 const STORAGE_KEY = 'dualang.bubble.top';
 
 export function initBubble(callbacks: Callbacks): void {
@@ -134,9 +136,44 @@ export function trackArticle(article: Element): void {
   if (!id) return;
   if (ctx.tracked.has(article)) return;
   ctx.tracked.add(article);
+  visibleArticles.add(article);
   ctx.currentArticleId = id;
   ctx.root.classList.remove('dualang-bubble--hidden');
   setBubbleState(id, 'idle');
+
+  // 用 IntersectionObserver 自动监测离场；jsdom 没有该 API，测试通过显式 untrackArticle 触发
+  if (typeof IntersectionObserver !== 'undefined') {
+    const io = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (e.isIntersecting) {
+          visibleArticles.add(e.target);
+          // 切换到该 article（用户滚到它了）
+          const eid = e.target.getAttribute('data-dualang-article-id');
+          if (eid && ctx) {
+            ctx.currentArticleId = eid;
+            ctx.root.classList.remove('dualang-bubble--hidden');
+          }
+        } else {
+          untrackArticle(e.target);
+        }
+      }
+    }, { rootMargin: '200px' });
+    io.observe(article);
+  }
+}
+
+export function untrackArticle(article: Element): void {
+  if (!ctx) return;
+  visibleArticles.delete(article);
+  if (visibleArticles.size === 0) {
+    ctx.root.classList.add('dualang-bubble--hidden');
+    ctx.currentArticleId = null;
+  } else {
+    // 切换到仍在视口的第一个
+    const next = visibleArticles.values().next().value as Element | undefined;
+    const nextId = next?.getAttribute('data-dualang-article-id') ?? null;
+    ctx.currentArticleId = nextId;
+  }
 }
 
 export function setBubbleState(
@@ -194,4 +231,5 @@ export function disposeBubble(): void {
   ctx?.root.remove();
   ctx?.panel.remove();
   ctx = null;
+  visibleArticles.clear();
 }

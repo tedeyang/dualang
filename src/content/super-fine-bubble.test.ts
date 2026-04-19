@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { initBubble, trackArticle, setBubbleState, disposeBubble } from './super-fine-bubble';
+import { initBubble, trackArticle, setBubbleState, disposeBubble, untrackArticle } from './super-fine-bubble';
 
 beforeEach(() => {
   document.body.innerHTML = '';
@@ -141,5 +141,38 @@ describe('hover mini panel', () => {
     bubble.dispatchEvent(new PointerEvent('pointerenter'));
     const summary = document.querySelector('.dualang-bubble-panel-summary');
     expect(summary?.textContent).toContain('3/10');
+  });
+});
+
+describe('visibility tracking', () => {
+  it('所有 article 离开视口时浮球隐藏', async () => {
+    const { untrackArticle } = await import('./super-fine-bubble');
+    initBubble({ onTrigger: vi.fn(), onCancel: vi.fn() });
+    const article = document.createElement('article');
+    article.setAttribute('data-dualang-article-id', 'a1');
+    document.body.appendChild(article);
+    trackArticle(article);
+    const bubble = document.querySelector('.dualang-bubble') as HTMLElement;
+    expect(bubble.classList.contains('dualang-bubble--hidden')).toBe(false);
+
+    untrackArticle(article);
+    expect(bubble.classList.contains('dualang-bubble--hidden')).toBe(true);
+  });
+
+  it('多 article 时，离开其中一个不隐藏浮球', async () => {
+    const { untrackArticle } = await import('./super-fine-bubble');
+    initBubble({ onTrigger: vi.fn(), onCancel: vi.fn() });
+    const a1 = document.createElement('article');
+    a1.setAttribute('data-dualang-article-id', 'a1');
+    const a2 = document.createElement('article');
+    a2.setAttribute('data-dualang-article-id', 'a2');
+    document.body.append(a1, a2);
+    trackArticle(a1);
+    trackArticle(a2);
+    const bubble = document.querySelector('.dualang-bubble') as HTMLElement;
+    untrackArticle(a1);
+    expect(bubble.classList.contains('dualang-bubble--hidden')).toBe(false);
+    untrackArticle(a2);
+    expect(bubble.classList.contains('dualang-bubble--hidden')).toBe(true);
   });
 });
