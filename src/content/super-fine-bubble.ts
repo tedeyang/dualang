@@ -9,9 +9,11 @@ interface BubbleCtx {
   root: HTMLElement;
   ring: SVGCircleElement;
   label: HTMLElement;
+  panel: HTMLElement;
   tracked: WeakSet<Element>;
   currentArticleId: string | null;
   state: State;
+  progress: { completed: number; total: number } | null;
   callbacks: Callbacks;
 }
 
@@ -80,16 +82,50 @@ export function initBubble(callbacks: Callbacks): void {
     dragState = null;
   });
 
+  const panel = document.createElement('div');
+  panel.className = 'dualang-bubble-panel';
+  panel.innerHTML = `
+  <div class="dualang-bubble-panel-summary"></div>
+  <div class="dualang-bubble-panel-actions">
+    <button class="dualang-bubble-panel-cancel">取消</button>
+    <button class="dualang-bubble-panel-retry">重翻</button>
+  </div>
+`;
+  document.body.appendChild(panel);
   document.body.appendChild(root);
+
   ctx = {
     root,
     ring: root.querySelector('.dualang-bubble-ring')!,
     label: root.querySelector('.dualang-bubble-label')!,
+    panel,
     tracked: new WeakSet(),
     currentArticleId: null,
     state: 'idle',
+    progress: null,
     callbacks,
   };
+
+  let hideTimer: ReturnType<typeof setTimeout> | null = null;
+  const showPanel = () => {
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+    renderPanel();
+    panel.classList.add('dualang-bubble-panel--visible');
+  };
+  const hidePanel = () => {
+    hideTimer = setTimeout(() => panel.classList.remove('dualang-bubble-panel--visible'), 100);
+  };
+  root.addEventListener('pointerenter', showPanel);
+  root.addEventListener('pointerleave', hidePanel);
+  panel.addEventListener('pointerenter', showPanel);
+  panel.addEventListener('pointerleave', hidePanel);
+
+  panel.querySelector('.dualang-bubble-panel-cancel')!.addEventListener('click', () => {
+    if (ctx?.currentArticleId) ctx.callbacks.onCancel(ctx.currentArticleId);
+  });
+  panel.querySelector('.dualang-bubble-panel-retry')!.addEventListener('click', () => {
+    if (ctx?.currentArticleId) ctx.callbacks.onTrigger(ctx.currentArticleId);
+  });
 }
 
 export function trackArticle(article: Element): void {
@@ -110,6 +146,7 @@ export function setBubbleState(
 ): void {
   if (!ctx || ctx.currentArticleId !== articleId) return;
   ctx.state = state;
+  ctx.progress = progress ?? null;
   for (const s of ['idle', 'translating', 'done', 'failed'] as State[]) {
     ctx.root.classList.toggle(`dualang-bubble--${s}`, s === state);
   }
@@ -124,9 +161,37 @@ export function setBubbleState(
   } else if (state === 'failed') {
     ctx.label.textContent = '↻';
   }
+  // 面板内容随状态变化重新渲染（panel 可见时）
+  if (ctx.panel.classList.contains('dualang-bubble-panel--visible')) renderPanel();
+}
+
+function renderPanel() {
+  if (!ctx) return;
+  const summary = ctx.panel.querySelector('.dualang-bubble-panel-summary') as HTMLElement;
+  const cancelBtn = ctx.panel.querySelector('.dualang-bubble-panel-cancel') as HTMLElement;
+  const retryBtn = ctx.panel.querySelector('.dualang-bubble-panel-retry') as HTMLElement;
+  if (ctx.state === 'translating') {
+    const p = ctx.progress;
+    summary.textContent = p ? `精翻中 · ${p.completed}/${p.total} 段` : '精翻中…';
+    cancelBtn.style.display = '';
+    retryBtn.style.display = 'none';
+  } else if (ctx.state === 'done') {
+    summary.textContent = '精翻完成';
+    cancelBtn.style.display = 'none';
+    retryBtn.style.display = '';
+  } else if (ctx.state === 'failed') {
+    summary.textContent = '精翻失败，点击重试';
+    cancelBtn.style.display = 'none';
+    retryBtn.style.display = '';
+  } else {
+    summary.textContent = '点击精翻整篇文章';
+    cancelBtn.style.display = 'none';
+    retryBtn.style.display = 'none';
+  }
 }
 
 export function disposeBubble(): void {
   ctx?.root.remove();
+  ctx?.panel.remove();
   ctx = null;
 }

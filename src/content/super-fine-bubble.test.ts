@@ -99,3 +99,47 @@ describe('drag Y-axis', () => {
     localStorage.removeItem('dualang.bubble.top');
   });
 });
+
+describe('hover mini panel', () => {
+  it('hover 浮球显示 panel，mouseleave 隐藏', () => {
+    initBubble({ onTrigger: vi.fn(), onCancel: vi.fn() });
+    const article = document.createElement('article');
+    article.setAttribute('data-dualang-article-id', 'a1');
+    document.body.appendChild(article);
+    trackArticle(article);
+    const bubble = document.querySelector('.dualang-bubble') as HTMLElement;
+    bubble.dispatchEvent(new PointerEvent('pointerenter'));
+    const panel = document.querySelector('.dualang-bubble-panel');
+    expect(panel).toBeTruthy();
+    expect(panel?.classList.contains('dualang-bubble-panel--visible')).toBe(true);
+  });
+
+  it('translating 状态面板 cancel 按钮触发 onCancel', () => {
+    const onCancel = vi.fn();
+    initBubble({ onTrigger: vi.fn(), onCancel });
+    const article = document.createElement('article');
+    article.setAttribute('data-dualang-article-id', 'a1');
+    document.body.appendChild(article);
+    trackArticle(article);
+    setBubbleState('a1', 'translating', { completed: 2, total: 10 });
+    const bubble = document.querySelector('.dualang-bubble') as HTMLElement;
+    bubble.dispatchEvent(new PointerEvent('pointerenter'));
+    const cancelBtn = document.querySelector('.dualang-bubble-panel-cancel') as HTMLElement;
+    expect(cancelBtn).toBeTruthy();
+    cancelBtn.click();
+    expect(onCancel).toHaveBeenCalledWith('a1');
+  });
+
+  it('translating 状态面板显示进度文本 "N/M"', () => {
+    initBubble({ onTrigger: vi.fn(), onCancel: vi.fn() });
+    const article = document.createElement('article');
+    article.setAttribute('data-dualang-article-id', 'a1');
+    document.body.appendChild(article);
+    trackArticle(article);
+    setBubbleState('a1', 'translating', { completed: 3, total: 10 });
+    const bubble = document.querySelector('.dualang-bubble') as HTMLElement;
+    bubble.dispatchEvent(new PointerEvent('pointerenter'));
+    const summary = document.querySelector('.dualang-bubble-panel-summary');
+    expect(summary?.textContent).toContain('3/10');
+  });
+});
