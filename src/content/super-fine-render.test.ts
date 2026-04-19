@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { renderInlineSlots, clearInlineSlots, fillSlot } from './super-fine-render';
 import { extractAnchoredBlocks } from './utils';
 
