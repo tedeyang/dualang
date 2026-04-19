@@ -1,4 +1,4 @@
-import { shouldSkipContent, isAlreadyTargetLanguage, extractText, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, rebuildParagraphs, splitParagraphsByDom } from './utils';
+import { shouldSkipContent, isAlreadyTargetLanguage, extractText, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, rebuildParagraphs, splitParagraphsByDom, splitIntoParagraphs, extractParagraphsByBlock } from './utils';
 import { getModelMeta } from '../shared/model-meta';
 
 type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCache?: boolean };
@@ -244,6 +244,59 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     fromCache?: boolean;
   };
 
+  // 长文门槛：超过这些阈值就按段落切块独立翻译，避免小模型在 20k+ 字符整包输入下
+  // 把原本的 N 段压成 2 段输出（inline 模式下会出现大量空 pair）。
+  const LONG_ARTICLE_CHARS = 4000;
+  const LONG_ARTICLE_PARAS = 6;
+
+  function isLongArticle(text: string): boolean {
+    if (text.length < LONG_ARTICLE_CHARS) return false;
+    // splitIntoParagraphs：有 \n\n 按 \n\n 切，没有就按单 \n 切（X Articles tight layout）
+    return splitIntoParagraphs(text).length >= LONG_ARTICLE_PARAS;
+  }
+
+  // 长文专用路径：把 text 按 \n\n 切成 N 段，5 段一 chunk 串行送 API，
+  // 全部完成后 join('\n\n') 作为单段译文返回，外部调用方看不出是分多次请求完成的。
+  // 串行：避免一次性占满 MAX_CONCURRENT 与 background rate limiter，让整体稳定可控。
+  // 超时：单 chunk 60s（比普通请求 30s 宽），因为 5 段 ~4k 字符输入时 GLM-4-9B 偶尔需要更久。
+  async function requestTranslationChunked(
+    text: string, priority: number, skipCache: boolean, strictMode: boolean,
+  ): Promise<ResponseData> {
+    const paragraphs = splitIntoParagraphs(text);
+    const translations: string[] = new Array(paragraphs.length).fill('');
+    let totalTokens = 0;
+    let meta: { model?: string; baseUrl?: string } = {};
+    const chunkSize = 5;
+    for (let i = 0; i < paragraphs.length; i += chunkSize) {
+      const chunkTexts = paragraphs.slice(i, i + chunkSize);
+      const response: any = await Promise.race([
+        chrome.runtime.sendMessage({
+          action: 'translate',
+          payload: { texts: chunkTexts, priority, skipCache, strictMode },
+        }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`长文 chunk 翻译超时 (60s)`)), 60000)),
+      ]);
+      if (!response?.success) {
+        const e: any = new Error(response?.error || `长文 chunk @${i} 失败`);
+        e.retryable = response?.retryable !== false;
+        throw e;
+      }
+      const data = response.data;
+      for (let k = 0; k < (data.translations || []).length; k++) {
+        translations[i + k] = data.translations[k];
+      }
+      totalTokens += data.usage?.total_tokens || 0;
+      meta = { model: data.model, baseUrl: data.baseUrl };
+    }
+    return {
+      translations: [translations.join('\n\n')],
+      usage: { total_tokens: totalTokens },
+      model: meta.model,
+      baseUrl: meta.baseUrl,
+      fromCache: false,
+    };
+  }
+
   async function requestTranslation(
     texts: string[],
     priority: number,
@@ -252,6 +305,11 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
   ): Promise<ResponseData> {
     if (providerType === 'browser-native') {
       return translateViaBrowser(texts);  // 浏览器本地翻译不支持 strict 模式
+    }
+    // 长文（单条 4k+ 字符 + 6+ 段落）自动切段：小模型在整包 20k 字符输入下
+    // 会把 N 段输出压成 2 段，切成 5-段一组的独立 sub-batch 各自翻译能保证段落数对齐。
+    if (texts.length === 1 && isLongArticle(texts[0])) {
+      return requestTranslationChunked(texts[0], priority, skipCache, strictMode);
     }
     const response: any = await Promise.race([
       chrome.runtime.sendMessage({
@@ -392,10 +450,244 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     }, { threshold: 0.05, rootMargin: `${vh}px 0px ${vh}px 0px` });
   }
 
+  // ========== 容器抽象：tweet article + Grok 摘要卡 ==========
+  // X 的 "Grok AI 摘要卡"（trending 话题 / 热点总结）没有 article / testid / role / aria
+  // 可用作锚点；唯一稳定的结构特征是：4 个 child div + 内含 <time> + 最后一个 child 文本
+  // 含免责声明。检测后我们给卡片打 data-dualang-grok="true"，body 段落打
+  // data-dualang-text="true"，之后就能复用 tweet 的翻译管线（只需把 tweetText 查询
+  // 改成同时支持两种标记）。
+  const GROK_DISCLAIMER_MARKER = 'This story is a summary of posts on X';
+
+  function findTweetTextEl(container: Element): Element | null {
+    // 三种文本容器都识别：
+    //   - [data-testid="tweetText"]              —— 普通推文
+    //   - [data-dualang-text="true"]             —— 我们自己打标（Grok 摘要卡的 body）
+    //   - [data-testid="twitterArticleRichTextView"] —— X Articles（长文）正文
+    //     （不用 twitterArticleReadView：后者会把标题和引擎计数 "143 / 3.4K / 1.7M" 也
+    //     抓进文本里混入译文中间）
+    return container.querySelector(
+      '[data-testid="tweetText"], [data-dualang-text="true"], [data-testid="twitterArticleRichTextView"]'
+    );
+  }
+
+  // X Articles 识别：文章外壳仍是 article[data-testid="tweet"]，但内部有
+  // twitterArticleRichTextView（正文容器）和 twitter-article-title（标题）。
+  // 仅在文章页展示"超级精翻"按钮。
+  function isXArticle(article: Element): boolean {
+    return !!article.querySelector('[data-testid="twitterArticleRichTextView"]');
+  }
+
+  // 在文章右下角注入"超级精翻"按钮。用 absolute 定位，需要 article 成为定位上下文。
+  // idempotent：已注入过或已经在精翻中都直接返回。
+  function injectSuperFineButton(article: Element) {
+    if (article.querySelector('.dualang-super-btn')) return;
+    const btn = document.createElement('button');
+    btn.className = 'dualang-super-btn';
+    btn.textContent = '超级精翻';
+    btn.title = '用 Kimi 全文精翻（保留专业术语、排版、图表）；接受较长耗时';
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      translateArticleSuperFine(article);
+    });
+    const host = article as HTMLElement;
+    // 仅在 article 是 static 定位时补 relative；避免覆盖 X.com 自有定位
+    if (getComputedStyle(host).position === 'static') {
+      host.style.position = 'relative';
+    }
+    host.appendChild(btn);
+  }
+
+  // 超级精翻（流式 + 按段切块渲染）：
+  //   1. 清旧译文卡，挖空原文 DOM 用作 pair 结构
+  //   2. 打开 super-fine port，发 {action:'translate', payload:{text}}
+  //   3. background 按段 chunk 流式翻译 → partial/progress 事件逐段推送
+  //   4. 每 partial 事件：立刻把对应段译文填到已创建的 slot 里（progressive render）
+  //   5. done → 停脉冲、按钮变"重新精翻"、触发 success 图标
+  //   6. error / 10min 超时 → 显示 fail
+  async function translateArticleSuperFine(article: Element) {
+    const tweetTextEl = findTweetTextEl(article);
+    if (!tweetTextEl) return;
+    // 长文专用：按 DOM block 结构提取段落（X Articles 的 innerText 段落边界靠 CSS 布局，
+    // 直接文本拆解要么过细要么失败；extractParagraphsByBlock 按叶子 block 取整段）
+    const paragraphs = extractParagraphsByBlock(tweetTextEl);
+    if (paragraphs.length === 0) return;
+    const text = paragraphs.join('\n\n');
+
+    const btn = article.querySelector('.dualang-super-btn') as HTMLButtonElement | null;
+    article.classList.add('dualang-super-translating');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = `精翻中… (0/${paragraphs.length})`;
+    }
+    const apiT0 = performance.now();
+    logBiz('translation.superFine.start', { chars: text.length, paragraphs: paragraphs.length });
+
+    // 清旧译文卡、摘 data-dualang-mode；准备 progressive 渲染的 skeleton card
+    article.querySelector('.dualang-translation')?.remove();
+    article.removeAttribute('data-dualang-mode');
+    hideStatus(article, true);
+    delete (article as TweetArticle)._dualangQualityRetried;
+    article.setAttribute('data-dualang-mode', 'bilingual');
+
+    const card = document.createElement('div');
+    card.className = 'dualang-translation dualang-bilingual dualang-super-streaming';
+    // 克隆整段原文放顶部（bilingual 风格）
+    const origBlock = document.createElement('div');
+    origBlock.className = 'dualang-original-html';
+    for (const child of Array.from(tweetTextEl.childNodes) as Node[]) {
+      origBlock.appendChild(child.cloneNode(true));
+    }
+    card.appendChild(origBlock);
+    // N 个占位段，translation 到来时按 index 填
+    const paraSlots: HTMLElement[] = [];
+    for (let i = 0; i < paragraphs.length; i++) {
+      const p = document.createElement('div');
+      p.className = 'dualang-para dualang-super-slot';
+      p.dataset.index = String(i);
+      paraSlots.push(p);
+      card.appendChild(p);
+    }
+    tweetTextEl.parentNode?.insertBefore(card, tweetTextEl.nextSibling);
+    unobserveArticle(article);
+
+    // 10min 总超时兜底（port 断开时也触发清理）
+    let finished = false;
+    let port: chrome.runtime.Port | null = null;
+    const timeout = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      try { port?.disconnect(); } catch (_) {}
+      article.classList.remove('dualang-super-translating');
+      showFail(article, '精翻超时 (10min)');
+      if (btn) { btn.disabled = false; btn.textContent = '超级精翻'; }
+      logBiz('translation.superFine.fail', { error: 'timeout' }, 'warn');
+    }, 600_000);
+
+    let meta: { model?: string; baseUrl?: string } = {};
+    let completed = 0;
+
+    try {
+      port = chrome.runtime.connect(undefined, { name: 'super-fine' });
+    } catch (err: any) {
+      clearTimeout(timeout);
+      showFail(article, '无法连接后台：' + err.message);
+      if (btn) { btn.disabled = false; btn.textContent = '超级精翻'; }
+      article.classList.remove('dualang-super-translating');
+      return;
+    }
+
+    port.onMessage.addListener((msg: any) => {
+      if (finished) return;
+      if (msg.action === 'meta') {
+        meta.model = msg.model;
+        meta.baseUrl = msg.baseUrl;
+      } else if (msg.action === 'partial') {
+        const idx: number = msg.index;
+        const t: string = msg.translated;
+        const slot = paraSlots[idx];
+        if (slot && t) {
+          slot.textContent = t;
+          slot.classList.add('dualang-super-slot--filled');
+        }
+      } else if (msg.action === 'progress') {
+        completed = msg.completed;
+        if (btn) btn.textContent = `精翻中… (${completed}/${msg.total})`;
+      } else if (msg.action === 'chunkFail') {
+        logBiz('translation.superFine.chunkFail', { chunkIndex: msg.chunkIndex, error: msg.error }, 'warn');
+      } else if (msg.action === 'done') {
+        finished = true;
+        clearTimeout(timeout);
+        article.classList.remove('dualang-super-translating');
+        article.classList.add('dualang-super-translated');
+        // 补齐未填的 slot（罕见，chunk 全失败才会出现）
+        for (const slot of paraSlots) {
+          if (!slot.textContent) slot.textContent = '';
+        }
+        const rtt = performance.now() - apiT0;
+        showSuccess(article, { model: msg.model, baseUrl: msg.baseUrl, tokens: msg.totalTokens });
+        logBiz('translation.superFine.ok', {
+          paragraphs: paragraphs.length, completed: msg.completed, rttMs: rtt.toFixed(0), model: msg.model,
+        });
+        if (btn) { btn.disabled = false; btn.textContent = '重新精翻'; }
+        try { port?.disconnect(); } catch (_) {}
+      } else if (msg.action === 'error') {
+        finished = true;
+        clearTimeout(timeout);
+        article.classList.remove('dualang-super-translating');
+        logBiz('translation.superFine.fail', { error: msg.error }, 'warn');
+        showFail(article, msg.error);
+        if (btn) { btn.disabled = false; btn.textContent = '超级精翻'; }
+        try { port?.disconnect(); } catch (_) {}
+      }
+    });
+
+    port.onDisconnect.addListener(() => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timeout);
+      article.classList.remove('dualang-super-translating');
+      if (btn) { btn.disabled = false; btn.textContent = '超级精翻'; }
+    });
+
+    port.postMessage({
+      action: 'translate',
+      payload: { paragraphs, targetLang },
+    });
+  }
+
+  function isGrokCardContainer(el: Element): boolean {
+    if (!(el instanceof Element)) return false;
+    if (el.children.length !== 4) return false;
+    // 排除页面级 4-子容器（BUTTON / HEADER / MAIN 等）：Grok 卡内部 4 个孩子都是 DIV
+    for (const c of Array.from(el.children)) {
+      if (c.tagName !== 'DIV') return false;
+    }
+    if (!el.querySelector('time')) return false;
+    // 免责声明应该是 children[3] 的首字符串；如果是包含 Grok 卡的祖先，children[3]
+    // 是更大的块（含其他内容），textContent 开头不会是免责声明。
+    const lastChildText = (el.children[3]?.textContent || '').trim();
+    return lastChildText.startsWith(GROK_DISCLAIMER_MARKER);
+  }
+
+  // 在一棵子树里发现所有未处理的 Grok 卡片，打上标记后返回。
+  // 用 data-dualang-grok 做 idempotent guard，避免重复处理同一张卡。
+  function findAndPrepareGrokCards(root: Element | Document): Element[] {
+    const scope: any = root instanceof Element ? root : document;
+    // 候选集：用 `:has(time)` 先粗筛再细判；浏览器支持差异用 try/catch 兜底
+    let candidates: Element[] = [];
+    try {
+      candidates = Array.from(scope.querySelectorAll('div:has(> time), div:has(time)'));
+    } catch (_) {
+      candidates = Array.from(scope.querySelectorAll('div'));
+    }
+    const cards: Element[] = [];
+    for (const el of candidates) {
+      // 从候选往上找到 4-子 + 免责声明的最小容器 —— 因为我们刚粗筛了 <time>，其祖先都可能命中
+      let node: Element | null = el;
+      for (let i = 0; i < 6 && node; i++) {
+        if (isGrokCardContainer(node)) {
+          if (!node.hasAttribute('data-dualang-grok')) {
+            // children[2] 是正文 wrapper，内层的 div[dir] 是真正的文本元素
+            const bodyWrapper = node.children[2];
+            const bodyEl = bodyWrapper?.querySelector('div[dir]') || bodyWrapper?.querySelector('div');
+            if (bodyEl) {
+              node.setAttribute('data-dualang-grok', 'true');
+              bodyEl.setAttribute('data-dualang-text', 'true');
+              cards.push(node);
+            }
+          }
+          break;
+        }
+        node = node.parentElement;
+      }
+    }
+    return cards;
+  }
+
   // ========== 在去抖后分流 Show more / DOM 回收 ==========
   function handleShowMoreOrRecycle(article: TweetArticle) {
     if (!document.contains(article)) return; // article 已从 DOM 中移除
-    const tweetTextEl = article.querySelector('div[data-testid="tweetText"]');
+    const tweetTextEl = findTweetTextEl(article);
     if (!tweetTextEl) return;
 
     const currentContentId = getContentId(article);
@@ -405,6 +697,10 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     // 统一清理旧状态
     article.querySelector('.dualang-translation')?.remove();
     article.querySelector('.dualang-btn')?.remove();
+    // data-dualang-mode 控制着 CSS 对原文 tweetText 的显隐；移除旧 card 时必须同步摘掉，
+    // 否则 translation-only/inline/bilingual 模式下原文仍被 CSS 隐藏、card 也没了，
+    // article 高度瞬间塌到 0，等翻译回来再撑起来 —— 两次跳变导致页面上移。
+    article.removeAttribute('data-dualang-mode');
     hideStatus(article, true);
     translatingSet.delete(article);
     processedTweets.delete(article);
@@ -474,7 +770,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
             article.querySelector('.dualang-btn');
           if (!isDualangTouched) continue;
 
-          const tweetTextEl = article.querySelector('div[data-testid="tweetText"]');
+          const tweetTextEl = findTweetTextEl(article);
           if (!tweetTextEl) continue;
 
           const art = article as TweetArticle;
@@ -489,11 +785,14 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
           scheduleShowMoreCheck(art);
         }
 
-        // 收集含 article 的新增根节点，留给 scanAndQueue
+        // 收集含 article 或 Grok 摘要卡的新增根节点，留给 scanAndQueue。
+        // Grok 卡没有稳定 testid/role，只能按文本特征（免责声明）粗筛；精确识别留给 scanAndQueue。
         for (const node of mutation.addedNodes) {
           if (node.nodeType !== Node.ELEMENT_NODE) continue;
           const el = node as Element;
-          if (el.matches?.('article[data-testid="tweet"]') || el.querySelector?.('article[data-testid="tweet"]')) {
+          const hasTweet = el.matches?.('article[data-testid="tweet"]') || el.querySelector?.('article[data-testid="tweet"]');
+          const hasGrokMarker = (el.textContent || '').includes(GROK_DISCLAIMER_MARKER);
+          if (hasTweet || hasGrokMarker) {
             pendingScanRoots.add(el);
           }
         }
@@ -523,10 +822,13 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     const articles = root.matches?.('article[data-testid="tweet"]')
       ? [root]
       : root.querySelectorAll?.('article[data-testid="tweet"]') || [];
+    // Grok 摘要卡作为伪 article 一起处理（findAndPrepareGrokCards 打完标记就能走同一路径）
+    const grokCards = findAndPrepareGrokCards(root instanceof Element ? root : document);
+    const allContainers: Element[] = [...(Array.from(articles) as Element[]), ...grokCards];
 
     let newlyRegistered = 0;
     let cacheRestored = 0;
-    articles.forEach((article: Element) => {
+    allContainers.forEach((article: Element) => {
       if (processedTweets.has(article)) return;
       processedTweets.add(article);
 
@@ -534,8 +836,11 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       // 记录内容 ID 和文本长度基线，用于后续 Show more / DOM 复用检测
       const contentId = getContentId(article);
       if (contentId) art._dualangContentId = contentId;
-      const tweetTextEl = article.querySelector('div[data-testid="tweetText"]');
+      const tweetTextEl = findTweetTextEl(article);
       if (tweetTextEl) art._dualangLastText = tweetTextEl.textContent || '';
+
+      // X Articles：无论走缓存恢复还是走正常翻译路径，都注入"超级精翻"按钮
+      if (isXArticle(article)) injectSuperFineButton(article);
 
       // 虚拟 DOM 回收后重现：尝试从内容 ID 缓存恢复翻译
       if (contentId && translationCache.has(contentId) && !article.querySelector('.dualang-translation')) {
@@ -678,7 +983,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     const batch = [];
     let batchIndex = 0;
     for (const article of batchArticles) {
-      const tweetTextEl = article.querySelector('div[data-testid="tweetText"]');
+      const tweetTextEl = findTweetTextEl(article);
       if (!tweetTextEl) { batchIndex++; continue; }
       if (article.querySelector('.dualang-translation')) {
         hideStatus(article, true);
@@ -916,7 +1221,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     }
 
     // 异步等待期间 tweetTextEl 可能被替换，渲染前重取
-    const freshTextEl = article.querySelector('div[data-testid="tweetText"]') || tweetTextEl;
+    const freshTextEl = findTweetTextEl(article) || tweetTextEl;
     if (!translated) {
       hideStatus(article);
       return;
@@ -1001,7 +1306,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       }
 
       // 等待过程中 X.com 可能把原 tweetTextEl 换成新的 — 重新查询以避免渲染到 detached 节点
-      const freshTextEl = article.querySelector('div[data-testid="tweetText"]') || tweetTextEl;
+      const freshTextEl = findTweetTextEl(article) || tweetTextEl;
       const translated = response.data.translations?.[0];
       if (!translated) {
         hideStatus(article);
@@ -1079,7 +1384,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       status.dataset.type = type;
       return;
     }
-    const tweetTextEl = article.querySelector('div[data-testid="tweetText"]');
+    const tweetTextEl = findTweetTextEl(article);
     if (!tweetTextEl) return;
 
     status = document.createElement('div');
@@ -1126,11 +1431,13 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       retryCounts.delete(article);
       // 重置质量重试额度，让手动触发的重试也能再自动重试一次
       delete (article as TweetArticle)._dualangQualityRetried;
-      // 清 article 下挂着的旧翻译（可能是质量不佳但已渲染的版本）
+      // 清 article 下挂着的旧翻译（可能是质量不佳但已渲染的版本）；
+      // 同步摘 data-dualang-mode，避免原文被 CSS 继续隐藏造成塌陷
       article.querySelector('.dualang-translation')?.remove();
+      article.removeAttribute('data-dualang-mode');
       hideStatus(article, true);
       // 手动重试走立即通道 + skipCache：强制新 API 调用，绕过已缓存的坏翻译
-      const tweetTextEl = article.querySelector('div[data-testid="tweetText"]');
+      const tweetTextEl = findTweetTextEl(article);
       if (tweetTextEl) translateImmediate(article, tweetTextEl, true);
     }, { once: true });
   }
@@ -1143,7 +1450,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     const m = getModelMeta(meta.model || '', meta.baseUrl || '');
 
     let status = article.querySelector('.dualang-status') as HTMLElement | null;
-    const tweetTextEl = article.querySelector('div[data-testid="tweetText"]');
+    const tweetTextEl = findTweetTextEl(article);
     if (!status) {
       if (!tweetTextEl) return;
       status = document.createElement('div');
@@ -1180,7 +1487,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     if (article.querySelector('.dualang-btn')) return;
     if (article.querySelector('.dualang-translation')) return;
 
-    const tweetTextEl = article.querySelector('div[data-testid="tweetText"]');
+    const tweetTextEl = findTweetTextEl(article);
     if (!tweetTextEl) return;
 
     const text = extractText(tweetTextEl);
@@ -1242,9 +1549,24 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       // 多出的译文段落作为最后一段译文块；少的译文位置留空（用户能看到原文提示模型漏译）
       card.classList.add('dualang-inline');
       const originalParas = splitParagraphsByDom(tweetTextEl);
-      if (originalParas.length === 0) {
-        // 没拆出段落就退化为 append 行为（只渲染译文）
+      // 段数严重不匹配（比如 X Articles 的原文 DOM 只切出 5 段但译文有 25 段，因为
+      // 文章的段落边界靠 CSS block 布局而非文本节点 \n\n 分隔）→ 退回整体对照布局，
+      // 避免大量译文散落在末尾。门槛：原文段数 < 译文段数 × 0.5 视为严重不匹配。
+      const severeMismatch = originalParas.length > 0
+        && translatedParas.length > 2
+        && originalParas.length < translatedParas.length * 0.5;
+      if (originalParas.length === 0 || severeMismatch) {
+        // 退化路径：克隆整段原文 HTML + 译文整块（bilingual 风格）
+        const origBlock = document.createElement('div');
+        origBlock.className = 'dualang-original-html';
+        for (const child of Array.from(tweetTextEl.childNodes) as Node[]) {
+          origBlock.appendChild(child.cloneNode(true));
+        }
+        card.appendChild(origBlock);
         appendTranslationParas(card, translatedParas);
+        if (severeMismatch) {
+          perfLog('inline.fallbackToBilingual', { origParas: originalParas.length, transParas: translatedParas.length });
+        }
       } else {
         for (let i = 0; i < originalParas.length; i++) {
           const pair = document.createElement('div');

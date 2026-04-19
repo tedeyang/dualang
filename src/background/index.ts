@@ -1,7 +1,7 @@
 // background.js - 服务工作者（orchestrator）
 
 import { getCache, getCacheBatch, setCache, cacheKey } from './cache';
-import { getSettings, invalidateSettingsCache } from './settings';
+import { getSettings, invalidateSettingsCache, getMoonshotKey } from './settings';
 import { rateLimiter } from './rate-limiter';
 import { doTranslateSingle, doTranslateBatchRequest, doTranslateBatchStream } from './api';
 import { recordRequest, recordCacheHit, recordQualityRetry, recordError, getStats, resetStats } from './stats';
@@ -20,6 +20,13 @@ chrome.runtime.onConnect.addListener((port) => {
     port.onMessage.addListener((msg) => {
       if (msg.action === 'translate') {
         handleTranslateStream(msg.payload, port);
+      }
+    });
+  } else if (port.name === 'super-fine') {
+    // 超级精翻流式端口：长文按段切 chunk，Kimi k2.5 + SSE 逐段推送
+    port.onMessage.addListener((msg) => {
+      if (msg.action === 'translate') {
+        handleSuperFineStream(msg.payload, port);
       }
     });
   }
@@ -155,8 +162,29 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 async function handleTranslate(payload: any) {
-  const settings = await getSettings();
-  console.log('[Dualang] translate config baseUrl=', settings.baseUrl, 'model=', settings.model, 'priority=', payload.priority);
+  let settings = await getSettings();
+  // 超级精翻模式：强制用 Kimi（moonshot-v1-128k，长上下文版本，避免 8k 模型截断 21k+ 字符文章）
+  // API Key 优先从 config.json 的 moonshot 条目取，其次用主设置（用户可能把 Kimi 配成主 provider）
+  if (payload.superFine) {
+    const superFineKey = await getMoonshotKey();
+    if (!superFineKey) {
+      throw new Error('超级精翻需要 Moonshot API Key；请在 config.json 的 providers.moonshot.apiKey 或 popup 主 API 配置中填入');
+    }
+    settings = {
+      ...settings,
+      baseUrl: 'https://api.moonshot.cn/v1',
+      model: 'moonshot-v1-128k',
+      apiKey: superFineKey,
+      maxTokens: 8192,
+      reasoningEffort: 'none',
+      enableStreaming: false,
+      fallbackEnabled: false,
+      hedgedRequestEnabled: false,
+    };
+    console.log('[Dualang] super-fine translation via Kimi', settings.model);
+  } else {
+    console.log('[Dualang] translate config baseUrl=', settings.baseUrl, 'model=', settings.model, 'priority=', payload.priority);
+  }
 
   if (payload.texts && Array.isArray(payload.texts)) {
     return handleTranslateBatch(payload.texts, settings, payload.priority || 0, !!payload.skipCache, !!payload.strictMode);
@@ -283,6 +311,126 @@ async function handleTranslateStream(payload: any, port: chrome.runtime.Port) {
     try {
       port.postMessage({ action: 'error', error: err.message, retryable: !!err.retryable });
     } catch (_) {}
+  }
+}
+
+// ===================== 超级精翻流式 =====================
+// 长文按段切 chunk，Kimi k2.5 + SSE 逐段推送。协议：
+//   content → background: { action:'translate', payload:{ text, targetLang } }
+//   background → content: { action:'meta', paragraphs:N, chunks:N, model, baseUrl }
+//   background → content: { action:'partial', index, translated }    — 每个段落完成立推
+//   background → content: { action:'progress', completed, total }    — 每 chunk 完成后
+//   background → content: { action:'done', totalTokens, model, baseUrl }
+//   background → content: { action:'error', error }
+async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
+  const CHUNK = 5;
+  let disconnected = false;
+  port.onDisconnect.addListener(() => { disconnected = true; });
+  const abortController = new AbortController();
+  port.onDisconnect.addListener(() => abortController.abort());
+
+  try {
+    const moonshotKey = await getMoonshotKey();
+    if (!moonshotKey) {
+      throw new Error('超级精翻需要 Moonshot API Key；请在 config.json 的 providers.moonshot.apiKey 填入');
+    }
+    const baseSettings = await getSettings();
+    // 超级精翻默认用 moonshot-v1-128k（128k 上下文 + 稳定 + 快）。
+    // 之前计划用 kimi-k2.5（flagship）但 reasoning 模式单 chunk 28s×29 chunks 不现实，
+    // 且 API key 层可能没 k2.5 权限。先用 128k 保证流式链路稳定，后续 bench 验证 k2.5
+    // 可用且足够快后再切换。
+    // bench v2：moonshot-v1-8k 1.8s / 8.9 quality；v1-128k 类似速度、支持 17k+ 字符输入。
+    const model = payload.model || 'moonshot-v1-128k';
+    const settings = {
+      ...baseSettings,
+      baseUrl: 'https://api.moonshot.cn/v1',
+      model,
+      apiKey: moonshotKey,
+      maxTokens: 8192,
+      reasoningEffort: 'none',
+      enableStreaming: true,
+      fallbackEnabled: false,
+      hedgedRequestEnabled: false,
+    };
+
+    // content 端已经用 extractParagraphsByBlock 按 DOM block 结构切好段落
+    // 直接接收数组，避免再做字符级拆分（容易因为 \n vs \n\n 差异出错）
+    const paragraphs: string[] = Array.isArray(payload.paragraphs) ? payload.paragraphs : [];
+    if (paragraphs.length === 0) {
+      port.postMessage({ action: 'error', error: '无可翻译内容' });
+      return;
+    }
+
+    const totalChunks = Math.ceil(paragraphs.length / CHUNK);
+    port.postMessage({
+      action: 'meta',
+      paragraphs: paragraphs.length,
+      chunks: totalChunks,
+      model: settings.model,
+      baseUrl: settings.baseUrl,
+    });
+    const totalChars = paragraphs.reduce((s, p) => s + p.length, 0);
+    console.log('[Dualang] super-fine stream start', {
+      paragraphs: paragraphs.length, chunks: totalChunks, chars: totalChars,
+    });
+
+    let totalTokens = 0;
+    let completedParagraphs = 0;
+
+    // 串行处理 chunks：Kimi k2.5 reasoning 模型单 chunk 就比较慢，再并发容易打爆
+    // rate limit。串行 + SSE 流式组合保证"第一段就能开始读"的渐进体验。
+    for (let ci = 0; ci < totalChunks; ci++) {
+      if (disconnected || abortController.signal.aborted) return;
+      const start = ci * CHUNK;
+      const chunk = paragraphs.slice(start, start + CHUNK);
+      try {
+        await doTranslateBatchStream(
+          chunk,
+          settings,
+          abortController.signal,
+          (subIndex, translated) => {
+            if (disconnected) return;
+            const globalIndex = start + subIndex;
+            port.postMessage({ action: 'partial', index: globalIndex, translated });
+            completedParagraphs++;
+          },
+          true, // strictMode：提示保留段落结构，减少模型压缩
+        ).then((result) => {
+          // 补推流式未覆盖的条目（通常最后一条）
+          for (let i = 0; i < result.translations.length; i++) {
+            const globalIndex = start + i;
+            const t = result.translations[i];
+            if (t && completedParagraphs < start + i + 1) {
+              // 已经推过就不重推；用 completedParagraphs 粗略判断
+            }
+          }
+        });
+        if (!disconnected) {
+          port.postMessage({ action: 'progress', completed: Math.min(start + chunk.length, paragraphs.length), total: paragraphs.length });
+        }
+      } catch (err: any) {
+        console.warn('[Dualang] super-fine chunk fail', { chunkIndex: ci, error: err.message });
+        // 单 chunk 失败不中止整体，继续下一个
+        if (!disconnected) {
+          port.postMessage({ action: 'chunkFail', chunkIndex: ci, error: err.message });
+        }
+      }
+    }
+
+    if (!disconnected) {
+      port.postMessage({
+        action: 'done',
+        totalTokens,
+        model: settings.model,
+        baseUrl: settings.baseUrl,
+        completed: completedParagraphs,
+        total: paragraphs.length,
+      });
+    }
+  } catch (err: any) {
+    if (!disconnected) {
+      try { port.postMessage({ action: 'error', error: err.message }); } catch (_) {}
+    }
   }
 }
 

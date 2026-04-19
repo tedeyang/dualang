@@ -226,7 +226,8 @@ export async function doTranslateBatchStream(
   texts: string[],
   settings: any,
   signal: AbortSignal | null,
-  onResult: OnStreamResult
+  onResult: OnStreamResult,
+  strictMode = false,
 ): Promise<{ translations: string[] }> {
   const profile = getProfile(settings);
   const endpoint = resolveEndpoint(profile, settings.baseUrl || 'https://api.moonshot.cn/v1');
@@ -234,7 +235,7 @@ export async function doTranslateBatchStream(
 
   const isSingle = texts.length === 1;
   const systemPrompt = composeSystemPrompt(profile, targetLangDisplay, {
-    batch: !isSingle, strict: false,
+    batch: !isSingle, strict: strictMode,
   });
   const userContent = isSingle
     ? texts[0]

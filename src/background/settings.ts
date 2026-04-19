@@ -11,6 +11,16 @@ async function loadLocalConfig() {
   }
 }
 
+// 超级精翻专用：优先 config.json 的 moonshot key，其次当前主设置里的 key（若 baseUrl 是 moonshot）。
+export async function getMoonshotKey(): Promise<string> {
+  const cfg = await loadLocalConfig();
+  const fromConfig = cfg?.providers?.moonshot?.apiKey || '';
+  if (fromConfig) return fromConfig;
+  const s = await chrome.storage.sync.get({ baseUrl: '', apiKey: '' });
+  if ((s.baseUrl || '').includes('moonshot') && s.apiKey) return s.apiKey;
+  return '';
+}
+
 export const LANG_DISPLAY: Record<string, string> = {
   'zh-CN': '简体中文',
   'zh-TW': '繁体中文（台湾正体）',

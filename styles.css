@@ -3,16 +3,14 @@
   margin-top: 8px;
 }
 
-/* ===== 普通模式：纯译文段落 ===== */
+/* ===== 译文段落 =====
+ * 大多数模式下整段译文放在一个 div 里，用 white-space:pre-wrap 让 \n\n 自然撑开
+ * 一个完整空行（line-height 高度），与 X.com 原生 tweetText 的段落视觉完全一致。
+ * inline 模式下每个 pair 有一个独立 .dualang-para（单段）。
+ */
 .dualang-para {
   white-space: pre-wrap;
   word-wrap: break-word;
-}
-
-/* 段落间保留空行视觉（与 X.com 原生推文段落间距一致）；
- * 过小的 margin（4px）会让多段译文挤成一坨，不利于阅读 */
-.dualang-para + .dualang-para {
-  margin-top: 1em;
 }
 
 /* ===== 原文克隆块（inline / bilingual 模式下替代 tweetText 的显示位置）=====
@@ -177,4 +175,76 @@ article[data-dualang-mode="bilingual"] [data-testid="tweetText"] {
 
 @keyframes dualang-spin {
   to { transform: rotate(360deg); }
+}
+
+/* ===== 超级精翻按钮（仅 X Articles 长文页面注入）=====
+ * 绝对定位到 article 右下角；翻译中禁用 + 进度文字；完成后改为"重新精翻"
+ */
+.dualang-super-btn {
+  position: absolute;
+  bottom: 14px;
+  right: 14px;
+  padding: 7px 16px;
+  background: #1d9bf0;
+  color: #fff;
+  border: none;
+  border-radius: 9999px;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(29, 155, 240, 0.35);
+  z-index: 10;
+  transition: background 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+  user-select: none;
+}
+
+.dualang-super-btn:hover:not(:disabled) {
+  background: #1a8cd8;
+  transform: translateY(-1px);
+  box-shadow: 0 3px 14px rgba(29, 155, 240, 0.45);
+}
+
+.dualang-super-btn:disabled {
+  background: #6b7280;
+  cursor: default;
+  box-shadow: none;
+  opacity: 0.85;
+}
+
+/* 精翻中：原文容器柔和蓝色脉冲 —— 视觉提示"后台仍在处理，不要误以为卡死"。
+ * 作用到整个 readView（含标题 + 正文），脉冲周期 2.4s 柔和不刺眼。
+ */
+@keyframes dualang-super-pulse {
+  0%, 100% { background-color: transparent; }
+  50% { background-color: rgba(29, 155, 240, 0.08); }
+}
+
+article.dualang-super-translating [data-testid="twitterArticleReadView"] {
+  animation: dualang-super-pulse 2.4s ease-in-out infinite;
+  border-radius: 10px;
+  transition: background-color 0.3s ease;
+}
+
+/* 渐进渲染的占位段：待填充时灰色脉冲，译文到达时淡入 */
+@keyframes dualang-slot-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 0.55; }
+}
+
+.dualang-super-slot:not(.dualang-super-slot--filled) {
+  min-height: 1.2em;
+  background: linear-gradient(90deg, rgba(29,155,240,0.08) 0%, rgba(29,155,240,0.04) 50%, rgba(29,155,240,0.08) 100%);
+  background-size: 200% 100%;
+  animation: dualang-slot-pulse 1.6s ease-in-out infinite;
+  border-radius: 4px;
+}
+
+.dualang-super-slot--filled {
+  animation: dualang-slot-fadein 0.35s ease-out;
+}
+
+@keyframes dualang-slot-fadein {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 1; transform: translateY(0); }
 }

@@ -178,6 +178,19 @@ describe('getContentId', () => {
     );
     expect(getContentId(el)).toBe('777');
   });
+
+  it('Grok 摘要卡：用 data-dualang-grok 属性 + 第一子 div 标题作为 ID', () => {
+    const el = makeEl(
+      '<div>Nvidia CEO Huang Challenges U.S. Chip Bans</div><div>Last updated</div><div>body...</div><div>This story is a summary...</div>',
+      '', 'div', 'data-dualang-grok="true"'
+    );
+    expect(getContentId(el)).toBe('grok:Nvidia CEO Huang Challenges U.S. Chip Bans');
+  });
+
+  it('没有 data-dualang-grok 标记时不走 Grok 策略', () => {
+    const el = makeEl('<div>Not a Grok card</div>');
+    expect(getContentId(el)).toBeNull();
+  });
 });
 
 describe('hasSuspiciousLineMismatch', () => {
@@ -393,9 +406,25 @@ describe('splitParagraphsByDom', () => {
   it('单个 <br> 保留为行内换行，不分段', () => {
     const parts = splitParagraphsByDom(el('Line 1<br>Line 2'));
     expect(parts.length).toBe(1);
-    const frag = document.createElement('div');
-    frag.appendChild(parts[0]);
-    expect(frag.querySelector('br')).not.toBeNull();
+    // 单 BR 被转换为 \n（视觉等价，pre-wrap 下渲染相同）
+    expect(parts[0].textContent).toMatch(/Line 1[\n\r]+Line 2/);
+  });
+
+  it('X.com 实际结构：整段推文包在一个 span 里用 \\n\\n 分段', () => {
+    // 这是 X.com 主列表的真实 DOM 形态 —— 顶层是 <span>，3 段文本用 \n\n 分隔藏在 span 的 text node 里
+    const node = document.createElement('div');
+    const span = document.createElement('span');
+    span.appendChild(document.createTextNode('para one\n\npara two\n\npara three'));
+    node.appendChild(span);
+    const parts = splitParagraphsByDom(node);
+    expect(parts.length).toBe(3);
+    expect(parts[0].textContent).toBe('para one');
+    expect(parts[1].textContent).toBe('para two');
+    expect(parts[2].textContent).toBe('para three');
+    // 克隆的 fragment 保留了 <span> 壳
+    const holder = document.createElement('div');
+    holder.appendChild(parts[0]);
+    expect(holder.querySelector('span')).not.toBeNull();
   });
 
   it('纯空白段落被过滤', () => {

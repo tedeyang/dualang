@@ -23,11 +23,21 @@ describe('getProfile', () => {
     expect(getProfile({ baseUrl: 'https://api.z.ai/v1', model: 'GLM-4-6' }).id).toBe('glm-4.6');
   });
 
-  it('Generic fallback: 未匹配到任何 profile', () => {
+  it('GLM 非 4.6 系列命中 glm-legacy（GLM-4-9B / 4-32B / 4-Plus）', () => {
+    // 顺序：GLM46 先命中 4.6，其他 glm-4 落到 legacy
+    expect(getProfile({ model: 'THUDM/GLM-4-9B-0414' }).id).toBe('glm-legacy');
+    expect(getProfile({ baseUrl: 'https://api.siliconflow.cn/v1', model: 'THUDM/GLM-4-32B-0414' }).id).toBe('glm-legacy');
+    // legacy 禁流式，避免 CJK SSE 切字
+    expect(getProfile({ model: 'THUDM/GLM-4-9B-0414' }).supportsStreaming).toBe(false);
+    // 4.6 还是启用流式
+    expect(getProfile({ model: 'glm-4.6' }).supportsStreaming).toBe(true);
+  });
+
+  it('Generic fallback: 未匹配到任何 profile，默认禁流式', () => {
     expect(getProfile({ baseUrl: 'https://api.openai.com/v1', model: 'gpt-4' }).id).toBe('generic-openai');
     expect(getProfile({ baseUrl: 'https://unknown.example.com/v1', model: 'weird-model' }).id).toBe('generic-openai');
-    // GLM-4-9B 走 generic（不是 glm-4.6）
-    expect(getProfile({ baseUrl: 'https://api.siliconflow.cn/v1', model: 'THUDM/GLM-4-9B-0414' }).id).toBe('generic-openai');
+    // generic 默认禁流式：未知 endpoint 小模型普遍有 SSE 切 CJK 字符问题
+    expect(getProfile({ model: 'gpt-4' }).supportsStreaming).toBe(false);
   });
 
   it('温度按模型分流：kimi-k2.5 → 1，其他 Moonshot → 0.3', () => {

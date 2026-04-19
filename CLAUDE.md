@@ -42,7 +42,8 @@ The extension has three runtime contexts communicating via `chrome.runtime.sendM
 - `temperature` is `1` for `kimi-k2.5` models, `0.3` for others
 
 **`content.js` (injected into x.com and localhost:9999)**
-- `MutationObserver` detects dynamically loaded tweets (`article[data-testid="tweet"]`) and "Show more" expansions
+- `MutationObserver` detects dynamically loaded tweets (`article[data-testid="tweet"]`), Grok AI summary cards (detected by 4-div children + `<time>` + disclaimer text), X Articles (inside `article[data-testid="tweet"]` with `[data-testid="twitterArticleRichTextView"]` body), and "Show more" expansions
+- `findTweetTextEl(container)` helper unifies three text container selectors: `[data-testid="tweetText"]` (tweets), `[data-dualang-text="true"]` (Grok body, marked by us), `[data-testid="twitterArticleRichTextView"]` (X Articles long-form body)
 - `IntersectionObserver` (rootMargin `0px 0px 600px 0px`) pre-queues tweets before they enter the viewport
 - **Translation modes**: if `autoTranslate=true`, tweets are queued automatically; if `false`, a `<button class="dualang-btn">译</button>` is injected for manual translation
 - **Display modes** (`displayMode` setting, 4 values; replaces the old boolean `bilingualMode`):

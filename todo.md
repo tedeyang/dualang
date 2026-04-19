@@ -244,3 +244,110 @@
 - [x] **Popup UI**：`bilingualMode` checkbox → `displayMode` select 4 选 1，提示"模式切换后，已翻译的推文保留旧模式；刷新页面可全量应用新模式" ✅
 - [x] **CSS**：新增 `.dualang-original-html`（保留原文 pre-wrap + font-size）、`.dualang-inline-pair` / `.dualang-inline` 间距；`article[data-dualang-mode="translation-only"|"inline"|"bilingual"] [data-testid="tweetText"] { display: none; }` 精准隐藏原文 ✅
 - [x] **测试**：`manual-and-bilingual.spec.ts` 重构为 5 个 describe（append / translation-only / inline / bilingual / 持久化+迁移），9 条 e2e 全绿；全套 e2e 48/48（两轮稳定）、vitest 124 条（原 117 + 7 新增 splitParagraphsByDom）✅
+
+### P28 — 小模型流式 CJK 乱码治理
+
+- [x] **问题**：Qwen2.5-7B / GLM-4-9B 等 7-9B 小模型在 SiliconFlow / z.ai 上开启 SSE 流式时，服务端在分片边界切断多字节 UTF-8 字符，JSON encoder 直接用 `�`（U+FFFD）替换不完整字节 —— 客户端怎么也修不回来。附带症状：字符级复读（"， ， ，"、"就 不 就不应该"），像是两段翻译被错乱合并 ✅
+- [x] **profile 层禁流式**（`src/background/profiles.ts`）：
+  - `QWEN_LEGACY_PROFILE.supportsStreaming = false`（Qwen2.5 系列）
+  - 新增 `GLM_LEGACY_PROFILE`，正则 `/glm-4/i` 匹配 GLM-4-9B / 4-32B / 4-Plus 等非 4.6 系列，`supportsStreaming: false`；顺序放在 `GLM46_PROFILE` 之后，避免 `/glm-4/i` 抢在 4.6 之前
+  - `GENERIC_PROFILE.supportsStreaming = false`（未知 endpoint 默认保守）
+  - 流式现在只给 Moonshot / Qwen3（reasoning 需要早期反馈）/ GLM-4.6（大参数低切字概率）✅
+- [x] **客户端兜底**（`src/background/api.ts`）：`parseStream` 和 `doTranslateBatchStream` 循环结束后 `decoder.decode()` 不带 `stream: true` 做最终 flush，清空 TextDecoder 内部字节缓冲，避免末尾多字节字符残留成 `�`。防御性修复，对所有 provider 生效 ✅
+- [x] **popup UI 降级 Qwen2.5**：推荐组重排 GLM-4-9B 到第一位（标"默认"）+ Moonshot 次位；Qwen2.5-7B 移到"其他免费（有局限）"组，描述加"禁流式（CJK 偶发乱码）、数字易错"警告；兜底选择器同步降级 ✅
+- [x] **测试**：`profiles.test.ts` 新增 GLM legacy 匹配 + streaming 字段断言（4.6 仍开、非 4.6 关）；全套 vitest 126 / e2e 48 通过 ✅
+
+### P29 — 展示模式视觉与交互 bug 治理
+
+- [x] **段落空行对齐**（styles + content/index.ts）：`append/translation-only/bilingual` 模式下把多段译文 `join('\n\n')` 放进单个 `<div class="dualang-para">`，靠 `white-space: pre-wrap` 原生渲染出和原文 `\n\n` 完全一致的空行（一整行 line-height）。旧做法是每段一个 div + `margin-top: 4px`，永远对不齐原文空行 ✅
+- [x] **译文配色**：从 `#8b98a5`（luminance ~60%，过暗影响阅读）改到 `#c5ccd3`（~80%）；保留冷灰色调便于辨识"这是译文"，同时避免过暗 ✅
+- [x] **`splitParagraphsByDom` 深度改写**（`src/content/utils.ts`）：X.com 主列表把整段推文包进一个 `<span>`，多段落通过 `\n\n` 藏在 span 内部 text node 里。旧实现只遍历顶层 childNodes 永远只拆出 1 段。新实现：克隆子树 → 所有 `<br>` 替换成 `\n` → `normalize()` 合并相邻文本节点 → TreeWalker 深度扫所有 text node 收集 `\n\n` 的 `(node, offset)` → 用 `Range.cloneContents()` 提取每段 fragment，自动保留跨层级的 `<span>` / `<a>` / `<img>` 壳。新增单测覆盖 X.com 真实结构（span 内 `\n\n` 分 3 段）✅
+- [x] **Show more 跳页修复**：`handleShowMoreOrRecycle` 和 fail 状态手动重试路径里，`.dualang-translation.remove()` 的同时 `article.removeAttribute('data-dualang-mode')`。否则在 translation-only / inline / bilingual 模式下，过渡期原文仍被 CSS 隐藏、card 又没了，article 高度塌到 0，翻译回来再撑起 —— 两次跳变导致页面上移。摘属性后过渡期原文可见（自然高度），只剩一次切换 ✅
+- [x] **测试**：vitest 126（新 splitParagraphsByDom 测 X.com 实际结构）、e2e 48/48 全绿 ✅
+
+### P30 — 支持 X.com Grok AI 摘要卡
+
+- [x] **场景**：X `/i/trending/<id>` 页面顶部的 Grok 自动生成摘要卡（含标题 / 时间戳 / 主体段落 / 免责声明）不是 `article[data-testid="tweet"]`，我们原来的扫描器直接跳过，不触发翻译 ✅
+- [x] **定位锚点**：用 Chrome DevTools Protocol（localhost:9222 WebSocket）live inspect 实际 DOM，确认 Grok 卡无 `data-testid` / `role` / `aria-label`，唯一稳定结构：4 个子 DIV + 含 `<time>` + `children[3].textContent.trim().startsWith('This story is a summary of posts on X')`。不能只看子元素数 + time —— 页面级容器（buttons + HEADER + MAIN）也匹配，必须同时要求所有 4 个孩子都是 DIV + 免责声明位于 children[3] 首字符串 ✅
+- [x] **`isGrokCardContainer(el)` + `findAndPrepareGrokCards(root)`**（`src/content/index.ts`）：粗筛用 `:has(time)` 选择器 + 向上 6 层找最小 Grok 卡；发现后在卡上打 `data-dualang-grok="true"`、body div 打 `data-dualang-text="true"`，之后复用 tweet 翻译管线 ✅
+- [x] **`findTweetTextEl(container)` 抽象**：把散落 10 处的 `article.querySelector('div[data-testid="tweetText"]')` 归一成 `container.querySelector('[data-testid="tweetText"], [data-dualang-text="true"]')`。tweet 和 Grok 卡走同一查询 ✅
+- [x] **`scanAndQueue` 扩容**：把 `findAndPrepareGrokCards(root)` 的结果拼到 articles 列表后面，一起走处理循环；processedTweets WeakSet / IntersectionObserver 注册 / contentId 缓存 / cache 命中恢复全部白送 ✅
+- [x] **MutationObserver 扩展**：新增节点如果 `textContent.includes('This story is a summary of posts on X')` 就作为扫描根入队，确保 SPA 路由 / 动态插入 Grok 卡能被发现 ✅
+- [x] **getContentId Grok 策略**（`src/content/utils.ts`）：有 `data-dualang-grok` 属性时，用 `children[0].textContent` 作为 ID（带 `grok:` 前缀），标题对同一 trending 话题稳定 ✅
+- [x] **测试**：vitest 128（新增 2 条 Grok contentId 单测），e2e 48/48 全绿。**活页验证**：通过 DevTools Protocol reload 扩展后，trending 页 Grok 卡 10s 内被标记，11s 内渲染中文译文（"在一个近两个小时的谈话中，主持人 Dwarkesh Patel..."）✅
+
+### P31 — 支持 X Articles（长文阅读视图）
+
+- [x] **场景**：X 的"Articles" 长文页（url 模式 `/<user>/status/<id>` 但服务端返回为长文结构），DOM 里有 `[data-testid="twitterArticleReadView"]` / `[data-testid="twitter-article-title"]` / `[data-testid="twitterArticleRichTextView"]` / `[data-testid="longformRichTextComponent"]`；外壳仍是 `article[data-testid="tweet"]`，但内部**没有** `[data-testid="tweetText"]`，老扫描器找不到文本就跳过。实测 17k 字符长文（"Why Your AI-First Strategy Is Probably Wrong"）整篇不翻译 ✅
+- [x] **定位锚点**：通过 Chrome DevTools Protocol live inspect 真实文章页；testid 稳定可靠（不像 Grok 卡需要结构嗅探）。选 `twitterArticleRichTextView`（纯正文）作为 tweetText 等价物，**不**选 `twitterArticleReadView` —— 后者包含标题和引擎计数（143 / 3.4K / 1.7M），会混进译文中间（首轮验证时"为什么你的'AI优先'战略很可能错了1437083.4K1.7M99%的..."就这么出现的）✅
+- [x] **`findTweetTextEl` 第三个选择器**：在原有 `[data-testid="tweetText"], [data-dualang-text="true"]` 之上加 `[data-testid="twitterArticleRichTextView"]`。一处改动，扫描 / 翻译 / 渲染管线全部自动适配 —— 因为 article 外壳已经是 `article[data-testid="tweet"]`，scanAndQueue 原本就会捕获，只是老版本在 findTweetTextEl 返回 null 就卡住 ✅
+- [x] **活页验证**：reload 扩展 + 刷新 `/intuitiveml/status/2043545596699750791`，83 秒后译文渲染完成（6229 字符干净中文，无引擎计数混入），延迟主要来自 17k 字符输入的 API 调用本身 ✅
+- [x] **后续可选**：标题（`twitter-article-title`）未翻译 —— MVP 不做，需要的话后续加一个独立的伪容器映射过去。文章太长时的体感可通过 hedged race 和适度切块改善 ✅
+
+### P32 — 长文按段切块翻译（修复 X Articles 译文坍缩）
+
+- [x] **问题**：第二篇 X Article（21k 字符）整包送翻译时，GLM-4-9B 把**25 段原文压成 2 段输出**（模型在超长上下文下丢失段落结构）。inline 模式下 splitParagraphsByDom 检测到 5 段原文 DOM fragments，但只有 2 段有对应译文，剩下都是空的 pair ✅
+- [x] **根因**：不是 DOM 检测问题，是**模型自身**在长输入下把多段译文揉成少数几个块。`splitParagraphsByDom` 老实现看 text node `\n\n` 已经够用，短文没问题，长文靠小模型保留段落结构本来就靠不住 ✅
+- [x] **`requestTranslationChunked(text, priority, skipCache, strictMode)`**（`src/content/index.ts`）：当 `texts.length === 1 && text.length >= 4000 && paraCount >= 6` 时自动进入。把文本按 `\n\n` 切段，5 段一 chunk **串行**送 API（并发会把 MAX_CONCURRENT 占满 + rate limiter 串行化反而更易触发 30s 超时），每 chunk 超时放宽到 60s，全部完成后 `join('\n\n')` 作为单段译文返回。`requestTranslation` 内部自动分流，调用方（`translateImmediate` / `flushQueue` 两条路径）无需感知 ✅
+- [x] **inline 模式段数严重不匹配降级**：原文 DOM 切出段数 < 译文段数 × 0.5 时，不再强行逐段配对（会造成 20+ 空 pair），退回 bilingual 风格渲染（整段克隆原文 HTML + 整段译文单块），`perfLog('inline.fallbackToBilingual', ...)` 记录。长文的自然场景是 DOM 段少、译文段多（因为 splitParagraphsByDom 看 text node 而 innerText 看 CSS block 布局） ✅
+- [x] **质量检查对长文放行**：`hasSuspiciousLineMismatch` 加 `origTranslatable >= 5000` 跳过行数/段数坍缩检查。长文英中翻译的行数比例天然不同（英文 391 单 \n vs 中文 ~50），原门槛主要针对短推文的"模型压缩成一行"坏情况，长文误报率太高。字符级缩减检查保留（真正的截断会被捕获）✅
+- [x] **活页实测**：两篇文章均成功
+  - `intuitiveml/2043545596699750791`（17k 字符）：72s，7 段译文，status=success
+  - `gemchange_ltd/2028904166895112617`（21k 字符）：93s，22 段译文，status=success ✅
+- [x] **测试**：vitest 128 / e2e 48/48 全绿 ✅
+
+### P33 — X Articles"超级精翻"按钮（Kimi 全文精翻）
+
+- [x] **场景**：X Articles 长文页面。用户想要更高质量的翻译（比常规 GLM-4-9B 免费模型更精准、地道、保留专业术语），愿意接受较长耗时。按钮注入 article 右下角 `position: absolute`，点击触发 Kimi 全文翻译 ✅
+- [x] **`isXArticle(article)` + `injectSuperFineButton(article)`**（`src/content/index.ts`）：scanAndQueue 里识别 article 是否含 `[data-testid="twitterArticleRichTextView"]`（推文 / Grok 卡不会有），是就在 article 右下角注入按钮。若 article 是 `position: static` 则补 `relative`（不覆盖 X.com 自有定位）。idempotent ✅
+- [x] **`translateArticleSuperFine(article)`**（`src/content/index.ts`）：
+  - 10min 超时（远超常规 30s），接受 Kimi 长耗时
+  - `sendMessage({action:'translate', payload:{superFine:true, strictMode:true, skipCache:true, priority:2}})`：superFine 标记让 background 切换到 Kimi，strictMode 拼 STRICT_PREFIX 强制保留段落结构避免多段压成一段
+  - 替换已有译文 card（之前 GLM 的那份），插 Kimi 新版 ✅
+- [x] **Background 端 Kimi 覆写**（`src/background/index.ts` + `settings.ts`）：`handleTranslate(payload)` 里若 `payload.superFine` 则覆写 settings：`baseUrl=api.moonshot.cn/v1`、`model=moonshot-v1-128k`（128k 上下文避免 21k+ 字符文章被截断）、`apiKey` 从 `config.json` 的 moonshot 条目读，没有则报错提示用户配置。禁流式 / 禁兜底 / 禁赛马（精翻场景要可控）✅
+- [x] **视觉反馈**（`styles.css`）：
+  - `.dualang-super-btn`：蓝色胶囊按钮（#1d9bf0）右下角 `position: absolute`，hover 上移 + 阴影加深；禁用时灰色（#6b7280）
+  - `@keyframes dualang-super-pulse`：2.4s ease-in-out 循环，`background-color` 在透明 ↔ `rgba(29,155,240,0.08)` 之间柔和脉冲
+  - `article.dualang-super-translating [data-testid="twitterArticleReadView"]` 触发动画，圆角 10px 配背景过渡 ✅
+- [x] **按钮文本状态机**：初始 "超级精翻" → 点击后 "精翻中…" (禁用) → 成功 "重新精翻" (允许再跑) / 失败回 "超级精翻" ✅
+- [x] **活页实测**（intuitiveml/2043545596699750791 , 17k 字符）：
+  - 按钮 0s 注入可见
+  - 点击 → `translating` class 触发脉冲（视觉确认）
+  - 48s 后 status=success，model=`moonshot-v1-128k`，6911 tokens，23543 字符 Chinese 译文
+  - 按钮变"重新精翻" ✅
+- [x] **测试**：vitest 128 / e2e 48/48 全绿 ✅
+
+### P34 — 超级精翻流式 + 分段渲染（A+B 方案落地）
+
+- [x] **问题**：原版超级精翻单请求全文 → Kimi 在 17k+ 字符下段落压缩（N 段压成 2 段）；48s 过程零反馈；没 cancel；感知慢 ✅
+- [x] **新架构**：
+  - **端到端流式 port**：content `chrome.runtime.connect({name:'super-fine'})` → background `handleSuperFineStream` → `doTranslateBatchStream` SSE 逐段推送
+  - **按段切块**：一篇文章切 5 段一 chunk 串行翻译，段数天然对齐（不再靠模型保留结构）
+  - **渐进渲染**：点击后立即渲染 N 个占位 slot（脉冲灰色 skeleton），每段译文到就填对应 slot + fade-in 动画
+  - **进度可见**：按钮文本 `精翻中… (X/N)` 实时更新 ✅
+- [x] **消息协议**（`src/background/index.ts`）：
+  - `meta` → 元信息 `{paragraphs, chunks, model, baseUrl}`
+  - `partial` → 单段译文 `{index, translated}`（前端按 index 填 slot）
+  - `progress` → chunk 完成 `{completed, total}`（按钮文案更新）
+  - `chunkFail` → 单 chunk 失败（不中止整体）
+  - `done` → 全部完成 `{totalTokens, model, baseUrl, completed, total}`
+  - `error` → 致命错误 ✅
+- [x] **DOM block 段落提取**（`src/content/utils.ts::extractParagraphsByBlock`）：原来的 `extractText` clone 后 innerText 丢失 CSS 布局换行（X Articles tight layout 退化成 1 段）。新实现遍历 DOM leaf block 节点取 textContent，段数真实反映视觉段落 ✅
+- [x] **`extractText` 修复**：改为直接读原元素 innerText（不 clone），保留 CSS block 布局换行。新增 `splitIntoParagraphs(text)` 在 `\n\n` 优先、`\n` 降级的策略下一致切段 ✅
+- [x] **CSS skeleton**（`styles.css`）：
+  - `.dualang-super-slot:not(--filled)` 蓝色脉冲背景 1.6s 循环
+  - `.dualang-super-slot--filled` fade-in + translateY(2px→0) 0.35s ease-out 动画 ✅
+- [x] **模型选择**：默认 `moonshot-v1-128k`（非 reasoning、128k 上下文、速度快、质量高）。`kimi-k2.5` 原计划但 bench v2 实测 28s/请求 × 29 chunks = 14 分钟不现实；`handleSuperFineStream` 已经从 `payload.model` 读取，popup 加"精翻模型"下拉就能切换 ✅
+- [x] **活页实测**（intuitiveml 17k 字符 / 142 段）：
+  - 按钮 1s 就绪；点击后 0s 立刻渲染 3 段；5s 11/142；40s 75/142；**80s 142/142 成功**
+  - 对比原版（非流式）48s 全部等完，新版 1s 就能开始读 —— 感知速度提升 ~48×
+  - 第一段译文："我们99%的生产代码是由人工智能编写的。上周二，我们在上午10点发布了一个新功能..." ✅
+- [x] **测试**：vitest 128 / e2e 48/48 全绿 ✅
+
+### 后续方向（未做）
+
+- 精翻模型可选：popup 加下拉框暴露 `moonshot-v1-128k` / `kimi-k2.5` / `moonshot-v1-auto`，用户按需选（k2.5 需要先 bench 验证实际可用 + 单请求 latency 可接受）
+- 取消按钮：翻译中按钮文案"✕ 取消"，abort 剩余 chunks（AbortController 已接好，只差 UI）
+- 并发 chunks：当前串行 80s；2-3 路并发同发 Moonshot 允许的话可以再快 2-3×
+- 142 段过细：很多是列表短项；合并 <40 字短段到相邻段可减到 ~50 段
+- 标题翻译：X Articles 的 `twitter-article-title`、Grok 卡的 `children[0]`

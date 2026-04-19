@@ -181,19 +181,44 @@ const GLM46_PROFILE: ProviderProfile = {
   systemPromptBatch: BATCH_PROMPT,
 };
 
-// 任意 OpenAI 兼容 fallback（SiliconFlow 上的 GLM-4-9B 等走这里）
+// GLM-4-9B / 4-32B / 4-Plus 等非 4.6 系列（z.ai 原生、SiliconFlow 托管）：
+// 和 Qwen 同类问题 —— 流式输出偶发 `�` + 字符复读（"， ， ，" / "就 不 就不应该"），
+// 服务端在 SSE 分片边界切了 CJK 字符。禁流式后整包下发消失。
+// 顺序敏感：必须在 GLM46 之后，否则会把 GLM-4.6 也吞掉。
+const GLM_LEGACY_PROFILE: ProviderProfile = {
+  id: 'glm-legacy',
+  matchModel: /glm-4/i,
+  endpointPath: '/chat/completions',
+  temperature: () => 0.3,
+  thinkingControl: 'omit',
+  supportsStreaming: false,
+  systemPromptSingle: SINGLE_PROMPT,
+  systemPromptBatch: BATCH_PROMPT,
+};
+
+// 任意 OpenAI 兼容 fallback：已知 profile 都不命中时兜底。
+// 默认禁流式 —— 小模型（7-9B 级）的服务端普遍有 SSE 分片切 CJK 字符问题，
+// 宁可保守也别冒字符坏损的风险。确认某个 endpoint 流式安全再单独加 profile 打开。
 const GENERIC_PROFILE: ProviderProfile = {
   id: 'generic-openai',
   endpointPath: '/chat/completions',
   temperature: () => 0.3,
   thinkingControl: 'omit',
-  supportsStreaming: true,
+  supportsStreaming: false,
   systemPromptSingle: SINGLE_PROMPT,
   systemPromptBatch: BATCH_PROMPT,
 };
 
-// 顺序敏感：QWEN3 必须在 QWEN_LEGACY 之前，否则 /qwen/i 会先命中把 qwen3 也吞掉。
-const PROFILES: ProviderProfile[] = [MOONSHOT_PROFILE, QWEN3_PROFILE, QWEN_LEGACY_PROFILE, GLM46_PROFILE];
+// 顺序敏感：
+//   - QWEN3 必须在 QWEN_LEGACY 之前，否则 /qwen/i 会先命中把 qwen3 也吞掉
+//   - GLM46 必须在 GLM_LEGACY 之前，否则 /glm-4/i 会先命中把 4.6 也吞掉
+const PROFILES: ProviderProfile[] = [
+  MOONSHOT_PROFILE,
+  QWEN3_PROFILE,
+  QWEN_LEGACY_PROFILE,
+  GLM46_PROFILE,
+  GLM_LEGACY_PROFILE,
+];
 
 export function getProfile(settings: { baseUrl?: string; model?: string }): ProviderProfile {
   const url = String(settings.baseUrl || '').toLowerCase();

@@ -67,6 +67,13 @@ const ID_STRATEGIES: IdStrategy[] = [
     const d = (el as HTMLElement).dataset;
     return d?.postId || d?.commentId || d?.messageId || d?.entryId || d?.threadId || null;
   },
+  // Grok 摘要卡（X.com /i/trending/<id>）：卡片没 testid、没链接，用标题哈希作为 ID。
+  // 标题是卡片第一个子 div 的文本，对同一 trending 话题稳定；换话题会变。
+  (el) => {
+    if (!(el instanceof Element) || !el.hasAttribute?.('data-dualang-grok')) return null;
+    const title = (el.children[0]?.textContent || '').trim();
+    return title ? `grok:${title}` : null;
+  },
   // 回退：元素自身 id 属性（mock 测试页 / 明确指定 id 的站点）
   (el) => el.id || null,
 ];
@@ -104,6 +111,13 @@ export function hasSuspiciousLineMismatch(original: string, translated: string):
 
   // 字符级急剧缩减（按可翻译字符）
   if (translated.length * 7 < origTranslatable) return true;
+
+  // 长文（>5000 字符）跳过行数 / 段落坍缩检查：
+  //   - 英中翻译中行数比例天然不同（英文列表/代码/项目符号行数多，中文合并进段落）
+  //   - 长文已走分段翻译路径（requestTranslationChunked），段数由客户端 join 控制，
+  //     不会被模型压缩
+  //   - 这个启发式主要针对短推文被模型压缩成 "翻译:" 一行的坏情况
+  if (origTranslatable >= 5000) return false;
 
   const origLines = countSignificantLines(original);
   const transLines = countSignificantLines(translated);
@@ -190,55 +204,126 @@ function countParagraphs(s: string): number {
 }
 
 export function extractText(el: Element): string {
-  const clone = el.cloneNode(true) as Element;
-  clone.querySelectorAll('.dualang-translation, .dualang-btn, .dualang-status').forEach(n => n.remove());
-  const raw = ((clone as HTMLElement).innerText || clone.textContent || '').trim();
+  // 直接用原元素的 innerText —— 脱离 DOM 的 clone 下 innerText 会 fallback 到
+  // textContent，丢失 CSS block 布局撑出来的换行（X Articles 里 100+ 个 <div>
+  // 段落全部粘成一行）。我们注入的 .dualang-translation / .dualang-btn / .dualang-status
+  // 都是 tweetTextEl 的兄弟节点（见 insertBefore 调用点），不在 tweetTextEl 内部，
+  // 所以直接读 innerText 不会抓到我们自己的 UI 文字。
+  // 另外：X Articles 的段落边界在 innerText 里可能只有单个 \n（tight layout）而非 \n\n，
+  // 统一把 2+ 连续 \n 归一为 \n\n，保留单个 \n 作为行内换行供下游按需拆段。
+  const raw = ((el as HTMLElement).innerText || el.textContent || '').trim();
   return raw.replace(/[^\S\n]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// 按段落切分 extractText 的输出。X Articles 在 innerText 里常用单 \n 分隔段落
+// （CSS tight layout），普通推文用 \n\n。两种形态统一对待：优先 \n\n，没有就降级 \n。
+// 返回去空白后的非空段落数组。
+export function splitIntoParagraphs(text: string): string[] {
+  const hasDoubleNL = /\n\s*\n/.test(text);
+  const parts = hasDoubleNL
+    ? text.split(/\n\s*\n/)
+    : text.split(/\n/);
+  return parts.map((p) => p.trim()).filter(Boolean);
+}
+
+// 按 DOM block-level 结构提取段落，专为长文（X Articles）设计。
+// 遍历每个 leaf block（自身是 block 且内部没有更深的 block 子元素）取 textContent，
+// 合并为 "\n\n" 分隔的段落串。对 innerText 的 CSS tight-layout（全 \n）或
+// margin-separated（全 \n\n）都给出一致的按视觉段落数。
+const BLOCK_TAGS = new Set([
+  'DIV', 'P', 'SECTION', 'ARTICLE', 'MAIN', 'ASIDE',
+  'LI', 'UL', 'OL', 'DL', 'DD', 'DT',
+  'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+  'BLOCKQUOTE', 'PRE', 'FIGURE', 'TABLE', 'TR',
+]);
+
+export function extractParagraphsByBlock(el: Element): string[] {
+  const paras: string[] = [];
+  function visit(node: Element) {
+    const blockChildren = Array.from(node.children).filter((c) => BLOCK_TAGS.has(c.tagName));
+    if (blockChildren.length === 0) {
+      // 叶子 block：取整段 textContent 作为一段（内部的 inline <span>/<a>/<br> 文本被拼接）
+      const t = (node.textContent || '').trim();
+      if (t) paras.push(t);
+      return;
+    }
+    // 有 block 子：递归；非 block 的 inline 孩子（散落文本）在叶子层会被一起抓到
+    for (const c of blockChildren) visit(c);
+  }
+  visit(el);
+  return paras;
 }
 
 /**
  * 把 tweetText 元素按段落边界切成 N 个 DocumentFragment，保留原 HTML
  * （`<a>` / `<img alt>` / `<span>` 等），供"段落对照"模式用来克隆原文段落。
  *
- * 段落分隔识别两种形态（X.com 实际见到的混合）：
- *   1. 文本节点里出现 `\n\n`（最常见，pre-wrap 推文）
+ * 段落分隔识别两种形态（X.com 实际结构都见过）：
+ *   1. 任意深度的文本节点里出现 `\n\n`（X.com 主列表常把整段推文包进一个 `<span>`，
+ *      多段落通过 `\n\n` 分隔，**不是** 顶层兄弟节点）
  *   2. 连续的 `<br><br>`（少数富文本推文）
  *
- * 纯空白段（去 trim 后 length=0）会被过滤。返回数组长度即段落数。
+ * 实现：先克隆整棵子树，把所有 `<br>` 替换成 "\n" 文本节点，再 `normalize()` 把相邻
+ * 文本合并成单节点，这样 BR-based 和 \n\n-based 两种形态都归一到"文本节点里找 \n\n"。
+ * 然后用 TreeWalker 扫所有 text node 收集 `\n\n` 的 (node, offset) 位置，用这些位置
+ * 作为 Range 边界调 `Range.cloneContents()` 提取每段的 fragment —— 跨层级、保留 HTML。
+ *
+ * 纯空白段（trim 后 length=0）会被过滤。返回数组长度即段落数。
  */
 export function splitParagraphsByDom(el: Element): DocumentFragment[] {
   const doc = el.ownerDocument || document;
-  const groups: Node[][] = [[]];
-  const nodes = Array.from(el.childNodes);
-  for (let i = 0; i < nodes.length; i++) {
-    const node = nodes[i];
-    if (node.nodeType === Node.TEXT_NODE) {
-      const text = node.textContent || '';
-      const parts = text.split(/\n\s*\n/);
-      for (let p = 0; p < parts.length; p++) {
-        if (parts[p].length > 0) {
-          groups[groups.length - 1].push(doc.createTextNode(parts[p]));
-        }
-        if (p < parts.length - 1) groups.push([]);
-      }
-    } else if ((node as Element).tagName === 'BR') {
-      // 连续 <br><br> 视为段落分隔；单个 <br> 当作行内换行保留
-      const next = nodes[i + 1];
-      if (next && (next as Element).tagName === 'BR') {
-        groups.push([]);
-        i++;  // 跳过第二个 <br>
-      } else {
-        groups[groups.length - 1].push(node.cloneNode(true));
-      }
-    } else {
-      groups[groups.length - 1].push(node.cloneNode(true));
-    }
+
+  // 克隆子树后预处理：<br> → "\n" 文本节点 + normalize() 合并相邻文本节点。
+  // 必须操作 clone，避免污染原 DOM。
+  const clone = el.cloneNode(true) as Element;
+  const brs = Array.from(clone.querySelectorAll('br'));
+  for (const br of brs) {
+    br.parentNode?.replaceChild(doc.createTextNode('\n'), br);
   }
-  return groups
-    .filter((group) => group.some((n) => (n.textContent || '').trim().length > 0))
-    .map((group) => {
-      const f = doc.createDocumentFragment();
-      group.forEach((n) => f.appendChild(n));
-      return f;
-    });
+  (clone as Element & { normalize(): void }).normalize();
+
+  // 收集所有 text node 里 `\n\n` 的位置
+  type Break = { node: Text; start: number; end: number };
+  const breaks: Break[] = [];
+  const walker = doc.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
+  let n: Node | null = walker.nextNode();
+  while (n) {
+    const text = (n as Text).data;
+    const re = /\n\s*\n/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      breaks.push({ node: n as Text, start: m.index, end: m.index + m[0].length });
+    }
+    n = walker.nextNode();
+  }
+
+  const result: DocumentFragment[] = [];
+  const pushRange = (startNode: Node, startOffset: number, endNode: Node, endOffset: number) => {
+    const r = doc.createRange();
+    r.setStart(startNode, startOffset);
+    r.setEnd(endNode, endOffset);
+    const frag = r.cloneContents();
+    if ((frag.textContent || '').trim().length > 0) result.push(frag);
+  };
+
+  if (breaks.length === 0) {
+    // 没有段落分隔符：整段作为一个 fragment
+    const r = doc.createRange();
+    r.selectNodeContents(clone);
+    const frag = r.cloneContents();
+    if ((frag.textContent || '').trim().length > 0) result.push(frag);
+    return result;
+  }
+
+  // 第一段：clone 起点 → 第一个 break 的开始
+  pushRange(clone, 0, breaks[0].node, breaks[0].start);
+  // 中间各段：上一 break 结束 → 下一 break 开始
+  for (let i = 0; i < breaks.length - 1; i++) {
+    pushRange(breaks[i].node, breaks[i].end, breaks[i + 1].node, breaks[i + 1].start);
+  }
+  // 最后一段：最后一个 break 结束 → clone 终点
+  const last = breaks[breaks.length - 1];
+  pushRange(last.node, last.end, clone, clone.childNodes.length);
+
+  return result;
 }
