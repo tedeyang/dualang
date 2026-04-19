@@ -1,5 +1,6 @@
-import { shouldSkipContent, isAlreadyTargetLanguage, extractText, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, rebuildParagraphs, splitParagraphsByDom, splitIntoParagraphs, extractParagraphsByBlock } from './utils';
+import { shouldSkipContent, isAlreadyTargetLanguage, extractText, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, rebuildParagraphs, splitParagraphsByDom, splitIntoParagraphs, extractParagraphsByBlock, extractAnchoredBlocks } from './utils';
 import { getModelMeta } from '../shared/model-meta';
+import * as bubble from './super-fine-bubble';
 
 type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCache?: boolean };
 
@@ -365,6 +366,17 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       initCostMs: (performance.now() - t0).toFixed(2)
     });
     ensureBgPort();
+    bubble.initBubble({
+      onTrigger: (articleId: string) => {
+        const article = document.querySelector(`[data-dualang-article-id="${articleId}"]`);
+        if (article) translateArticleSuperFine(article);
+      },
+      onCancel: (articleId: string) => {
+        const article = document.querySelector(`[data-dualang-article-id="${articleId}"]`);
+        const port = (article as any)?._dualangSuperFinePort;
+        try { port?.disconnect(); } catch (_) {}
+      },
+    });
     setupIntersectionObservers();
     observeMutations();
     setTimeout(() => {
@@ -839,9 +851,6 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       const tweetTextEl = findTweetTextEl(article);
       if (tweetTextEl) art._dualangLastText = tweetTextEl.textContent || '';
 
-      // X Articles：无论走缓存恢复还是走正常翻译路径，都注入"超级精翻"按钮
-      if (isXArticle(article)) injectSuperFineButton(article);
-
       // 虚拟 DOM 回收后重现：尝试从内容 ID 缓存恢复翻译
       if (contentId && translationCache.has(contentId) && !article.querySelector('.dualang-translation')) {
         const cached = translationCache.get(contentId)!;
@@ -872,6 +881,28 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
           }
         }
       }
+
+      // X Articles 长文：跳过常规自动翻译，改由浮球交互触发
+      // 用 twitterArticleRichTextView 作为正文容器，不用通用 tweetTextEl
+      // （避免 querySelector 优先命中同 article 内的短 tweetText 预览元素）
+      if (isXArticle(article)) {
+        const richTextEl = article.querySelector('[data-testid="twitterArticleRichTextView"]');
+        const blocks = richTextEl ? extractAnchoredBlocks(richTextEl) : [];
+        const longByBlocks = blocks.length >= 6;
+        const longByChars = richTextEl ? (richTextEl.textContent || '').length >= 4000 : false;
+        if (longByBlocks && longByChars) {
+          article.setAttribute('data-dualang-long-article', 'true');
+          if (!article.getAttribute('data-dualang-article-id')) {
+            article.setAttribute('data-dualang-article-id', contentId || ('la-' + Math.random().toString(36).slice(2, 10)));
+          }
+          bubble.trackArticle(article);
+          newlyRegistered++;
+          return; // 不注册 viewport/preload observer
+        }
+      }
+
+      // 短文/常规 X Article：保留旧按钮行为直到 Task 10 清理
+      if (isXArticle(article)) injectSuperFineButton(article);
 
       viewportObserver?.observe(article);
       preloadObserver?.observe(article);
