@@ -1,6 +1,7 @@
 import { shouldSkipContent, isAlreadyTargetLanguage, extractText, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, rebuildParagraphs, splitParagraphsByDom, splitIntoParagraphs, extractParagraphsByBlock, extractAnchoredBlocks } from './utils';
 import { getModelMeta } from '../shared/model-meta';
 import * as bubble from './super-fine-bubble';
+import { renderInlineSlots, fillSlot, clearInlineSlots } from './super-fine-render';
 
 type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCache?: boolean };
 
@@ -509,126 +510,85 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     host.appendChild(btn);
   }
 
-  // 超级精翻（流式 + 按段切块渲染）：
-  //   1. 清旧译文卡，挖空原文 DOM 用作 pair 结构
-  //   2. 打开 super-fine port，发 {action:'translate', payload:{text}}
-  //   3. background 按段 chunk 流式翻译 → partial/progress 事件逐段推送
-  //   4. 每 partial 事件：立刻把对应段译文填到已创建的 slot 里（progressive render）
-  //   5. done → 停脉冲、按钮变"重新精翻"、触发 success 图标
-  //   6. error / 10min 超时 → 显示 fail
+  // 超级精翻（流式 + 原 DOM 保留 + 内联 slot 渲染）：
+  //   1. 按 DOM block 提取 AnchoredBlock[]（文本块 + img-alt 块）
+  //   2. 用 renderInlineSlots 在每个原块后插入 skeleton slot（不动原 DOM）
+  //   3. 浮球状态 translating，onCancel 通过 port.disconnect 中止
+  //   4. 每 partial 事件：fillSlot(article, index, text)
+  //   5. done → 浮球 done、success 图标；error/10min 超时 → 浮球 failed
   async function translateArticleSuperFine(article: Element) {
-    const tweetTextEl = findTweetTextEl(article);
+    const articleId = article.getAttribute('data-dualang-article-id');
+    if (!articleId) return;
+    // 优先用 twitterArticleRichTextView（X Articles 长文正文），避免 findTweetTextEl
+    // 因 CSS 选择器顺序返回同 article 内先出现的短预览 tweetText 元素
+    const tweetTextEl =
+      article.querySelector('[data-testid="twitterArticleRichTextView"]') ||
+      findTweetTextEl(article);
     if (!tweetTextEl) return;
-    // 长文专用：按 DOM block 结构提取段落（X Articles 的 innerText 段落边界靠 CSS 布局，
-    // 直接文本拆解要么过细要么失败；extractParagraphsByBlock 按叶子 block 取整段）
-    const paragraphs = extractParagraphsByBlock(tweetTextEl);
-    if (paragraphs.length === 0) return;
-    const text = paragraphs.join('\n\n');
+    const blocks = extractAnchoredBlocks(tweetTextEl);
+    if (blocks.length === 0) return;
 
-    const btn = article.querySelector('.dualang-super-btn') as HTMLButtonElement | null;
-    article.classList.add('dualang-super-translating');
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = `精翻中… (0/${paragraphs.length})`;
-    }
+    // 清旧 slot（可能是一次失败后的重翻）
+    clearInlineSlots(article);
+    renderInlineSlots(article, blocks);
+
+    bubble.setBubbleState(articleId, 'translating', { completed: 0, total: blocks.length });
+
+    // img-alt 块用 "[图: alt]" 发给模型，便于作为独立段落翻译
+    const paragraphs = blocks.map((b) => b.kind === 'img-alt' ? `[图: ${b.text}]` : b.text);
     const apiT0 = performance.now();
-    logBiz('translation.superFine.start', { chars: text.length, paragraphs: paragraphs.length });
+    logBiz('translation.superFine.start', { paragraphs: blocks.length });
 
-    // 清旧译文卡、摘 data-dualang-mode；准备 progressive 渲染的 skeleton card
-    article.querySelector('.dualang-translation')?.remove();
-    article.removeAttribute('data-dualang-mode');
-    hideStatus(article, true);
-    delete (article as TweetArticle)._dualangQualityRetried;
-    article.setAttribute('data-dualang-mode', 'bilingual');
-
-    const card = document.createElement('div');
-    card.className = 'dualang-translation dualang-bilingual dualang-super-streaming';
-    // 克隆整段原文放顶部（bilingual 风格）
-    const origBlock = document.createElement('div');
-    origBlock.className = 'dualang-original-html';
-    for (const child of Array.from(tweetTextEl.childNodes) as Node[]) {
-      origBlock.appendChild(child.cloneNode(true));
-    }
-    card.appendChild(origBlock);
-    // N 个占位段，translation 到来时按 index 填
-    const paraSlots: HTMLElement[] = [];
-    for (let i = 0; i < paragraphs.length; i++) {
-      const p = document.createElement('div');
-      p.className = 'dualang-para dualang-super-slot';
-      p.dataset.index = String(i);
-      paraSlots.push(p);
-      card.appendChild(p);
-    }
-    tweetTextEl.parentNode?.insertBefore(card, tweetTextEl.nextSibling);
-    unobserveArticle(article);
-
-    // 10min 总超时兜底（port 断开时也触发清理）
     let finished = false;
     let port: chrome.runtime.Port | null = null;
     const timeout = setTimeout(() => {
       if (finished) return;
       finished = true;
       try { port?.disconnect(); } catch (_) {}
-      article.classList.remove('dualang-super-translating');
-      showFail(article, '精翻超时 (10min)');
-      if (btn) { btn.disabled = false; btn.textContent = '超级精翻'; }
+      bubble.setBubbleState(articleId, 'failed');
       logBiz('translation.superFine.fail', { error: 'timeout' }, 'warn');
     }, 600_000);
-
-    let meta: { model?: string; baseUrl?: string } = {};
-    let completed = 0;
 
     try {
       port = chrome.runtime.connect(undefined, { name: 'super-fine' });
     } catch (err: any) {
       clearTimeout(timeout);
-      showFail(article, '无法连接后台：' + err.message);
-      if (btn) { btn.disabled = false; btn.textContent = '超级精翻'; }
-      article.classList.remove('dualang-super-translating');
+      bubble.setBubbleState(articleId, 'failed');
+      logBiz('translation.superFine.fail', { error: 'connect:' + err.message }, 'warn');
       return;
     }
+
+    (article as any)._dualangSuperFinePort = port;
+    let metaModel: string | undefined;
+    let metaBaseUrl: string | undefined;
 
     port.onMessage.addListener((msg: any) => {
       if (finished) return;
       if (msg.action === 'meta') {
-        meta.model = msg.model;
-        meta.baseUrl = msg.baseUrl;
+        metaModel = msg.model;
+        metaBaseUrl = msg.baseUrl;
       } else if (msg.action === 'partial') {
-        const idx: number = msg.index;
-        const t: string = msg.translated;
-        const slot = paraSlots[idx];
-        if (slot && t) {
-          slot.textContent = t;
-          slot.classList.add('dualang-super-slot--filled');
-        }
+        fillSlot(article, msg.index, msg.translated);
       } else if (msg.action === 'progress') {
-        completed = msg.completed;
-        if (btn) btn.textContent = `精翻中… (${completed}/${msg.total})`;
+        bubble.setBubbleState(articleId, 'translating', { completed: msg.completed, total: msg.total });
       } else if (msg.action === 'chunkFail') {
         logBiz('translation.superFine.chunkFail', { chunkIndex: msg.chunkIndex, error: msg.error }, 'warn');
       } else if (msg.action === 'done') {
         finished = true;
         clearTimeout(timeout);
-        article.classList.remove('dualang-super-translating');
-        article.classList.add('dualang-super-translated');
-        // 补齐未填的 slot（罕见，chunk 全失败才会出现）
-        for (const slot of paraSlots) {
-          if (!slot.textContent) slot.textContent = '';
-        }
+        bubble.setBubbleState(articleId, 'done');
         const rtt = performance.now() - apiT0;
-        showSuccess(article, { model: msg.model, baseUrl: msg.baseUrl, tokens: msg.totalTokens });
+        showSuccess(article, { model: msg.model || metaModel, baseUrl: msg.baseUrl || metaBaseUrl, tokens: msg.totalTokens });
         logBiz('translation.superFine.ok', {
-          paragraphs: paragraphs.length, completed: msg.completed, rttMs: rtt.toFixed(0), model: msg.model,
+          paragraphs: blocks.length, completed: msg.completed, rttMs: rtt.toFixed(0), model: msg.model || metaModel,
         });
-        if (btn) { btn.disabled = false; btn.textContent = '重新精翻'; }
         try { port?.disconnect(); } catch (_) {}
       } else if (msg.action === 'error') {
         finished = true;
         clearTimeout(timeout);
-        article.classList.remove('dualang-super-translating');
+        bubble.setBubbleState(articleId, 'failed');
         logBiz('translation.superFine.fail', { error: msg.error }, 'warn');
         showFail(article, msg.error);
-        if (btn) { btn.disabled = false; btn.textContent = '超级精翻'; }
         try { port?.disconnect(); } catch (_) {}
       }
     });
@@ -637,8 +597,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       if (finished) return;
       finished = true;
       clearTimeout(timeout);
-      article.classList.remove('dualang-super-translating');
-      if (btn) { btn.disabled = false; btn.textContent = '超级精翻'; }
+      bubble.setBubbleState(articleId, 'failed');
     });
 
     port.postMessage({
