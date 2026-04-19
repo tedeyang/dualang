@@ -56,3 +56,46 @@ describe('trackArticle / setBubbleState', () => {
     expect(onTrigger).toHaveBeenCalledWith('a1');
   });
 });
+
+describe('drag Y-axis', () => {
+  it('pointer 拖动更新 top 位置并 clamp 到 viewport', () => {
+    initBubble({ onTrigger: vi.fn(), onCancel: vi.fn() });
+    const article = document.createElement('article');
+    article.setAttribute('data-dualang-article-id', 'a1');
+    document.body.appendChild(article);
+    trackArticle(article);
+    const bubble = document.querySelector('.dualang-bubble') as HTMLElement;
+    Object.defineProperty(window, 'innerHeight', { value: 800, configurable: true });
+
+    bubble.dispatchEvent(new PointerEvent('pointerdown', { clientY: 400, pointerId: 1 }));
+    document.dispatchEvent(new PointerEvent('pointermove', { clientY: 500, pointerId: 1 }));
+    document.dispatchEvent(new PointerEvent('pointerup', { clientY: 500, pointerId: 1 }));
+    expect(bubble.style.top).toMatch(/px$/);
+    const top = parseFloat(bubble.style.top);
+    expect(top).toBeGreaterThan(440);
+    expect(top).toBeLessThan(520);
+  });
+
+  it('拖动后位置持久化到 localStorage', () => {
+    const setSpy = vi.spyOn(Storage.prototype, 'setItem');
+    initBubble({ onTrigger: vi.fn(), onCancel: vi.fn() });
+    const article = document.createElement('article');
+    article.setAttribute('data-dualang-article-id', 'a1');
+    document.body.appendChild(article);
+    trackArticle(article);
+    const bubble = document.querySelector('.dualang-bubble') as HTMLElement;
+    bubble.dispatchEvent(new PointerEvent('pointerdown', { clientY: 400, pointerId: 1 }));
+    document.dispatchEvent(new PointerEvent('pointermove', { clientY: 500, pointerId: 1 }));
+    document.dispatchEvent(new PointerEvent('pointerup', { clientY: 500, pointerId: 1 }));
+    expect(setSpy).toHaveBeenCalledWith('dualang.bubble.top', expect.any(String));
+    setSpy.mockRestore();
+  });
+
+  it('初始化时读取 localStorage 中的 top', () => {
+    localStorage.setItem('dualang.bubble.top', '250');
+    initBubble({ onTrigger: vi.fn(), onCancel: vi.fn() });
+    const bubble = document.querySelector('.dualang-bubble') as HTMLElement;
+    expect(bubble.style.top).toBe('250px');
+    localStorage.removeItem('dualang.bubble.top');
+  });
+});

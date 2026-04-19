@@ -17,6 +17,8 @@ interface BubbleCtx {
 
 let ctx: BubbleCtx | null = null;
 
+const STORAGE_KEY = 'dualang.bubble.top';
+
 export function initBubble(callbacks: Callbacks): void {
   if (ctx) return;
   const root = document.createElement('div');
@@ -28,12 +30,54 @@ export function initBubble(callbacks: Callbacks): void {
     </svg>
     <div class="dualang-bubble-label">🌐</div>
   `;
+
+  // Read saved position from localStorage
+  const savedTop = parseFloat(localStorage.getItem(STORAGE_KEY) || 'NaN');
+  if (!isNaN(savedTop)) {
+    root.style.top = `${savedTop}px`;
+  }
+
+  // Drag state variables (closed over by click + pointer handlers)
+  let dragState: { startY: number; startTop: number } | null = null;
+  const DRAG_THRESHOLD = 4;
+  let moved = false;
+
   root.addEventListener('click', () => {
+    if (moved) { moved = false; return; }
     if (!ctx?.currentArticleId) return;
     if (ctx.state === 'idle' || ctx.state === 'failed') {
       ctx.callbacks.onTrigger(ctx.currentArticleId);
     }
   });
+
+  root.addEventListener('pointerdown', (e) => {
+    const parsedTop = parseFloat(root.style.top);
+    dragState = {
+      startY: e.clientY,
+      startTop: isNaN(parsedTop) ? e.clientY : parsedTop,
+    };
+    moved = false;
+    try { root.setPointerCapture(e.pointerId); } catch (_) {}
+  });
+
+  document.addEventListener('pointermove', (e) => {
+    if (!dragState) return;
+    const dy = e.clientY - dragState.startY;
+    if (Math.abs(dy) > DRAG_THRESHOLD) moved = true;
+    if (!moved) return;
+    const nextTop = dragState.startTop + dy;
+    const clamped = Math.max(20, Math.min(window.innerHeight - 60, nextTop));
+    root.style.top = `${clamped}px`;
+  });
+
+  document.addEventListener('pointerup', () => {
+    if (!dragState) return;
+    if (moved) {
+      localStorage.setItem(STORAGE_KEY, root.style.top.replace('px', ''));
+    }
+    dragState = null;
+  });
+
   document.body.appendChild(root);
   ctx = {
     root,
