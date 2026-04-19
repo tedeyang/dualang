@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect } from 'vitest';
-import { isAlreadyTargetLanguage, shouldSkipContent, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, rebuildParagraphs, splitParagraphsByDom } from './utils';
+import { isAlreadyTargetLanguage, shouldSkipContent, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, rebuildParagraphs, splitParagraphsByDom, extractAnchoredBlocks } from './utils';
 
 // ========== isAlreadyTargetLanguage ==========
 
@@ -455,5 +455,60 @@ describe('splitParagraphsByDom', () => {
     const holder2 = document.createElement('div');
     holder2.appendChild(parts[2]);
     expect(holder2.textContent).toBe('Third @user');
+  });
+});
+
+// ========== extractAnchoredBlocks ==========
+
+describe('extractAnchoredBlocks', () => {
+  it('返回带 el 引用的 text blocks', () => {
+    document.body.innerHTML = `
+      <article>
+        <p>Hello world</p>
+        <p>Second para</p>
+      </article>`;
+    const root = document.querySelector('article')!;
+    const blocks = extractAnchoredBlocks(root);
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0].kind).toBe('text');
+    expect(blocks[0].text).toBe('Hello world');
+    expect(blocks[0].el.tagName).toBe('P');
+    expect(blocks[1].text).toBe('Second para');
+  });
+
+  it('img 独立成 img-alt block，alt 文本进 text 字段', () => {
+    document.body.innerHTML = `
+      <article>
+        <p>Before image</p>
+        <figure><img alt="Chart showing revenue growth"></figure>
+        <p>After image</p>
+      </article>`;
+    const root = document.querySelector('article')!;
+    const blocks = extractAnchoredBlocks(root);
+    expect(blocks).toHaveLength(3);
+    expect(blocks[1].kind).toBe('img-alt');
+    expect(blocks[1].text).toBe('Chart showing revenue growth');
+    expect(blocks[1].el.tagName).toBe('FIGURE');
+  });
+
+  it('无 alt 的图片不产生 block（避免空串）', () => {
+    document.body.innerHTML = `
+      <article>
+        <p>Only text</p>
+        <figure><img src="x.jpg"></figure>
+      </article>`;
+    const blocks = extractAnchoredBlocks(document.querySelector('article')!);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].kind).toBe('text');
+  });
+
+  it('视频/音频节点跳过（当前版本不翻译）', () => {
+    document.body.innerHTML = `
+      <article>
+        <p>Intro</p>
+        <video src="v.mp4"></video>
+      </article>`;
+    const blocks = extractAnchoredBlocks(document.querySelector('article')!);
+    expect(blocks).toHaveLength(1);
   });
 });

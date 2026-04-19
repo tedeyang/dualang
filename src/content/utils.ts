@@ -237,21 +237,36 @@ const BLOCK_TAGS = new Set([
   'BLOCKQUOTE', 'PRE', 'FIGURE', 'TABLE', 'TR',
 ]);
 
-export function extractParagraphsByBlock(el: Element): string[] {
-  const paras: string[] = [];
+export interface AnchoredBlock {
+  el: Element;        // 原 DOM 节点，slot 会插到它 afterend
+  kind: 'text' | 'img-alt';
+  text: string;       // 要送翻译的文本（img-alt 就是 alt 字符串）
+}
+
+export function extractAnchoredBlocks(el: Element): AnchoredBlock[] {
+  const blocks: AnchoredBlock[] = [];
   function visit(node: Element) {
     const blockChildren = Array.from(node.children).filter((c) => BLOCK_TAGS.has(c.tagName));
     if (blockChildren.length === 0) {
-      // 叶子 block：取整段 textContent 作为一段（内部的 inline <span>/<a>/<br> 文本被拼接）
+      // 叶子 block：优先识别图片
+      const img = node.querySelector('img[alt]');
+      if (img && (img.getAttribute('alt') || '').trim()) {
+        blocks.push({ el: node, kind: 'img-alt', text: img.getAttribute('alt')!.trim() });
+        return;
+      }
       const t = (node.textContent || '').trim();
-      if (t) paras.push(t);
+      if (t) blocks.push({ el: node, kind: 'text', text: t });
       return;
     }
-    // 有 block 子：递归；非 block 的 inline 孩子（散落文本）在叶子层会被一起抓到
     for (const c of blockChildren) visit(c);
   }
   visit(el);
-  return paras;
+  return blocks;
+}
+
+// 保留旧签名以免其他调用方断裂
+export function extractParagraphsByBlock(el: Element): string[] {
+  return extractAnchoredBlocks(el).map((b) => b.text);
 }
 
 /**
