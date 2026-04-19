@@ -309,28 +309,41 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
   port.onDisconnect.addListener(() => abortController.abort());
 
   try {
-    const moonshotKey = await getMoonshotKey();
-    if (!moonshotKey) {
-      throw new Error('超级精翻需要 Moonshot API Key；请在 config.json 的 providers.moonshot.apiKey 填入');
-    }
     const baseSettings = await getSettings();
-    // 超级精翻默认用 moonshot-v1-128k（128k 上下文 + 稳定 + 快）。
-    // 之前计划用 kimi-k2.5（flagship）但 reasoning 模式单 chunk 28s×29 chunks 不现实，
-    // 且 API key 层可能没 k2.5 权限。先用 128k 保证流式链路稳定，后续 bench 验证 k2.5
-    // 可用且足够快后再切换。
-    // bench v2：moonshot-v1-8k 1.8s / 8.9 quality；v1-128k 类似速度、支持 17k+ 字符输入。
-    const model = payload.model || 'moonshot-v1-128k';
-    const settings = {
-      ...baseSettings,
-      baseUrl: 'https://api.moonshot.cn/v1',
-      model,
-      apiKey: moonshotKey,
-      maxTokens: 8192,
-      reasoningEffort: 'none',
-      enableStreaming: true,
-      fallbackEnabled: false,
-      hedgedRequestEnabled: false,
-    };
+    // 精翻 provider 选择：默认复用主设置（SiliconFlow GLM-4-9B-0414）——
+    // 实测 TPM 充足 + 免费 + UTF-8 flush 已修，批量 chunked 稳定。
+    // Moonshot Kimi 为 opt-in：payload.model 以 `moonshot-` 或 `kimi-` 开头时切换。
+    const wantsMoonshot = typeof payload.model === 'string' &&
+      (payload.model.startsWith('moonshot-') || payload.model.startsWith('kimi-'));
+
+    let settings: any;
+    if (wantsMoonshot) {
+      const moonshotKey = await getMoonshotKey();
+      if (!moonshotKey) {
+        throw new Error('Moonshot 模型需要 API Key；请在 config.json 的 providers.moonshot.apiKey 填入，或不指定 model 以使用默认 GLM');
+      }
+      settings = {
+        ...baseSettings,
+        baseUrl: 'https://api.moonshot.cn/v1',
+        model: payload.model,
+        apiKey: moonshotKey,
+        maxTokens: 8192,
+        reasoningEffort: 'none',
+        enableStreaming: true,
+        fallbackEnabled: false,
+        hedgedRequestEnabled: false,
+      };
+    } else {
+      if (!baseSettings.apiKey) {
+        throw new Error('精翻需要 API Key；请在 popup 设置或 config.json 填入 SiliconFlow key');
+      }
+      settings = {
+        ...baseSettings,
+        enableStreaming: true,
+        fallbackEnabled: false,
+        hedgedRequestEnabled: false,
+      };
+    }
 
     // content 端已经用 extractParagraphsByBlock 按 DOM block 结构切好段落
     // 直接接收数组，避免再做字符级拆分（容易因为 \n vs \n\n 差异出错）

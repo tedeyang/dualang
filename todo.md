@@ -388,3 +388,10 @@
 - 短段（<40 字）合并减少 slot 数
 - 文章标题（twitter-article-title）翻译
 - 双栏对照"阅读模式"（方案 E）
+
+## P36: 精翻默认 provider 改为 GLM
+
+Moonshot Kimi 免费层 TPM 不稳定，长文 ~29 chunks 串行容易中途触发限流。改为：
+- **默认**：复用 `getSettings()`（SiliconFlow GLM-4-9B-0414，免费 + TPM 充足 + 已修 UTF-8 flush）
+- **Opt-in Moonshot**：`payload.model` 以 `moonshot-` 或 `kimi-` 开头时切回 Kimi（需要 config.json 的 moonshot key）
+- 去掉"超级精翻需要 Moonshot API Key"的硬门槛错误
