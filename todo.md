@@ -351,3 +351,40 @@
 - 并发 chunks：当前串行 80s；2-3 路并发同发 Moonshot 允许的话可以再快 2-3×
 - 142 段过细：很多是列表短项；合并 <40 字短段到相邻段可减到 ~50 段
 - 标题翻译：X Articles 的 `twitter-article-title`、Grok 卡的 `children[0]`
+
+---
+
+## P35: 超级精翻浮球（floating bubble）
+
+**目标**：把 X Articles 的静态"超级精翻"按钮换成右侧中部悬浮球，解决 3 个痛点：
+1. 按钮在文章底部，要翻很久才能找到
+2. 翻译过程看不到进度
+3. 长文里的 img/video/链接丢失
+
+**实现**：
+- 新增 `super-fine-bubble.ts`（5 个 export：initBubble/trackArticle/untrackArticle/setBubbleState/disposeBubble）
+  - 状态机 idle/translating/done/failed，SVG 进度环（--progress CSS 变量驱动）
+  - 右侧中部 fixed 定位，Y 轴 pointer 拖动 + localStorage 记忆
+  - hover mini 面板（summary + 取消/重翻按钮，100ms debounce）
+  - IntersectionObserver 跟踪 article 可见性自动显隐；per-article observer 存入 `articleObservers: Map<Element, IntersectionObserver>`，disposeBubble 时全部 disconnect
+  - document pointermove/pointerup handler 引用保存到 `ctx.docHandlers`，disposeBubble 时 removeEventListener 防泄漏
+- 新增 `super-fine-render.ts`（3 个 export：renderInlineSlots/fillSlot/clearInlineSlots）
+  - 按 AnchoredBlock.el 在原 DOM 节点 afterend 插入 skeleton slot，**不动原文**——img/video/link 天然保留
+- 重构 `extractParagraphsByBlock` → `extractAnchoredBlocks` 返回 `AnchoredBlock[]`（el 引用 + 'text' | 'img-alt' kind）；`<img alt>` 作为独立 block，多张图 alt 合并成一段送翻译
+- `src/content/index.ts`：
+  - `initBubble` 在生命周期起点创建一次
+  - scanAndQueue 识别 X Article 长文（≥4000 字 ∧ ≥6 段落）→ 打 `data-dualang-long-article` + `data-dualang-article-id`，跳过 viewport/preload observer，交给浮球
+  - `translateArticleSuperFine` 改写：浮球状态驱动 + renderInlineSlots/fillSlot 渲染 + port 流式协议零改
+- 删除 legacy：`injectSuperFineButton`、`payload.superFine` 分支、`.dualang-super-btn`/`.dualang-super-slot` CSS、`article.dualang-super-translating` 脉冲
+
+**测试**：
+- vitest 150 通过（新增：utils.test 4 + super-fine-render.test 4 + super-fine-bubble.test 12）
+- e2e `super-fine-bubble.spec.ts`：长文不走常规翻译 + 浮球可见 + 点击后 slot 注入
+- 全套 e2e 51/51 通过
+
+**后续方向（未做）**：
+- popup 下拉选择精翻模型（暴露 moonshot-v1-128k / kimi-k2.5）
+- 并发 chunk（2-3 并行）加速长文
+- 短段（<40 字）合并减少 slot 数
+- 文章标题（twitter-article-title）翻译
+- 双栏对照"阅读模式"（方案 E）

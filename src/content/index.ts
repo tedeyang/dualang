@@ -485,29 +485,8 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
 
   // X Articles 识别：文章外壳仍是 article[data-testid="tweet"]，但内部有
   // twitterArticleRichTextView（正文容器）和 twitter-article-title（标题）。
-  // 仅在文章页展示"超级精翻"按钮。
   function isXArticle(article: Element): boolean {
     return !!article.querySelector('[data-testid="twitterArticleRichTextView"]');
-  }
-
-  // 在文章右下角注入"超级精翻"按钮。用 absolute 定位，需要 article 成为定位上下文。
-  // idempotent：已注入过或已经在精翻中都直接返回。
-  function injectSuperFineButton(article: Element) {
-    if (article.querySelector('.dualang-super-btn')) return;
-    const btn = document.createElement('button');
-    btn.className = 'dualang-super-btn';
-    btn.textContent = '超级精翻';
-    btn.title = '用 Kimi 全文精翻（保留专业术语、排版、图表）；接受较长耗时';
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      translateArticleSuperFine(article);
-    });
-    const host = article as HTMLElement;
-    // 仅在 article 是 static 定位时补 relative；避免覆盖 X.com 自有定位
-    if (getComputedStyle(host).position === 'static') {
-      host.style.position = 'relative';
-    }
-    host.appendChild(btn);
   }
 
   // 超级精翻（流式 + 原 DOM 保留 + 内联 slot 渲染）：
@@ -859,9 +838,6 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
           return; // 不注册 viewport/preload observer
         }
       }
-
-      // 短文/常规 X Article：保留旧按钮行为直到 Task 10 清理
-      if (isXArticle(article)) injectSuperFineButton(article);
 
       viewportObserver?.observe(article);
       preloadObserver?.observe(article);

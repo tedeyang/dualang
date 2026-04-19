@@ -162,29 +162,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 async function handleTranslate(payload: any) {
-  let settings = await getSettings();
-  // 超级精翻模式：强制用 Kimi（moonshot-v1-128k，长上下文版本，避免 8k 模型截断 21k+ 字符文章）
-  // API Key 优先从 config.json 的 moonshot 条目取，其次用主设置（用户可能把 Kimi 配成主 provider）
-  if (payload.superFine) {
-    const superFineKey = await getMoonshotKey();
-    if (!superFineKey) {
-      throw new Error('超级精翻需要 Moonshot API Key；请在 config.json 的 providers.moonshot.apiKey 或 popup 主 API 配置中填入');
-    }
-    settings = {
-      ...settings,
-      baseUrl: 'https://api.moonshot.cn/v1',
-      model: 'moonshot-v1-128k',
-      apiKey: superFineKey,
-      maxTokens: 8192,
-      reasoningEffort: 'none',
-      enableStreaming: false,
-      fallbackEnabled: false,
-      hedgedRequestEnabled: false,
-    };
-    console.log('[Dualang] super-fine translation via Kimi', settings.model);
-  } else {
-    console.log('[Dualang] translate config baseUrl=', settings.baseUrl, 'model=', settings.model, 'priority=', payload.priority);
-  }
+  const settings = await getSettings();
+  console.log('[Dualang] translate config baseUrl=', settings.baseUrl, 'model=', settings.model, 'priority=', payload.priority);
 
   if (payload.texts && Array.isArray(payload.texts)) {
     return handleTranslateBatch(payload.texts, settings, payload.priority || 0, !!payload.skipCache, !!payload.strictMode);

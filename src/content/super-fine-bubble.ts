@@ -15,11 +15,15 @@ interface BubbleCtx {
   state: State;
   progress: { completed: number; total: number } | null;
   callbacks: Callbacks;
+  docHandlers: { move: (e: PointerEvent) => void; up: () => void };
 }
 
 let ctx: BubbleCtx | null = null;
 
 const visibleArticles = new Set<Element>();
+
+// Track per-article IntersectionObservers so disposeBubble can disconnect them all
+const articleObservers = new Map<Element, IntersectionObserver>();
 
 const STORAGE_KEY = 'dualang.bubble.top';
 
@@ -66,7 +70,7 @@ export function initBubble(callbacks: Callbacks): void {
     try { root.setPointerCapture(e.pointerId); } catch (_) {}
   });
 
-  document.addEventListener('pointermove', (e) => {
+  const onPointerMove = (e: PointerEvent) => {
     if (!dragState) return;
     const dy = e.clientY - dragState.startY;
     if (Math.abs(dy) > DRAG_THRESHOLD) moved = true;
@@ -74,15 +78,18 @@ export function initBubble(callbacks: Callbacks): void {
     const nextTop = dragState.startTop + dy;
     const clamped = Math.max(20, Math.min(window.innerHeight - 60, nextTop));
     root.style.top = `${clamped}px`;
-  });
+  };
 
-  document.addEventListener('pointerup', () => {
+  const onPointerUp = () => {
     if (!dragState) return;
     if (moved) {
       localStorage.setItem(STORAGE_KEY, root.style.top.replace('px', ''));
     }
     dragState = null;
-  });
+  };
+
+  document.addEventListener('pointermove', onPointerMove);
+  document.addEventListener('pointerup', onPointerUp);
 
   const panel = document.createElement('div');
   panel.className = 'dualang-bubble-panel';
@@ -106,6 +113,7 @@ export function initBubble(callbacks: Callbacks): void {
     state: 'idle',
     progress: null,
     callbacks,
+    docHandlers: { move: onPointerMove, up: onPointerUp },
   };
 
   let hideTimer: ReturnType<typeof setTimeout> | null = null;
@@ -159,6 +167,7 @@ export function trackArticle(article: Element): void {
       }
     }, { rootMargin: '200px' });
     io.observe(article);
+    articleObservers.set(article, io);
   }
 }
 
@@ -229,6 +238,13 @@ function renderPanel() {
 }
 
 export function disposeBubble(): void {
+  if (ctx) {
+    document.removeEventListener('pointermove', ctx.docHandlers.move);
+    document.removeEventListener('pointerup', ctx.docHandlers.up);
+  }
+  // Disconnect all per-article IntersectionObservers
+  for (const io of articleObservers.values()) { io.disconnect(); }
+  articleObservers.clear();
   ctx?.root.remove();
   ctx?.panel.remove();
   ctx = null;
