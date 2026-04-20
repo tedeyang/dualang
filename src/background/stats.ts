@@ -7,6 +7,10 @@
 const STATS_KEY = 'dualang_stats_v1';
 const MAX_ERRORS = 20;
 const PERSIST_DEBOUNCE_MS = 2000;
+/** 近况 RTT 窗口长度：5 分钟内的成功请求 */
+const RECENT_RTT_WINDOW_MS = 5 * 60 * 1000;
+/** 每个模型最多保留 100 个样本；超出按时间剪枝 */
+const RECENT_RTT_MAX_SAMPLES = 100;
 
 export type ModelStats = {
   reqs: number;
@@ -20,6 +24,8 @@ export type ModelStats = {
   tokensCompletion: number;
   tokensTotal: number;
   lastUsedAt: number;
+  /** 近 5 分钟的 RTT 样本（ts + rttMs），仅成功请求记录 */
+  recentRtts: Array<{ ts: number; rttMs: number }>;
 };
 
 export type ErrorEntry = {
@@ -43,7 +49,22 @@ function newModelStats(): ModelStats {
     rttMinMs: Infinity, rttMaxMs: 0,
     tokensPrompt: 0, tokensCompletion: 0, tokensTotal: 0,
     lastUsedAt: 0,
+    recentRtts: [],
   };
+}
+
+/** 丢弃过期样本；采样头部即可（ts 单调递增），避免每次扫全数组 */
+function pruneRecentRtts(samples: Array<{ ts: number; rttMs: number }>, now: number): Array<{ ts: number; rttMs: number }> {
+  const cutoff = now - RECENT_RTT_WINDOW_MS;
+  let head = 0;
+  while (head < samples.length && samples[head].ts < cutoff) head++;
+  if (head === 0 && samples.length <= RECENT_RTT_MAX_SAMPLES) return samples;
+  const pruned = samples.slice(head);
+  // 额外兜底：窗口内样本太多时裁到上限（优先保留较新的）
+  if (pruned.length > RECENT_RTT_MAX_SAMPLES) {
+    return pruned.slice(pruned.length - RECENT_RTT_MAX_SAMPLES);
+  }
+  return pruned;
 }
 
 function defaultStats(): Stats {
@@ -93,23 +114,47 @@ export async function recordRequest(
   await ensureLoaded();
   const key = normalizeModelKey(model);
   const m = memStats.models[key] || newModelStats();
+  if (!m.recentRtts) m.recentRtts = [];
   m.reqs++;
   if (ok) m.successes++;
   else m.failures++;
+  const now = Date.now();
   if (Number.isFinite(rttMs) && rttMs >= 0) {
     m.rttTotalMs += rttMs;
     m.rttCount++;
     if (rttMs < m.rttMinMs) m.rttMinMs = rttMs;
     if (rttMs > m.rttMaxMs) m.rttMaxMs = rttMs;
+    // 仅成功请求计入近况窗口（失败的 RTT 不代表"该模型有多快"）
+    if (ok) {
+      m.recentRtts.push({ ts: now, rttMs });
+      m.recentRtts = pruneRecentRtts(m.recentRtts, now);
+    }
   }
   if (usage) {
     m.tokensPrompt += usage.prompt_tokens || 0;
     m.tokensCompletion += usage.completion_tokens || 0;
     m.tokensTotal += usage.total_tokens || 0;
   }
-  m.lastUsedAt = Date.now();
+  m.lastUsedAt = now;
   memStats.models[key] = m;
   schedulePersist();
+}
+
+/**
+ * 返回每个模型最近 5 分钟的成功请求平均 RTT。
+ * 用于浮球里展示 "模型名 · 1.9s"。没有样本的模型不出现在结果里。
+ */
+export async function getRecentRttByModel(): Promise<Record<string, { avgMs: number; samples: number }>> {
+  await ensureLoaded();
+  const now = Date.now();
+  const out: Record<string, { avgMs: number; samples: number }> = {};
+  for (const [key, m] of Object.entries(memStats.models)) {
+    const samples = pruneRecentRtts(m.recentRtts || [], now);
+    if (samples.length === 0) continue;
+    const avgMs = samples.reduce((s, x) => s + x.rttMs, 0) / samples.length;
+    out[key] = { avgMs, samples: samples.length };
+  }
+  return out;
 }
 
 export async function recordCacheHit(count = 1) {

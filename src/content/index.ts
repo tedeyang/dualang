@@ -239,13 +239,9 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     });
     ensureBgPort();
     bubble.initBubble({
-      onTrigger: (articleId: string) => {
-        const article = document.querySelector(`[data-dualang-article-id="${articleId}"]`);
-        if (article) translateArticleSuperFine(article);
-      },
-      onCancel: (articleId: string) => {
-        const article = document.querySelector(`[data-dualang-article-id="${articleId}"]`);
-        const port = article ? getState(article)?.superFinePort : undefined;
+      onSuperFineTrigger: (article: Element) => translateArticleSuperFine(article),
+      onSuperFineCancel: (article: Element) => {
+        const port = getState(article)?.superFinePort;
         try { port?.disconnect(); } catch (_) {}
       },
     });
@@ -365,8 +361,12 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
   //   4. 每 partial 事件：fillSlot(article, index, text)
   //   5. done → 浮球 done、success 图标；error/10min 超时 → 浮球 failed
   async function translateArticleSuperFine(article: Element) {
-    const articleId = article.getAttribute('data-dualang-article-id');
-    if (!articleId) return;
+    let articleId = article.getAttribute('data-dualang-article-id');
+    if (!articleId) {
+      articleId = 'la-' + Math.random().toString(36).slice(2, 10);
+      article.setAttribute('data-dualang-article-id', articleId);
+    }
+    bubble.bindSuperFineArticle(article);
     // 优先用 twitterArticleRichTextView（X Articles 长文正文），避免 findTweetTextEl
     // 因 CSS 选择器顺序返回同 article 内先出现的短预览 tweetText 元素
     const tweetTextEl =
@@ -643,9 +643,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
         }
       }
 
-      // X Articles 长文：跳过常规自动翻译，改由浮球交互触发
-      // 用 twitterArticleRichTextView 作为正文容器，不用通用 tweetTextEl
-      // （避免 querySelector 优先命中同 article 内的短 tweetText 预览元素）
+      // X Articles 长文：跳过常规自动翻译，改由浮球"精翻此文"按钮触发
       if (isXArticle(article)) {
         const richTextEl = article.querySelector('[data-testid="twitterArticleRichTextView"]');
         if (richTextEl && isLongRichElement(richTextEl)) {
@@ -653,7 +651,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
           if (!article.getAttribute('data-dualang-article-id')) {
             article.setAttribute('data-dualang-article-id', contentId || ('la-' + Math.random().toString(36).slice(2, 10)));
           }
-          bubble.trackArticle(article);
+          bubble.setLongArticle(article);
           newlyRegistered++;
           return; // 不注册 viewport/preload observer
         }

@@ -4,7 +4,7 @@ import { getCache, getCacheBatch, setCache, cacheKey } from './cache';
 import { getSettings, invalidateSettingsCache, getMoonshotKey } from './settings';
 import { rateLimiter } from './rate-limiter';
 import { doTranslateSingle, doTranslateBatchRequest, doTranslateBatchStream } from './api';
-import { recordRequest, recordCacheHit, recordQualityRetry, recordError, getStats, resetStats } from './stats';
+import { recordRequest, recordCacheHit, recordQualityRetry, recordError, getStats, resetStats, getRecentRttByModel } from './stats';
 import {
   buildFallbackSettings, buildSuperFineSettings, applyBatchResult, runFallback,
   isFallbackConfigured, shouldHedge, estimateTokens,
@@ -153,6 +153,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
   if (request.action === 'getStats') {
     getStats().then(data => sendResponse({ success: true, data }));
+    return true;
+  }
+  if (request.action === 'getRecentRtt') {
+    getRecentRttByModel().then(data => sendResponse({ success: true, data }));
     return true;
   }
   if (request.action === 'resetStats') {

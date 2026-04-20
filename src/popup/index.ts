@@ -1,4 +1,5 @@
 import { getModelMeta } from '../shared/model-meta';
+import { MODEL_PRESETS, detectPreset as detectPresetShared } from '../shared/model-presets';
 
 // popup DOM 是静态的；找不到就是 HTML/bundle 不对应，fail-fast 比到处 null 检查更清晰
 function byId<T extends HTMLElement>(id: string): T {
@@ -56,26 +57,25 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  const PRESETS = {
-    'moonshot-k2.5': { baseUrl: 'https://api.moonshot.cn/v1', model: 'kimi-k2.5', provider: 'moonshot', providerType: 'openai' },
-    'moonshot-v1-8k': { baseUrl: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k', provider: 'moonshot', providerType: 'openai' },
-    'siliconflow-glm-4-9b': { baseUrl: 'https://api.siliconflow.cn/v1', model: 'THUDM/GLM-4-9B-0414', provider: 'siliconflow', providerType: 'openai' },
-    'siliconflow-qwen2.5-7b': { baseUrl: 'https://api.siliconflow.cn/v1', model: 'Qwen/Qwen2.5-7B-Instruct', provider: 'siliconflow', providerType: 'openai' },
-    'siliconflow-qwen3-8b': { baseUrl: 'https://api.siliconflow.cn/v1', model: 'Qwen/Qwen3-8B', provider: 'siliconflow', providerType: 'openai' },
-    'browser-native': { baseUrl: 'browser://translator', model: 'browser-native', provider: 'browser', providerType: 'browser-native' },
-  };
+  // 从 shared/model-presets.ts 读的 MODEL_PRESETS 现在是数组；popup 里按 key 查字典效率足够
+  const PRESETS: Record<string, { baseUrl: string; model: string; provider: string; providerType: string }> = {};
+  for (const p of MODEL_PRESETS) {
+    PRESETS[p.key] = {
+      baseUrl: p.baseUrl, model: p.model, provider: p.provider, providerType: p.providerType,
+    };
+  }
 
-  const FALLBACK_PRESETS = {
-    'siliconflow-glm-4-9b': { baseUrl: 'https://api.siliconflow.cn/v1', model: 'THUDM/GLM-4-9B-0414' },
-    'siliconflow-qwen2.5-7b': { baseUrl: 'https://api.siliconflow.cn/v1', model: 'Qwen/Qwen2.5-7B-Instruct' },
-    'siliconflow-qwen3-8b': { baseUrl: 'https://api.siliconflow.cn/v1', model: 'Qwen/Qwen3-8B' }
-  };
-
-  function detectPreset(baseUrl, model) {
-    for (const [key, cfg] of Object.entries(PRESETS)) {
-      if (baseUrl === cfg.baseUrl && model === cfg.model) return key;
+  // Fallback presets 只取 siliconflow 家族（其他作为主模型不作兜底）
+  const FALLBACK_PRESETS: Record<string, { baseUrl: string; model: string }> = {};
+  for (const p of MODEL_PRESETS) {
+    if (p.provider === 'siliconflow') {
+      FALLBACK_PRESETS[p.key] = { baseUrl: p.baseUrl, model: p.model };
     }
-    return 'custom';
+  }
+
+  function detectPreset(baseUrl: string, model: string): string {
+    const p = detectPresetShared(baseUrl, model);
+    return p ? p.key : 'custom';
   }
 
   const defaultApiKey = localConfig?.providers?.moonshot?.apiKey || '';

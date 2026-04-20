@@ -1,35 +1,60 @@
-type State = 'idle' | 'translating' | 'done' | 'failed';
+/**
+ * 浮球（bubble）——全局快捷设置面板。
+ *
+ * 职责（重构后）：
+ *   1. 始终可见（不再 article-scoped）
+ *   2. 面板里暴露"开启/关闭翻译"、"显示模式"、"对照风格"、"模型切换" 4 组控件
+ *   3. 检测到长文时额外显示"精翻此文"按钮，保留超级精翻入口
+ *   4. 精翻进行中展示进度环 + 状态（idle / translating / done / failed）
+ *
+ * 设置通过 chrome.storage.sync.set 写回；content / background 各自的
+ * onChanged 监听会自动 pickup。面板不持有应用层状态 —— 只镜像 storage。
+ */
+import { MODEL_PRESETS, detectPreset, type ModelPreset } from '../shared/model-presets';
 
-interface Callbacks {
-  onTrigger: (articleId: string) => void;
-  onCancel: (articleId: string) => void;
+type State = 'idle' | 'translating' | 'done' | 'failed';
+type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
+
+export interface BubbleCallbacks {
+  /** 用户点击"精翻此文"；提供长文 article 元素 */
+  onSuperFineTrigger?: (article: Element) => void;
+  /** 精翻进行中点击"取消" */
+  onSuperFineCancel?: (article: Element) => void;
+}
+
+interface CurrentSettings {
+  enabled: boolean;
+  displayMode: DisplayMode;
+  baseUrl: string;
+  model: string;
 }
 
 interface BubbleCtx {
   root: HTMLElement;
   ring: SVGCircleElement;
   panel: HTMLElement;
-  tracked: WeakSet<Element>;
-  currentArticleId: string | null;
   state: State;
   progress: { completed: number; total: number } | null;
-  callbacks: Callbacks;
+  settings: CurrentSettings;
+  /** 当前检测到的长文 article（若有），用于精翻按钮 */
+  currentLongArticle: Element | null;
+  /** 正在精翻的 article（与 currentLongArticle 可能不同）*/
+  superFineArticle: Element | null;
+  callbacks: BubbleCallbacks;
   docHandlers: { move: (e: PointerEvent) => void; up: () => void };
+  rttPollTimer: ReturnType<typeof setInterval> | null;
+  rttByModel: Record<string, { avgMs: number; samples: number }>;
 }
 
 let ctx: BubbleCtx | null = null;
 
-const visibleArticles = new Set<Element>();
-
-// Track per-article IntersectionObservers so disposeBubble can disconnect them all
-const articleObservers = new Map<Element, IntersectionObserver>();
-
 const STORAGE_KEY = 'dualang.bubble.top';
+const RTT_POLL_INTERVAL_MS = 5_000;
 
-export function initBubble(callbacks: Callbacks): void {
+export function initBubble(callbacks: BubbleCallbacks = {}): void {
   if (ctx) return;
   const root = document.createElement('div');
-  root.className = 'dualang-bubble dualang-bubble--hidden dualang-bubble--idle';
+  root.className = 'dualang-bubble dualang-bubble--idle';
   root.innerHTML = `
     <svg class="dualang-bubble-ring-svg" viewBox="0 0 40 40">
       <circle class="dualang-bubble-ring-track" cx="20" cy="20" r="17" fill="none"/>
@@ -47,23 +72,26 @@ export function initBubble(callbacks: Callbacks): void {
     </svg>
   `;
 
-  // Read saved position from localStorage
+  // 读 localStorage 恢复 Y 轴位置
   const savedTop = parseFloat(localStorage.getItem(STORAGE_KEY) || 'NaN');
   if (!isNaN(savedTop)) {
     root.style.top = `${savedTop}px`;
   }
 
-  // Drag state variables (closed over by click + pointer handlers)
+  // 拖拽状态
   let dragState: { startY: number; startTop: number } | null = null;
   const DRAG_THRESHOLD = 4;
   let moved = false;
 
+  const panel = document.createElement('div');
+  panel.className = 'dualang-bubble-panel';
+  panel.innerHTML = renderPanelTemplate();
+  if (!isNaN(savedTop)) panel.style.top = `${savedTop}px`;
+
   root.addEventListener('click', () => {
     if (moved) { moved = false; return; }
-    if (!ctx?.currentArticleId) return;
-    if (ctx.state === 'idle' || ctx.state === 'failed') {
-      ctx.callbacks.onTrigger(ctx.currentArticleId);
-    }
+    // 点击浮球自身切换 panel 显隐（hover 也显示，点击可粘住）
+    panel.classList.toggle('dualang-bubble-panel--pinned');
   });
 
   root.addEventListener('pointerdown', (e) => {
@@ -100,16 +128,6 @@ export function initBubble(callbacks: Callbacks): void {
   document.addEventListener('pointermove', onPointerMove);
   document.addEventListener('pointerup', onPointerUp);
 
-  const panel = document.createElement('div');
-  panel.className = 'dualang-bubble-panel';
-  panel.innerHTML = `
-  <div class="dualang-bubble-panel-summary"></div>
-  <div class="dualang-bubble-panel-actions">
-    <button class="dualang-bubble-panel-cancel">取消</button>
-    <button class="dualang-bubble-panel-retry">重翻</button>
-  </div>
-`;
-  if (!isNaN(savedTop)) panel.style.top = `${savedTop}px`;
   document.body.appendChild(panel);
   document.body.appendChild(root);
 
@@ -117,89 +135,78 @@ export function initBubble(callbacks: Callbacks): void {
     root,
     ring: root.querySelector('.dualang-bubble-ring')!,
     panel,
-    tracked: new WeakSet(),
-    currentArticleId: null,
     state: 'idle',
     progress: null,
+    settings: {
+      enabled: true,
+      displayMode: 'append',
+      baseUrl: 'https://api.siliconflow.cn/v1',
+      model: 'THUDM/GLM-4-9B-0414',
+    },
+    currentLongArticle: null,
+    superFineArticle: null,
     callbacks,
     docHandlers: { move: onPointerMove, up: onPointerUp },
+    rttPollTimer: null,
+    rttByModel: {},
   };
 
+  // hover 悬停展示面板；点击可粘住（加 --pinned class）
   let hideTimer: ReturnType<typeof setTimeout> | null = null;
   const showPanel = () => {
     if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
-    renderPanel();
+    refreshPanel();
     panel.classList.add('dualang-bubble-panel--visible');
   };
   const hidePanel = () => {
-    hideTimer = setTimeout(() => panel.classList.remove('dualang-bubble-panel--visible'), 100);
+    hideTimer = setTimeout(() => {
+      if (!panel.classList.contains('dualang-bubble-panel--pinned')) {
+        panel.classList.remove('dualang-bubble-panel--visible');
+      }
+    }, 120);
   };
   root.addEventListener('pointerenter', showPanel);
   root.addEventListener('pointerleave', hidePanel);
   panel.addEventListener('pointerenter', showPanel);
   panel.addEventListener('pointerleave', hidePanel);
 
-  panel.querySelector('.dualang-bubble-panel-cancel')!.addEventListener('click', () => {
-    if (ctx?.currentArticleId) ctx.callbacks.onCancel(ctx.currentArticleId);
+  wirePanelControls();
+  loadSettingsFromStorage().then(() => refreshPanel());
+  startRttPoll();
+
+  // storage 变更（popup 里改设置）同步到 panel 选中态
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'sync' || !ctx) return;
+    let dirty = false;
+    if (changes.enabled)   { ctx.settings.enabled = changes.enabled.newValue !== false; dirty = true; }
+    if (changes.displayMode) { ctx.settings.displayMode = normalizeDisplayMode(changes.displayMode.newValue); dirty = true; }
+    if (changes.baseUrl)   { ctx.settings.baseUrl = changes.baseUrl.newValue || ''; dirty = true; }
+    if (changes.model)     { ctx.settings.model = changes.model.newValue || ''; dirty = true; }
+    if (dirty) refreshPanel();
   });
-  panel.querySelector('.dualang-bubble-panel-retry')!.addEventListener('click', () => {
-    if (ctx?.currentArticleId) ctx.callbacks.onTrigger(ctx.currentArticleId);
-  });
 }
 
-export function trackArticle(article: Element): void {
+/**
+ * 内容脚本发现长文时调用。浮球记下该 article，面板会显示"精翻此文"按钮。
+ * 传 null 表示没有长文（用户滚出）。
+ */
+export function setLongArticle(article: Element | null): void {
   if (!ctx) return;
-  const id = article.getAttribute('data-dualang-article-id');
-  if (!id) return;
-  if (ctx.tracked.has(article)) return;
-  ctx.tracked.add(article);
-  visibleArticles.add(article);
-  ctx.currentArticleId = id;
-  ctx.root.classList.remove('dualang-bubble--hidden');
-  setBubbleState(id, 'idle');
-
-  // 用 IntersectionObserver 自动监测离场；jsdom 没有该 API，测试通过显式 untrackArticle 触发
-  if (typeof IntersectionObserver !== 'undefined') {
-    const io = new IntersectionObserver((entries) => {
-      for (const e of entries) {
-        if (e.isIntersecting) {
-          visibleArticles.add(e.target);
-          // 切换到该 article（用户滚到它了）
-          const eid = e.target.getAttribute('data-dualang-article-id');
-          if (eid && ctx) {
-            ctx.currentArticleId = eid;
-            ctx.root.classList.remove('dualang-bubble--hidden');
-          }
-        } else {
-          untrackArticle(e.target);
-        }
-      }
-    }, { rootMargin: '200px' });
-    io.observe(article);
-    articleObservers.set(article, io);
-  }
+  if (ctx.currentLongArticle === article) return;
+  ctx.currentLongArticle = article;
+  refreshPanel();
 }
 
-export function untrackArticle(article: Element): void {
-  if (!ctx) return;
-  visibleArticles.delete(article);
-  if (visibleArticles.size === 0) {
-    ctx.root.classList.add('dualang-bubble--hidden');
-    ctx.currentArticleId = null;
-  } else {
-    // 切换到仍在视口的第一个
-    const next = visibleArticles.values().next().value as Element | undefined;
-    const nextId = next?.getAttribute('data-dualang-article-id') ?? null;
-    ctx.currentArticleId = nextId;
-  }
-}
-
+/**
+ * 精翻状态回调入口（translateArticleSuperFine 里调）。
+ * articleId 参数保留是为了 e2e 兼容；实际 ctx 通过 superFineArticle 引用跟踪。
+ */
 export function setBubbleState(
   articleId: string,
   state: State,
   progress?: { completed: number; total: number },
 ): void {
-  if (!ctx || ctx.currentArticleId !== articleId) return;
+  if (!ctx) return;
   ctx.state = state;
   ctx.progress = progress ?? null;
   for (const s of ['idle', 'translating', 'done', 'failed'] as State[]) {
@@ -210,51 +217,276 @@ export function setBubbleState(
     ctx.ring.setAttribute('data-progress', p.toFixed(2));
     ctx.root.style.setProperty('--progress', String(p));
   } else {
-    // 非 translating 状态：把 --progress 重置为对应状态的目标值
-    // idle → 0（X 主色 / 文 muted）
-    // done → 1（X muted / 文 主色，配合背景 blue 完成感）
-    // failed → 不用 --progress（整块红底，字符白色，由专属 class 控制）
     ctx.root.style.setProperty('--progress', state === 'done' ? '1' : '0');
   }
-  // 面板内容随状态变化重新渲染（panel 可见时）
-  if (ctx.panel.classList.contains('dualang-bubble-panel--visible')) renderPanel();
+  if (ctx.panel.classList.contains('dualang-bubble-panel--visible')) refreshPanel();
 }
 
-function renderPanel() {
+/** 记下当前精翻的目标 article（供 cancel 回调找得到），super-fine-bubble 流程专用 */
+export function bindSuperFineArticle(article: Element | null): void {
   if (!ctx) return;
-  const summary = ctx.panel.querySelector('.dualang-bubble-panel-summary') as HTMLElement;
-  const cancelBtn = ctx.panel.querySelector('.dualang-bubble-panel-cancel') as HTMLElement;
-  const retryBtn = ctx.panel.querySelector('.dualang-bubble-panel-retry') as HTMLElement;
-  if (ctx.state === 'translating') {
-    const p = ctx.progress;
-    summary.textContent = p ? `精翻中 · ${p.completed}/${p.total} 段` : '精翻中…';
-    cancelBtn.style.display = '';
-    retryBtn.style.display = 'none';
-  } else if (ctx.state === 'done') {
-    summary.textContent = '精翻完成';
-    cancelBtn.style.display = 'none';
-    retryBtn.style.display = '';
-  } else if (ctx.state === 'failed') {
-    summary.textContent = '精翻失败，点击重试';
-    cancelBtn.style.display = 'none';
-    retryBtn.style.display = '';
-  } else {
-    summary.textContent = '点击精翻整篇文章';
-    cancelBtn.style.display = 'none';
-    retryBtn.style.display = 'none';
-  }
+  ctx.superFineArticle = article;
 }
 
 export function disposeBubble(): void {
-  if (ctx) {
-    document.removeEventListener('pointermove', ctx.docHandlers.move);
-    document.removeEventListener('pointerup', ctx.docHandlers.up);
-  }
-  // Disconnect all per-article IntersectionObservers
-  for (const io of articleObservers.values()) { io.disconnect(); }
-  articleObservers.clear();
-  ctx?.root.remove();
-  ctx?.panel.remove();
+  if (!ctx) return;
+  document.removeEventListener('pointermove', ctx.docHandlers.move);
+  document.removeEventListener('pointerup', ctx.docHandlers.up);
+  if (ctx.rttPollTimer) clearInterval(ctx.rttPollTimer);
+  ctx.root.remove();
+  ctx.panel.remove();
   ctx = null;
-  visibleArticles.clear();
+}
+
+// ===================== 内部：面板模板与交互 =====================
+
+function renderPanelTemplate(): string {
+  return `
+    <div class="dualang-bubble-panel-section">
+      <label class="dualang-bubble-switch">
+        <input type="checkbox" data-field="enabled" />
+        <span>开启翻译</span>
+      </label>
+    </div>
+
+    <div class="dualang-bubble-panel-section" data-section="display">
+      <div class="dualang-bubble-panel-label">显示</div>
+      <div class="dualang-bubble-segment">
+        <button type="button" data-display="original">只看原文</button>
+        <button type="button" data-display="translation-only">只看译文</button>
+        <button type="button" data-display="contrast">对照</button>
+      </div>
+    </div>
+
+    <div class="dualang-bubble-panel-section" data-section="style">
+      <div class="dualang-bubble-panel-label">对照风格</div>
+      <div class="dualang-bubble-segment">
+        <button type="button" data-style="append">强调原文</button>
+        <button type="button" data-style="bilingual">强调译文</button>
+      </div>
+    </div>
+
+    <div class="dualang-bubble-panel-section" data-section="models">
+      <div class="dualang-bubble-panel-label">模型</div>
+      <div class="dualang-bubble-models" data-slot="models"></div>
+    </div>
+
+    <div class="dualang-bubble-panel-section" data-section="super-fine" hidden>
+      <button type="button" class="dualang-bubble-super-fine-btn" data-action="super-fine">
+        精翻此文
+      </button>
+      <button type="button" class="dualang-bubble-super-fine-cancel" data-action="super-fine-cancel" hidden>
+        取消精翻
+      </button>
+    </div>
+  `;
+}
+
+function wirePanelControls(): void {
+  if (!ctx) return;
+  const panel = ctx.panel;
+
+  panel.querySelector<HTMLInputElement>('[data-field="enabled"]')?.addEventListener('change', (e) => {
+    const el = e.currentTarget as HTMLInputElement;
+    writeSettings({ enabled: el.checked });
+  });
+
+  panel.querySelectorAll<HTMLButtonElement>('[data-display]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const kind = btn.dataset.display;
+      if (kind === 'original') writeSettings({ enabled: false });
+      else if (kind === 'translation-only') writeSettings({ enabled: true, displayMode: 'translation-only' });
+      else if (kind === 'contrast') {
+        // 对照：若当前就是 append/bilingual 保持；否则默认 append（强调原文）
+        const cur = ctx?.settings.displayMode;
+        const next: DisplayMode = (cur === 'append' || cur === 'bilingual') ? cur : 'append';
+        writeSettings({ enabled: true, displayMode: next });
+      }
+    });
+  });
+
+  panel.querySelectorAll<HTMLButtonElement>('[data-style]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const kind = btn.dataset.style as 'append' | 'bilingual';
+      writeSettings({ enabled: true, displayMode: kind });
+    });
+  });
+
+  panel.querySelector<HTMLButtonElement>('[data-action="super-fine"]')?.addEventListener('click', () => {
+    if (!ctx?.currentLongArticle) return;
+    ctx.callbacks.onSuperFineTrigger?.(ctx.currentLongArticle);
+  });
+  panel.querySelector<HTMLButtonElement>('[data-action="super-fine-cancel"]')?.addEventListener('click', () => {
+    if (!ctx?.superFineArticle) return;
+    ctx.callbacks.onSuperFineCancel?.(ctx.superFineArticle);
+  });
+}
+
+function refreshPanel(): void {
+  if (!ctx) return;
+  const s = ctx.settings;
+  const panel = ctx.panel;
+
+  const enabledEl = panel.querySelector<HTMLInputElement>('[data-field="enabled"]');
+  if (enabledEl) enabledEl.checked = s.enabled;
+
+  // 显示模式 segment 选中态
+  panel.querySelectorAll<HTMLButtonElement>('[data-display]').forEach((b) => {
+    const kind = b.dataset.display;
+    const active =
+      (kind === 'original' && !s.enabled) ||
+      (kind === 'translation-only' && s.enabled && s.displayMode === 'translation-only') ||
+      (kind === 'contrast' && s.enabled && (s.displayMode === 'append' || s.displayMode === 'bilingual'));
+    b.classList.toggle('dualang-bubble-segment-btn--active', !!active);
+  });
+
+  // 对照风格子选项仅在"对照"模式下可操作；其他模式 dim
+  const isContrast = s.enabled && (s.displayMode === 'append' || s.displayMode === 'bilingual');
+  const styleSection = panel.querySelector<HTMLElement>('[data-section="style"]');
+  if (styleSection) styleSection.classList.toggle('dualang-bubble-panel-section--muted', !isContrast);
+  panel.querySelectorAll<HTMLButtonElement>('[data-style]').forEach((b) => {
+    const kind = b.dataset.style;
+    b.classList.toggle('dualang-bubble-segment-btn--active', isContrast && s.displayMode === kind);
+  });
+
+  // 模型列表
+  renderModelList();
+
+  // 精翻入口：仅在检测到长文且设置启用 时显示
+  const sfSection = panel.querySelector<HTMLElement>('[data-section="super-fine"]');
+  if (sfSection) {
+    const visible = !!ctx.currentLongArticle && s.enabled;
+    sfSection.hidden = !visible;
+    const trig = sfSection.querySelector<HTMLButtonElement>('[data-action="super-fine"]');
+    const canc = sfSection.querySelector<HTMLButtonElement>('[data-action="super-fine-cancel"]');
+    const busy = ctx.state === 'translating';
+    if (trig) trig.hidden = busy;
+    if (canc) canc.hidden = !busy;
+    if (busy && ctx.progress) {
+      sfSection.setAttribute('data-progress', `${ctx.progress.completed}/${ctx.progress.total}`);
+    } else {
+      sfSection.removeAttribute('data-progress');
+    }
+  }
+}
+
+function renderModelList(): void {
+  if (!ctx) return;
+  const slot = ctx.panel.querySelector<HTMLElement>('[data-slot="models"]');
+  if (!slot) return;
+  const s = ctx.settings;
+  const activePresetKey = detectPreset(s.baseUrl, s.model)?.key || '';
+
+  slot.innerHTML = '';
+  for (const preset of MODEL_PRESETS) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'dualang-bubble-model-row';
+    row.dataset.modelKey = preset.key;
+    if (preset.key === activePresetKey) row.classList.add('dualang-bubble-model-row--active');
+
+    const name = document.createElement('span');
+    name.className = 'dualang-bubble-model-name';
+    name.textContent = preset.displayName;
+
+    const latency = document.createElement('span');
+    latency.className = 'dualang-bubble-model-latency';
+    latency.textContent = formatLatency(ctx.rttByModel[preset.model]?.avgMs);
+
+    row.appendChild(name);
+    row.appendChild(latency);
+    row.addEventListener('click', () => onPickModel(preset));
+    slot.appendChild(row);
+  }
+}
+
+function formatLatency(avgMs: number | undefined): string {
+  if (avgMs === undefined || !Number.isFinite(avgMs)) return '—';
+  const s = avgMs / 1000;
+  return `${s.toFixed(s < 10 ? 1 : 0)}s`;
+}
+
+async function onPickModel(preset: ModelPreset): Promise<void> {
+  if (!ctx) return;
+  // providerType 切到 browser-native 也要透传；baseUrl/model 覆盖
+  const patch: Record<string, unknown> = {
+    baseUrl: preset.baseUrl,
+    model: preset.model,
+    providerType: preset.providerType,
+  };
+  // 从 config.json 里取对应 provider 的 apiKey（仅 openai 类）
+  if (preset.providerType === 'openai') {
+    const key = await fetchProviderKey(preset.provider);
+    if (key) patch.apiKey = key;
+  }
+  await chrome.storage.sync.set(patch);
+}
+
+async function fetchProviderKey(provider: string): Promise<string> {
+  try {
+    const res = await fetch(chrome.runtime.getURL('config.json'));
+    if (!res.ok) return '';
+    const cfg = await res.json();
+    return cfg?.providers?.[provider]?.apiKey || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+async function loadSettingsFromStorage(): Promise<void> {
+  if (!ctx) return;
+  const s = await chrome.storage.sync.get({
+    enabled: true,
+    displayMode: 'append',
+    bilingualMode: false,
+    baseUrl: 'https://api.siliconflow.cn/v1',
+    model: 'THUDM/GLM-4-9B-0414',
+  });
+  ctx.settings = {
+    enabled: s.enabled !== false,
+    displayMode: normalizeDisplayMode(s.displayMode, s.bilingualMode),
+    baseUrl: s.baseUrl || '',
+    model: s.model || '',
+  };
+}
+
+function normalizeDisplayMode(raw: unknown, legacyBilingual?: unknown): DisplayMode {
+  const valid: DisplayMode[] = ['append', 'translation-only', 'inline', 'bilingual'];
+  if (typeof raw === 'string' && (valid as string[]).includes(raw)) return raw as DisplayMode;
+  return legacyBilingual ? 'inline' : 'append';
+}
+
+function startRttPoll(): void {
+  if (!ctx) return;
+  const poll = async () => {
+    try {
+      const resp: any = await chrome.runtime.sendMessage({ action: 'getRecentRtt' });
+      if (resp?.success && ctx) {
+        ctx.rttByModel = resp.data || {};
+        if (ctx.panel.classList.contains('dualang-bubble-panel--visible')) renderModelList();
+      }
+    } catch (_) { /* background 可能未就绪 */ }
+  };
+  void poll();
+  ctx.rttPollTimer = setInterval(poll, RTT_POLL_INTERVAL_MS);
+}
+
+async function writeSettings(patch: Partial<{ enabled: boolean; displayMode: DisplayMode }>): Promise<void> {
+  await chrome.storage.sync.set(patch);
+}
+
+// ===================== 保留旧 API 以保持 e2e/tests 兼容 =====================
+// 旧的 trackArticle / untrackArticle 语义是"当前 article 进出视口"。
+// 重构后浮球不再与 article 绑定，这两个函数降级为：
+//   - trackArticle(el) → 如果 el 是长文，setLongArticle(el)
+//   - untrackArticle(el) → 如果 el === currentLongArticle，setLongArticle(null)
+// 使得旧测试能继续跑通，同时新代码路径统一走 setLongArticle。
+
+export function trackArticle(article: Element): void {
+  if (!article) return;
+  setLongArticle(article);
+}
+
+export function untrackArticle(article: Element): void {
+  if (ctx?.currentLongArticle === article) setLongArticle(null);
 }
