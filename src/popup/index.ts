@@ -19,6 +19,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   const targetLangSelect = byId<HTMLSelectElement>('targetLang');
   const autoTranslateCheckbox = byId<HTMLInputElement>('autoTranslate');
   const displayModeSelect = byId<HTMLSelectElement>('displayMode');
+  const lineFusionCheckbox = byId<HTMLInputElement>('lineFusionEnabled');
+  const smartDictCheckbox = byId<HTMLInputElement>('smartDictEnabled');
   const fallbackEnabledCheckbox = byId<HTMLInputElement>('fallbackEnabled');
   const fallbackPresetSelect = byId<HTMLSelectElement>('fallbackPreset');
   const fallbackBaseUrlInput = byId<HTMLInputElement>('fallbackBaseUrl');
@@ -99,6 +101,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     // 用 null 作为"未设置"哨兵，避免 chrome.storage API 对 undefined 默认值的序列化歧义。
     displayMode: null,
     bilingualMode: false,
+    lineFusionEnabled: false,
+    smartDictEnabled: false,
     fallbackEnabled: false,
     fallbackBaseUrl: 'https://api.siliconflow.cn/v1',
     fallbackApiKey: defaultFallbackApiKey,
@@ -121,6 +125,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     ? settings.displayMode
     : (settings.bilingualMode ? 'inline' : 'append');
   displayModeSelect.value = resolvedDisplayMode;
+  lineFusionCheckbox.checked = !!settings.lineFusionEnabled;
+  smartDictCheckbox.checked = !!settings.smartDictEnabled;
   presetSelect.value = detectPreset(settings.baseUrl, settings.model);
 
   // Fallback 配置
@@ -197,6 +203,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       displayMode: displayModeSelect.value,
       // 旧 bilingualMode 字段设回 false，防止未来其他代码路径误读老值
       bilingualMode: false,
+      lineFusionEnabled: lineFusionCheckbox.checked,
+      smartDictEnabled: smartDictCheckbox.checked,
       fallbackEnabled: fallbackEnabledCheckbox.checked,
       fallbackBaseUrl: (fallbackBaseUrlInput.value || 'https://api.siliconflow.cn/v1').trim(),
       fallbackApiKey: fallbackApiKeyInput.value.trim(),

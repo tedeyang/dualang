@@ -10,7 +10,7 @@
  * 设置通过 chrome.storage.sync.set 写回；content / background 各自的
  * onChanged 监听会自动 pickup。面板不持有应用层状态 —— 只镜像 storage。
  */
-import { MODEL_PRESETS, detectPreset, type ModelPreset } from '../shared/model-presets';
+import { VISIBLE_MODEL_PRESETS, detectPreset, type ModelPreset } from '../shared/model-presets';
 
 type State = 'idle' | 'translating' | 'done' | 'failed';
 type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
@@ -25,6 +25,8 @@ export interface BubbleCallbacks {
 interface CurrentSettings {
   enabled: boolean;
   displayMode: DisplayMode;
+  lineFusionEnabled: boolean;
+  smartDictEnabled: boolean;
   baseUrl: string;
   model: string;
 }
@@ -60,16 +62,7 @@ export function initBubble(callbacks: BubbleCallbacks = {}): void {
       <circle class="dualang-bubble-ring-track" cx="20" cy="20" r="17" fill="none"/>
       <circle class="dualang-bubble-ring" cx="20" cy="20" r="17" fill="none" data-progress="0"/>
     </svg>
-    <svg class="dualang-bubble-logo" viewBox="0 0 40 40" aria-label="X→文">
-      <text class="dualang-bubble-logo-x" x="14" y="20"
-            font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
-            font-size="13" font-weight="900"
-            text-anchor="middle" dominant-baseline="central">X</text>
-      <text class="dualang-bubble-logo-wen" x="26" y="20"
-            font-family="'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', 'Microsoft YaHei', system-ui, sans-serif"
-            font-size="11.5" font-weight="700"
-            text-anchor="middle" dominant-baseline="central">文</text>
-    </svg>
+    <img class="dualang-bubble-logo" alt="dualang" src="${chrome.runtime.getURL('icons/icon48.png')}">
   `;
 
   // 读 localStorage 恢复 Y 轴位置
@@ -140,6 +133,8 @@ export function initBubble(callbacks: BubbleCallbacks = {}): void {
     settings: {
       enabled: true,
       displayMode: 'append',
+      lineFusionEnabled: false,
+      smartDictEnabled: false,
       baseUrl: 'https://api.siliconflow.cn/v1',
       model: 'THUDM/GLM-4-9B-0414',
     },
@@ -180,6 +175,8 @@ export function initBubble(callbacks: BubbleCallbacks = {}): void {
     let dirty = false;
     if (changes.enabled)   { ctx.settings.enabled = changes.enabled.newValue !== false; dirty = true; }
     if (changes.displayMode) { ctx.settings.displayMode = normalizeDisplayMode(changes.displayMode.newValue); dirty = true; }
+    if (changes.lineFusionEnabled) { ctx.settings.lineFusionEnabled = !!changes.lineFusionEnabled.newValue; dirty = true; }
+    if (changes.smartDictEnabled) { ctx.settings.smartDictEnabled = !!changes.smartDictEnabled.newValue; dirty = true; }
     if (changes.baseUrl)   { ctx.settings.baseUrl = changes.baseUrl.newValue || ''; dirty = true; }
     if (changes.model)     { ctx.settings.model = changes.model.newValue || ''; dirty = true; }
     if (dirty) refreshPanel();
@@ -242,15 +239,22 @@ export function disposeBubble(): void {
 
 function renderPanelTemplate(): string {
   return `
-    <div class="dualang-bubble-panel-section">
+    <div class="dualang-bubble-panel-section dualang-bubble-top-row">
       <label class="dualang-bubble-switch">
         <input type="checkbox" data-field="enabled" />
         <span>开启翻译</span>
       </label>
+      <label class="dualang-bubble-switch dualang-bubble-switch--mini" data-section="smart-dict" title="智能字典（英文原文生僻词）">
+        <input type="checkbox" data-field="smartDictEnabled" />
+        <span>字典</span>
+      </label>
     </div>
 
     <div class="dualang-bubble-panel-section" data-section="display">
-      <div class="dualang-bubble-panel-label">显示</div>
+      <div class="dualang-bubble-group-header">
+        <span class="dualang-bubble-group-label">显示</span>
+        <span class="dualang-bubble-group-line"></span>
+      </div>
       <div class="dualang-bubble-segment">
         <button type="button" data-display="original">只看原文</button>
         <button type="button" data-display="translation-only">只看译文</button>
@@ -259,7 +263,14 @@ function renderPanelTemplate(): string {
     </div>
 
     <div class="dualang-bubble-panel-section" data-section="style">
-      <div class="dualang-bubble-panel-label">对照风格</div>
+      <div class="dualang-bubble-group-header">
+        <span class="dualang-bubble-group-label">对照</span>
+        <span class="dualang-bubble-group-line"></span>
+        <label class="dualang-bubble-switch dualang-bubble-switch--mini" data-section="line-fusion" title="多行原文时逐行融合">
+          <input type="checkbox" data-field="lineFusionEnabled" />
+          <span>逐行</span>
+        </label>
+      </div>
       <div class="dualang-bubble-segment">
         <button type="button" data-style="append">强调原文</button>
         <button type="button" data-style="bilingual">强调译文</button>
@@ -267,7 +278,10 @@ function renderPanelTemplate(): string {
     </div>
 
     <div class="dualang-bubble-panel-section" data-section="models">
-      <div class="dualang-bubble-panel-label">模型</div>
+      <div class="dualang-bubble-group-header">
+        <span class="dualang-bubble-group-label">模型</span>
+        <span class="dualang-bubble-group-line"></span>
+      </div>
       <div class="dualang-bubble-models" data-slot="models"></div>
     </div>
 
@@ -286,9 +300,14 @@ function wirePanelControls(): void {
   if (!ctx) return;
   const panel = ctx.panel;
 
-  panel.querySelector<HTMLInputElement>('[data-field="enabled"]')?.addEventListener('change', (e) => {
-    const el = e.currentTarget as HTMLInputElement;
-    writeSettings({ enabled: el.checked });
+  panel.querySelectorAll<HTMLInputElement>('input[data-field]').forEach((input) => {
+    input.addEventListener('change', (e) => {
+      const el = e.currentTarget as HTMLInputElement;
+      const field = el.dataset.field;
+      if (field === 'enabled') writeSettings({ enabled: el.checked });
+      else if (field === 'lineFusionEnabled') writeSettings({ lineFusionEnabled: el.checked });
+      else if (field === 'smartDictEnabled') writeSettings({ smartDictEnabled: el.checked });
+    });
   });
 
   panel.querySelectorAll<HTMLButtonElement>('[data-display]').forEach((btn) => {
@@ -329,6 +348,10 @@ function refreshPanel(): void {
 
   const enabledEl = panel.querySelector<HTMLInputElement>('[data-field="enabled"]');
   if (enabledEl) enabledEl.checked = s.enabled;
+  const lineFusionEl = panel.querySelector<HTMLInputElement>('[data-field="lineFusionEnabled"]');
+  if (lineFusionEl) lineFusionEl.checked = !!s.lineFusionEnabled;
+  const smartDictEl = panel.querySelector<HTMLInputElement>('[data-field="smartDictEnabled"]');
+  if (smartDictEl) smartDictEl.checked = !!s.smartDictEnabled;
 
   // 显示模式 segment 选中态
   panel.querySelectorAll<HTMLButtonElement>('[data-display]').forEach((b) => {
@@ -344,6 +367,9 @@ function refreshPanel(): void {
   const isContrast = s.enabled && (s.displayMode === 'append' || s.displayMode === 'bilingual');
   const styleSection = panel.querySelector<HTMLElement>('[data-section="style"]');
   if (styleSection) styleSection.classList.toggle('dualang-bubble-panel-section--muted', !isContrast);
+  const lineFusionSection = panel.querySelector<HTMLElement>('[data-section="line-fusion"]');
+  if (lineFusionSection) lineFusionSection.classList.toggle('dualang-bubble-panel-section--muted', !isContrast);
+  if (lineFusionEl) lineFusionEl.disabled = !isContrast;
   panel.querySelectorAll<HTMLButtonElement>('[data-style]').forEach((b) => {
     const kind = b.dataset.style;
     b.classList.toggle('dualang-bubble-segment-btn--active', isContrast && s.displayMode === kind);
@@ -378,7 +404,7 @@ function renderModelList(): void {
   const activePresetKey = detectPreset(s.baseUrl, s.model)?.key || '';
 
   slot.innerHTML = '';
-  for (const preset of MODEL_PRESETS) {
+  for (const preset of VISIBLE_MODEL_PRESETS) {
     const row = document.createElement('button');
     row.type = 'button';
     row.className = 'dualang-bubble-model-row';
@@ -419,11 +445,12 @@ async function onPickModel(preset: ModelPreset): Promise<void> {
 }
 
 async function fetchProviderKey(provider: string): Promise<string> {
+  // config.json 不是 web_accessible_resource —— content script 直接 fetch 会被
+  // 浏览器拒载（"chrome-extension://invalid/"）。由 background 读并返回 key。
   try {
-    const res = await fetch(chrome.runtime.getURL('config.json'));
-    if (!res.ok) return '';
-    const cfg = await res.json();
-    return cfg?.providers?.[provider]?.apiKey || '';
+    const resp: any = await chrome.runtime.sendMessage({ action: 'getProviderKey', provider });
+    if (!resp?.success) return '';
+    return String(resp?.data?.apiKey || '');
   } catch (_) {
     return '';
   }
@@ -435,12 +462,16 @@ async function loadSettingsFromStorage(): Promise<void> {
     enabled: true,
     displayMode: 'append',
     bilingualMode: false,
+    lineFusionEnabled: false,
+    smartDictEnabled: false,
     baseUrl: 'https://api.siliconflow.cn/v1',
     model: 'THUDM/GLM-4-9B-0414',
   });
   ctx.settings = {
     enabled: s.enabled !== false,
     displayMode: normalizeDisplayMode(s.displayMode, s.bilingualMode),
+    lineFusionEnabled: !!s.lineFusionEnabled,
+    smartDictEnabled: !!s.smartDictEnabled,
     baseUrl: s.baseUrl || '',
     model: s.model || '',
   };
@@ -467,7 +498,7 @@ function startRttPoll(): void {
   ctx.rttPollTimer = setInterval(poll, RTT_POLL_INTERVAL_MS);
 }
 
-async function writeSettings(patch: Partial<{ enabled: boolean; displayMode: DisplayMode }>): Promise<void> {
+async function writeSettings(patch: Partial<{ enabled: boolean; displayMode: DisplayMode; lineFusionEnabled: boolean; smartDictEnabled: boolean }>): Promise<void> {
   await chrome.storage.sync.set(patch);
 }
 

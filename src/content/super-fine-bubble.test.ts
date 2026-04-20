@@ -42,13 +42,27 @@ describe('initBubble', () => {
     expect(bubble?.classList.contains('dualang-bubble--idle')).toBe(true);
   });
 
-  it('创建面板的 4 个区块：开关、显示、对照风格、模型列表', () => {
+  it('面板含所有关键控件：顶部开关+字典、显示/对照/模型 3 组，对照组含逐行融合', () => {
     initBubble();
     const panel = document.querySelector('.dualang-bubble-panel')!;
-    expect(panel.querySelector('[data-field="enabled"]')).toBeTruthy();
+    // 顶部行：开启翻译（主开关）+ 字典（mini 开关）
+    const topRow = panel.querySelector('.dualang-bubble-top-row');
+    expect(topRow).toBeTruthy();
+    expect(topRow!.querySelector('[data-field="enabled"]')).toBeTruthy();
+    expect(topRow!.querySelector('[data-field="smartDictEnabled"]')).toBeTruthy();
+
+    // 显示 / 对照 / 模型 三组
     expect(panel.querySelector('[data-section="display"]')).toBeTruthy();
     expect(panel.querySelector('[data-section="style"]')).toBeTruthy();
     expect(panel.querySelector('[data-section="models"]')).toBeTruthy();
+
+    // 逐行融合 mini 开关在"对照"组的 group header 里
+    const styleSection = panel.querySelector('[data-section="style"]')!;
+    expect(styleSection.querySelector('[data-field="lineFusionEnabled"]')).toBeTruthy();
+
+    // 新的左对齐 group-header 结构：3 组（显示/对照/模型）
+    expect(panel.querySelectorAll('.dualang-bubble-group-header').length).toBe(3);
+    expect(panel.querySelector('.dualang-bubble-group-label')?.textContent).toBe('显示');
   });
 });
 
@@ -174,12 +188,17 @@ describe('long article super-fine button', () => {
 });
 
 describe('model list', () => {
-  it('渲染 MODEL_PRESETS 里的所有模型行', async () => {
+  it('渲染 VISIBLE_MODEL_PRESETS 里的所有可见模型行（不含 hidden 的 moonshot）', async () => {
     initBubble();
     // 等 loadSettingsFromStorage 的 async 初始化完成后 refreshPanel 才会填充列表
     await new Promise((r) => setTimeout(r, 20));
     const rows = document.querySelectorAll('.dualang-bubble-model-row');
-    expect(rows.length).toBeGreaterThanOrEqual(5);  // 至少 5 个 preset
+    // 当前可见：siliconflow-glm-4-9b / qwen3-8b / qwen2.5-7b
+    expect(rows.length).toBeGreaterThanOrEqual(3);
+    // 不应渲染 hidden 的 Moonshot 预设
+    const keys = Array.from(rows).map((r) => (r as HTMLElement).dataset.modelKey);
+    expect(keys).not.toContain('moonshot-v1-8k');
+    expect(keys).not.toContain('moonshot-k2.5');
   });
 
   it('当前 baseUrl+model 对应的 preset 被标 active', async () => {

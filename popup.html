@@ -32,14 +32,10 @@
         <select id="preset">
           <optgroup label="⭐ 推荐（bench v2 实测）">
             <option value="siliconflow-glm-4-9b">SiliconFlow GLM-4-9B · 1.9s · 质量 8.7 · 免费（默认）</option>
-            <option value="moonshot-v1-8k">Moonshot v1-8k · 1.8s · 质量 8.9（需付费 Key）</option>
           </optgroup>
           <optgroup label="其他免费（有局限）">
             <option value="siliconflow-qwen2.5-7b">SiliconFlow Qwen2.5-7B · ~1.5s · 禁流式（CJK 偶发乱码）、数字易错</option>
             <option value="siliconflow-qwen3-8b">SiliconFlow Qwen3-8B · 4.0s · 质量 8.5</option>
-          </optgroup>
-          <optgroup label="实验 / 慢">
-            <option value="moonshot-k2.5">Moonshot Kimi k2.5 · 28s · 推理模型，翻译过杀</option>
           </optgroup>
           <option value="custom">自定义</option>
         </select>
@@ -47,16 +43,16 @@
       </div>
       <div class="form-group">
         <label for="baseUrl">API 地址</label>
-        <input type="text" id="baseUrl" placeholder="https://api.moonshot.cn/v1">
+        <input type="text" id="baseUrl" placeholder="https://api.siliconflow.cn/v1">
       </div>
       <div class="form-group">
         <label for="apiKey">API Key</label>
         <input type="password" id="apiKey" placeholder="sk-...">
-        <p class="hint" id="apiKeyHint">在 <a href="https://www.kimi.com/" target="_blank">Kimi</a> 或 <a href="https://cloud.siliconflow.cn/" target="_blank">SiliconFlow</a> 获取 API Key</p>
+        <p class="hint" id="apiKeyHint">在 <a href="https://cloud.siliconflow.cn/" target="_blank">SiliconFlow</a> 获取免费 API Key</p>
       </div>
       <div class="form-group">
         <label for="model">模型名</label>
-        <input type="text" id="model" placeholder="moonshot-v1-8k">
+        <input type="text" id="model" placeholder="THUDM/GLM-4-9B-0414">
       </div>
 
       <div class="form-group">
@@ -90,6 +86,16 @@
           <option value="bilingual">整体对照（原文 + 译文分块）</option>
         </select>
         <p class="hint">模式切换后，已翻译的推文保留旧模式；刷新页面可全量应用新模式。</p>
+      </div>
+
+      <div class="form-group toggle-group">
+        <label class="toggle"><input type="checkbox" id="lineFusionEnabled"><span class="slider"></span></label>
+        <span class="toggle-label">逐行融合（多行原文）</span>
+      </div>
+
+      <div class="form-group toggle-group">
+        <label class="toggle"><input type="checkbox" id="smartDictEnabled"><span class="slider"></span></label>
+        <span class="toggle-label">智能字典（仅英文原文）</span>
       </div>
     </div>
 
