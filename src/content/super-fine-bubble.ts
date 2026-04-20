@@ -11,6 +11,7 @@
  * onChanged 监听会自动 pickup。面板不持有应用层状态 —— 只镜像 storage。
  */
 import { MODEL_PRESETS, detectPreset, type ModelPreset } from '../shared/model-presets';
+import { primeBrowserSession } from './browser-translator';
 
 type State = 'idle' | 'translating' | 'done' | 'failed';
 type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
@@ -27,6 +28,7 @@ interface CurrentSettings {
   displayMode: DisplayMode;
   baseUrl: string;
   model: string;
+  targetLang: string;
 }
 
 interface BubbleCtx {
@@ -142,6 +144,7 @@ export function initBubble(callbacks: BubbleCallbacks = {}): void {
       displayMode: 'append',
       baseUrl: 'https://api.siliconflow.cn/v1',
       model: 'THUDM/GLM-4-9B-0414',
+      targetLang: 'zh-CN',
     },
     currentLongArticle: null,
     superFineArticle: null,
@@ -182,6 +185,7 @@ export function initBubble(callbacks: BubbleCallbacks = {}): void {
     if (changes.displayMode) { ctx.settings.displayMode = normalizeDisplayMode(changes.displayMode.newValue); dirty = true; }
     if (changes.baseUrl)   { ctx.settings.baseUrl = changes.baseUrl.newValue || ''; dirty = true; }
     if (changes.model)     { ctx.settings.model = changes.model.newValue || ''; dirty = true; }
+    if (changes.targetLang) { ctx.settings.targetLang = changes.targetLang.newValue || 'zh-CN'; dirty = true; }
     if (dirty) refreshPanel();
   });
 }
@@ -383,6 +387,7 @@ function renderModelList(): void {
     row.type = 'button';
     row.className = 'dualang-bubble-model-row';
     row.dataset.modelKey = preset.key;
+    row.setAttribute('data-model-key', preset.key);
     if (preset.key === activePresetKey) row.classList.add('dualang-bubble-model-row--active');
 
     const name = document.createElement('span');
@@ -418,8 +423,35 @@ async function onPickModel(preset: ModelPreset): Promise<void> {
   if (preset.providerType === 'openai') {
     const key = await fetchProviderKey(preset.provider);
     if (key) patch.apiKey = key;
+    await chrome.storage.sync.set(patch);
+    return;
   }
-  await chrome.storage.sync.set(patch);
+
+  // 浏览器本地翻译：必须在当前 click 事件栈（user gesture）内启动 Translator.create，
+  // 否则首次使用会抛 "Requires a user gesture..." 而失败。
+  // 流程：① 打 UI 状态标记"下载中" → ② primeBrowserSession 触发下载 → ③ 写 storage
+  const row = ctx.panel.querySelector<HTMLElement>(`[data-model-key="${preset.key}"]`);
+  row?.setAttribute('data-status', 'priming');
+  try {
+    const avail = await primeBrowserSession(ctx.settings.targetLang);
+    if (avail === 'unavailable' || avail === 'unsupported') {
+      row?.setAttribute('data-status', 'unavailable');
+      alert(avail === 'unsupported'
+        ? '浏览器不支持内置 Translator API；请升级到 Chrome 138+ 或 Edge Canary 143+'
+        : `浏览器内置翻译不支持当前语言对`);
+      return;
+    }
+    if (avail === 'downloading' || avail === 'downloadable') {
+      // Translator.create 已启动下载；等它完成再切换设置避免"切完立刻 schedule 翻译失败"
+      row?.setAttribute('data-status', 'downloading');
+    }
+    await chrome.storage.sync.set(patch);
+    row?.removeAttribute('data-status');
+  } catch (err: any) {
+    console.warn('[Dualang] browser-native prime failed', err);
+    row?.removeAttribute('data-status');
+    alert(`浏览器本地翻译启动失败：${err?.message || err}`);
+  }
 }
 
 async function fetchProviderKey(provider: string): Promise<string> {
@@ -441,12 +473,14 @@ async function loadSettingsFromStorage(): Promise<void> {
     bilingualMode: false,
     baseUrl: 'https://api.siliconflow.cn/v1',
     model: 'THUDM/GLM-4-9B-0414',
+    targetLang: 'zh-CN',
   });
   ctx.settings = {
     enabled: s.enabled !== false,
     displayMode: normalizeDisplayMode(s.displayMode, s.bilingualMode),
     baseUrl: s.baseUrl || '',
     model: s.model || '',
+    targetLang: s.targetLang || 'zh-CN',
   };
 }
 

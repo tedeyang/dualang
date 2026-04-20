@@ -385,6 +385,26 @@ article[data-dualang-mode="bilingual"] [data-testid="tweetText"] {
 }
 .dualang-bubble-model-row--active .dualang-bubble-model-latency { color: #c5ccd3; }
 
+/* 模型行的临时状态：priming（prime 请求发出中）、downloading（模型下载中）、unavailable */
+.dualang-bubble-model-row[data-status="priming"],
+.dualang-bubble-model-row[data-status="downloading"] {
+  opacity: 0.75;
+  pointer-events: none;
+}
+.dualang-bubble-model-row[data-status]::after {
+  content: attr(data-status);
+  margin-left: 8px;
+  font-size: 10px;
+  color: #1d9bf0;
+  letter-spacing: 0.05em;
+}
+.dualang-bubble-model-row[data-status="priming"]::after { content: "连接中…"; }
+.dualang-bubble-model-row[data-status="downloading"]::after { content: "下载中…"; }
+.dualang-bubble-model-row[data-status="unavailable"]::after {
+  content: "不可用";
+  color: #f4212e;
+}
+
 /* 精翻此文按钮（仅在长文页面出现）*/
 .dualang-bubble-super-fine-btn,
 .dualang-bubble-super-fine-cancel {
