@@ -23,6 +23,12 @@ const configs = [
     outfile: 'background.js',
     format: 'iife',
   },
+  {
+    ...common,
+    entryPoints: ['src/popup/index.ts'],
+    outfile: 'popup.js',
+    format: 'iife',
+  },
 ];
 
 if (isWatch) {

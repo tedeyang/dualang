@@ -1,26 +1,35 @@
+import { getModelMeta } from '../shared/model-meta';
+
+// popup DOM 是静态的；找不到就是 HTML/bundle 不对应，fail-fast 比到处 null 检查更清晰
+function byId<T extends HTMLElement>(id: string): T {
+  const el = document.getElementById(id);
+  if (!el) throw new Error(`popup: #${id} not found`);
+  return el as T;
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
-  const presetSelect = document.getElementById('preset');
-  const baseUrlInput = document.getElementById('baseUrl');
-  const apiKeyInput = document.getElementById('apiKey');
-  const modelInput = document.getElementById('model');
-  const reasoningEffortSelect = document.getElementById('reasoningEffort');
-  const maxTokensInput = document.getElementById('maxTokens');
-  const enableStreamingCheckbox = document.getElementById('enableStreaming');
-  const targetLangSelect = document.getElementById('targetLang');
-  const autoTranslateCheckbox = document.getElementById('autoTranslate');
-  const displayModeSelect = document.getElementById('displayMode');
-  const fallbackEnabledCheckbox = document.getElementById('fallbackEnabled');
-  const fallbackPresetSelect = document.getElementById('fallbackPreset');
-  const fallbackBaseUrlInput = document.getElementById('fallbackBaseUrl');
-  const fallbackApiKeyInput = document.getElementById('fallbackApiKey');
-  const fallbackModelInput = document.getElementById('fallbackModel');
-  const hedgedRequestCheckbox = document.getElementById('hedgedRequestEnabled');
-  const hedgedDelayModeSelect = document.getElementById('hedgedDelayMode');
-  const hedgedDelayReadout = document.getElementById('hedgedDelayReadout');
-  const fallbackConfigDiv = document.getElementById('fallbackConfig');
-  const errorBanner = document.getElementById('errorBanner');
-  const saveBtn = document.getElementById('saveBtn');
-  const statusDiv = document.getElementById('status');
+  const presetSelect = byId<HTMLSelectElement>('preset');
+  const baseUrlInput = byId<HTMLInputElement>('baseUrl');
+  const apiKeyInput = byId<HTMLInputElement>('apiKey');
+  const modelInput = byId<HTMLInputElement>('model');
+  const reasoningEffortSelect = byId<HTMLSelectElement>('reasoningEffort');
+  const maxTokensInput = byId<HTMLInputElement>('maxTokens');
+  const enableStreamingCheckbox = byId<HTMLInputElement>('enableStreaming');
+  const targetLangSelect = byId<HTMLSelectElement>('targetLang');
+  const autoTranslateCheckbox = byId<HTMLInputElement>('autoTranslate');
+  const displayModeSelect = byId<HTMLSelectElement>('displayMode');
+  const fallbackEnabledCheckbox = byId<HTMLInputElement>('fallbackEnabled');
+  const fallbackPresetSelect = byId<HTMLSelectElement>('fallbackPreset');
+  const fallbackBaseUrlInput = byId<HTMLInputElement>('fallbackBaseUrl');
+  const fallbackApiKeyInput = byId<HTMLInputElement>('fallbackApiKey');
+  const fallbackModelInput = byId<HTMLInputElement>('fallbackModel');
+  const hedgedRequestCheckbox = byId<HTMLInputElement>('hedgedRequestEnabled');
+  const hedgedDelayModeSelect = byId<HTMLSelectElement>('hedgedDelayMode');
+  const hedgedDelayReadout = byId<HTMLDivElement>('hedgedDelayReadout');
+  const fallbackConfigDiv = byId<HTMLDivElement>('fallbackConfig');
+  const errorBanner = byId<HTMLDivElement>('errorBanner');
+  const saveBtn = byId<HTMLButtonElement>('saveBtn');
+  const statusDiv = byId<HTMLDivElement>('status');
 
   async function loadLocalConfig() {
     try {
@@ -297,9 +306,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     return 'bad';
   }
 
-  function renderStats(stats) {
-    const models = stats?.models || {};
-    const entries = Object.entries(models).sort((a, b) => (b[1].reqs || 0) - (a[1].reqs || 0));
+  type ModelStatsRow = {
+    reqs: number; successes: number; failures: number;
+    rttTotalMs: number; rttCount: number;
+    tokensTotal: number;
+  };
+  function renderStats(stats: any) {
+    const models: Record<string, ModelStatsRow> = stats?.models || {};
+    const entries: Array<[string, ModelStatsRow]> = Object.entries(models)
+      .sort((a, b) => (b[1].reqs || 0) - (a[1].reqs || 0));
     let totalReqs = 0, totalTokens = 0, totalSuccess = 0;
     for (const [, m] of entries) {
       totalReqs += m.reqs || 0;
@@ -390,14 +405,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // ===== Tabs =====
-  const tabButtons = document.querySelectorAll('.tab-button');
-  const tabPanels = document.querySelectorAll('.tab-panel');
+  const tabButtons = document.querySelectorAll<HTMLButtonElement>('.tab-button');
+  const tabPanels = document.querySelectorAll<HTMLElement>('.tab-panel');
   tabButtons.forEach((btn) => {
     btn.addEventListener('click', () => {
       const target = btn.dataset.tab;
       tabButtons.forEach(b => b.classList.toggle('active', b.dataset.tab === target));
       tabPanels.forEach(p => p.classList.toggle('active', p.dataset.panel === target));
-      onTabSwitch(target);
+      onTabSwitch(target || '');
     });
   });
 

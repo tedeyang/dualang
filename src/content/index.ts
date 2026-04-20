@@ -3,6 +3,7 @@ import { getModelMeta } from '../shared/model-meta';
 import * as bubble from './super-fine-bubble';
 import { renderInlineSlots, fillSlot, clearInlineSlots } from './super-fine-render';
 import { getState, ensureState } from './article-state';
+import { telemetry } from './telemetry';
 import {
   BATCH_SIZE, SUB_BATCH_SIZE, MAX_CONCURRENT,
   TRANSLATION_CACHE_MAX, TRANSLATION_CACHE_TTL_MS,
@@ -79,55 +80,19 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
   const pendingScanRoots = new Set();
   let scanTimer = null;
 
-  // 性能计数器
-  let perfCounters = {
-    viewportObserverFires: 0,
-    preloadObserverFires: 0,
-    mutationObserverFires: 0,
-    showMoreDetected: 0,
-    scanAndQueueCalls: 0,
-    articlesScanned: 0,
-    queueTranslationCalls: 0,
-    priorityUpgrades: 0,
-    preloadCancels: 0,
-    flushQueueCalls: 0,
-    apiCalls: 0,
-    apiTotalRtt: 0,
-    apiErrors: 0,
-    renderCalls: 0,
-    renderTotalTime: 0
-  };
+  // 埋点短名别名 —— 散落调用点沿用 perfLog/logBiz 命名，保留以避免大规模字符替换
+  const perfLog = telemetry.perf.bind(telemetry);
+  const logBiz = telemetry.biz.bind(telemetry);
 
-  // 详细性能埋点 — 默认走 console.debug（DevTools 里 verbose 才可见），
-  // 避免业务日志被海量的 enqueue / scan / render 淹没。
-  function perfLog(event: string, data: any = {}) {
-    console.debug('[Dualang:perf]', event, data);
-  }
-
-  // 业务语义日志 — 默认 console.log 级，保留在 Default 输出。
-  // level='warn' 用于非致命的异常（abort、timeout、quality retry），
-  // 'error' 用于用户可见的失败。
-  function logBiz(event: string, data: any = {}, level: 'log' | 'warn' | 'error' = 'log') {
-    const fn = (console as any)[level] || console.log;
-    fn('[Dualang]', event, data);
-  }
-
-  let _lastSummarySnap = 0;
-  setInterval(() => {
-    const activity = perfCounters.apiCalls + perfCounters.renderCalls +
-                     perfCounters.mutationObserverFires + perfCounters.queueTranslationCalls;
-    if (activity === _lastSummarySnap && pendingQueue.length === 0 && translatingSet.size === 0) return;
-    _lastSummarySnap = activity;
-    const avgRtt = perfCounters.apiCalls > 0 ? (perfCounters.apiTotalRtt / perfCounters.apiCalls).toFixed(1) : '0';
-    const avgRender = perfCounters.renderCalls > 0 ? (perfCounters.renderTotalTime / perfCounters.renderCalls).toFixed(2) : '0';
-    perfLog('summary', {
-      ...perfCounters,
-      avgApiRttMs: parseFloat(avgRtt),
-      avgRenderMs: parseFloat(avgRender),
+  telemetry.startSummary(
+    10_000,
+    () => ({
       pendingQueueLength: pendingQueue.length,
-      translatingSetSize: translatingSet.size
-    });
-  }, 10000);
+      translatingSetSize: translatingSet.size,
+    }),
+    () => telemetry.get('apiCalls') + telemetry.get('renderCalls')
+         + telemetry.get('mutationObserverFires') + telemetry.get('queueTranslationCalls'),
+  );
 
   const VALID_DISPLAY_MODES: DisplayMode[] = ['append', 'translation-only', 'inline', 'bilingual'];
   function normalizeDisplayMode(mode: unknown, legacyBilingual: unknown): DisplayMode {
@@ -498,7 +463,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
 
     viewportObserver = new IntersectionObserver((entries) => {
       if (!enabled) return;
-      perfCounters.viewportObserverFires += entries.length;
+      telemetry.add("viewportObserverFires", entries.length);
       entries.forEach((entry) => {
         if (!entry.isIntersecting) return;
         const article = entry.target;
@@ -509,7 +474,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
 
     preloadObserver = new IntersectionObserver((entries) => {
       if (!enabled) return;
-      perfCounters.preloadObserverFires += entries.length;
+      telemetry.add("preloadObserverFires", entries.length);
       entries.forEach((entry) => {
         const article = entry.target;
         if (entry.isIntersecting) {
@@ -529,7 +494,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
         pendingQueue.splice(idx, 1);
         pendingQueueSet.delete(article);
         hideStatus(article, true);
-        perfCounters.preloadCancels++;
+        telemetry.inc("preloadCancels");
         perfLog('preloadCancel', {
           contentId: getContentId(article),
           queueLength: pendingQueue.length
@@ -762,7 +727,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     }
 
     // 真正的 Show more / 文本变化：立即翻译
-    perfCounters.showMoreDetected++;
+    telemetry.inc("showMoreDetected");
     if (currentContentId) translationCache.delete(currentContentId);
     perfLog('showMore', {
       contentId: currentContentId,
@@ -789,7 +754,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
   function observeMutations() {
     const observer = new MutationObserver((mutations) => {
       if (!enabled) return;
-      perfCounters.mutationObserverFires++;
+      telemetry.inc("mutationObserverFires");
 
       // 同一次 flush 中同一个 article 只处理一次 Show more 检测
       const articlesCheckedThisFlush = new Set<Element>();
@@ -867,7 +832,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
   // ========== 扫描并注册到两层 IntersectionObserver ==========
   function scanAndQueue(root) {
     if (!enabled) return;
-    perfCounters.scanAndQueueCalls++;
+    telemetry.inc("scanAndQueueCalls");
     const t0 = performance.now();
     const articles = root.matches?.('article[data-testid="tweet"]')
       ? [root]
@@ -941,16 +906,16 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       preloadObserver?.observe(article);
       newlyRegistered++;
     });
-    perfCounters.articlesScanned += newlyRegistered;
+    telemetry.add("articlesScanned", newlyRegistered);
     if (newlyRegistered > 0) {
-      perfLog('scanAndQueue', { newlyRegistered, cacheRestored, totalProcessed: perfCounters.articlesScanned, costMs: (performance.now() - t0).toFixed(2) });
+      perfLog('scanAndQueue', { newlyRegistered, cacheRestored, totalProcessed: telemetry.get('articlesScanned'), costMs: (performance.now() - t0).toFixed(2) });
     }
   }
 
   // ========== 自动翻译队列 ==========
   function queueTranslation(article, highPriority = false) {
     if (!enabled) return;
-    perfCounters.queueTranslationCalls++;
+    telemetry.inc("queueTranslationCalls");
     if (article.querySelector('.dualang-translation')) return;
     if (translatingSet.has(article)) return;
 
@@ -964,7 +929,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
         if (idx > 0) {
           pendingQueue.splice(idx, 1);
           pendingQueue.unshift(article);
-          perfCounters.priorityUpgrades++;
+          telemetry.inc("priorityUpgrades");
           perfLog('priorityUpgrade', { queueLength: pendingQueue.length });
         }
       }
@@ -987,7 +952,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
   }
 
   function handleSubBatchError(err, subBatch, apiT0, rtt) {
-    perfCounters.apiErrors++;
+    telemetry.inc("apiErrors");
     const isPreempted = err.message?.includes('抢占');
     const isRetryable = err.retryable !== false; // 默认可重试，除非明确标记不可重试
     logBiz('translation.request.fail', {
@@ -1039,7 +1004,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
 
   function flushQueue() {
     if (!enabled || pendingQueue.length === 0) return;
-    perfCounters.flushQueueCalls++;
+    telemetry.inc("flushQueueCalls");
     const flushT0 = performance.now();
 
     const batchArticles = pendingQueue.splice(0, BATCH_SIZE);
@@ -1133,8 +1098,8 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
         requestTranslation(texts, hasHighPriority ? 1 : 0, false)
       ).then((data) => {
         const rtt = performance.now() - apiT0;
-        perfCounters.apiCalls++;
-        perfCounters.apiTotalRtt += rtt;
+        telemetry.inc("apiCalls");
+        telemetry.add("apiTotalRtt", rtt);
         const translations = data.translations;
         if (!Array.isArray(translations) || translations.length !== subBatch.length) {
           handleSubBatchError(new Error('子批量翻译返回结果数量不匹配'), subBatch, apiT0, rtt);
@@ -1156,8 +1121,8 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
         }
       }).catch((err) => {
         const rtt = performance.now() - apiT0;
-        perfCounters.apiCalls++;
-        perfCounters.apiTotalRtt += rtt;
+        telemetry.inc("apiCalls");
+        telemetry.add("apiTotalRtt", rtt);
         handleSubBatchError(err, subBatch, apiT0, rtt);
       });
     }
@@ -1210,8 +1175,8 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
         }
       } else if (msg.action === 'done') {
         const rtt = performance.now() - apiT0;
-        perfCounters.apiCalls++;
-        perfCounters.apiTotalRtt += rtt;
+        telemetry.inc("apiCalls");
+        telemetry.add("apiTotalRtt", rtt);
         perfLog('streamDone', { batchSize: batch.length, rttMs: rtt.toFixed(1), activeRequests });
         for (let j = 0; j < batch.length; j++) {
           if (translatingSet.has(batch[j].article)) {
@@ -1223,8 +1188,8 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
         try { port.disconnect(); } catch (_) {}
       } else if (msg.action === 'error') {
         const rtt = performance.now() - apiT0;
-        perfCounters.apiCalls++;
-        perfCounters.apiTotalRtt += rtt;
+        telemetry.inc("apiCalls");
+        telemetry.add("apiTotalRtt", rtt);
         releaseSlot();
         const e: any = new Error(msg.error || '流式翻译失败');
         e.retryable = msg.retryable !== false;
@@ -1351,8 +1316,8 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       // 严格 prompt 会明确要求模型"不要总结、保留段落"，破解上一次被压缩成短译文的怪圈
       const data = await requestTranslation([text], 2, isQualityRetry, isQualityRetry);
       const rtt = performance.now() - apiT0;
-      perfCounters.apiCalls++;
-      perfCounters.apiTotalRtt += rtt;
+      telemetry.inc("apiCalls");
+      telemetry.add("apiTotalRtt", rtt);
       perfLog('immediateTranslate', { rttMs: rtt.toFixed(1) });
       const response = { success: true, data };
 
@@ -1418,7 +1383,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
         });
       }
     } catch (err: any) {
-      perfCounters.apiErrors++;
+      telemetry.inc("apiErrors");
       logBiz('translation.immediate.fail', { error: err.message }, 'warn');
       hideStatus(article, true);
       // 已知当前正在使用的 model/baseUrl（来自设置缓存不可得，fail 路径仅记录错误）
@@ -1667,8 +1632,8 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     tweetTextEl.parentNode.insertBefore(card, tweetTextEl.nextSibling);
     unobserveArticle(article);
     const cost = performance.now() - t0;
-    perfCounters.renderCalls++;
-    perfCounters.renderTotalTime += cost;
+    telemetry.inc("renderCalls");
+    telemetry.add("renderTotalTime", cost);
     perfLog('render', { paras: translatedParas.length, mode, costMs: cost.toFixed(2) });
   }
 
