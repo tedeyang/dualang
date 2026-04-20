@@ -2,6 +2,7 @@ import { shouldSkipContent, isAlreadyTargetLanguage, extractText, getContentId, 
 import { getModelMeta } from '../shared/model-meta';
 import * as bubble from './super-fine-bubble';
 import { renderInlineSlots, fillSlot, clearInlineSlots } from './super-fine-render';
+import { getState, ensureState } from './article-state';
 import {
   BATCH_SIZE, SUB_BATCH_SIZE, MAX_CONCURRENT,
   TRANSLATION_CACHE_MAX, TRANSLATION_CACHE_TTL_MS,
@@ -29,15 +30,9 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
   let enableStreaming = false;
   let providerType: 'openai' | 'browser-native' = 'openai';
 
-  // Article 元素附加的自定义属性
-  type TweetArticle = Element & {
-    _dualangEnqueueTime?: number;
-    _dualangIsHighPriority?: boolean;
-    _dualangContentId?: string;
-    _dualangLastText?: string;                                // 最近一次处理时 tweetText 的 textContent，用于精确检测内容变化（show-more / 编辑 / 长度不变但内容变）
-    _dualangShowMoreTimer?: ReturnType<typeof setTimeout>;    // 静默期去抖定时器；新 mutation 到达时重置
-    _dualangQualityRetried?: boolean;                         // 行数差异触发的质量重试已用掉，防止死循环
-  };
+  // Article 级别的状态通过 WeakMap<Element, ArticleState> 管理（见 article-state.ts）
+  // TweetArticle 只是 Element 的别名，保留供 JSDoc / 可读性
+  type TweetArticle = Element;
 
   const processedTweets = new WeakSet();
   const pendingQueue: TweetArticle[] = [];
@@ -454,7 +449,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       },
       onCancel: (articleId: string) => {
         const article = document.querySelector(`[data-dualang-article-id="${articleId}"]`);
-        const port = (article as any)?._dualangSuperFinePort;
+        const port = article ? getState(article)?.superFinePort : undefined;
         try { port?.disconnect(); } catch (_) {}
       },
     });
@@ -528,7 +523,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
         // 已在 translatingSet 中的 in-flight 请求不取消（成本已付出）。
         if (!pendingQueueSet.has(article)) return;
         const art = article as TweetArticle;
-        if (art._dualangIsHighPriority) return;
+        if (getState(art)?.isHighPriority) return;
         const idx = pendingQueue.indexOf(art);
         if (idx === -1) return;
         pendingQueue.splice(idx, 1);
@@ -616,7 +611,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       return;
     }
 
-    (article as any)._dualangSuperFinePort = port;
+    ensureState(article).superFinePort = port;
     let metaModel: string | undefined;
     let metaBaseUrl: string | undefined;
 
@@ -744,7 +739,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     if (!tweetTextEl) return;
 
     const currentContentId = getContentId(article);
-    const prevContentId = article._dualangContentId;
+    const prevContentId = getState(article)?.contentId;
     const isRecycled = !!(prevContentId && currentContentId && prevContentId !== currentContentId);
 
     // 统一清理旧状态
@@ -758,7 +753,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     translatingSet.delete(article);
     processedTweets.delete(article);
     // 新内容 / 新推文 —— 质量重试额度重置，允许它们独立触发一次重试
-    delete (article as TweetArticle)._dualangQualityRetried;
+    delete ensureState(article).qualityRetried;
 
     if (isRecycled) {
       perfLog('domRecycle', { prevContentId, currentContentId });
@@ -771,7 +766,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     if (currentContentId) translationCache.delete(currentContentId);
     perfLog('showMore', {
       contentId: currentContentId,
-      prevLen: article._dualangLastText?.length,
+      prevLen: getState(article)?.lastText?.length,
       newLen: tweetTextEl.textContent?.length
     });
     translateImmediate(article, tweetTextEl);
@@ -781,9 +776,11 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
   // 才触发 show-more/recycle 处理。这把阈值的含义从"X.com 展开总时长"(硬编码假设)
   // 变成"mutation 批次之间的间隔"(浏览器事件循环特性) — 不论 X.com 的动画多长都能自适应。
   function scheduleShowMoreCheck(article: TweetArticle) {
-    if (article._dualangShowMoreTimer) clearTimeout(article._dualangShowMoreTimer);
-    article._dualangShowMoreTimer = setTimeout(() => {
-      article._dualangShowMoreTimer = undefined;
+    const s = ensureState(article);
+    if (s.showMoreTimer) clearTimeout(s.showMoreTimer);
+    s.showMoreTimer = setTimeout(() => {
+      const cur = getState(article);
+      if (cur) cur.showMoreTimer = undefined;
       handleShowMoreOrRecycle(article);
     }, SHOW_MORE_STABLE_MS);
   }
@@ -827,7 +824,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
 
           const art = article as TweetArticle;
           const currentText = tweetTextEl.textContent || '';
-          const prevText = art._dualangLastText;
+          const prevText = getState(art)?.lastText;
           // 未记录基线时不触发（避免首次注入时误判）
           if (prevText === undefined) continue;
           // 精确比较：长度相同但内容变化（编辑）也会被捕获
@@ -888,9 +885,10 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       const art = article as TweetArticle;
       // 记录内容 ID 和文本长度基线，用于后续 Show more / DOM 复用检测
       const contentId = getContentId(article);
-      if (contentId) art._dualangContentId = contentId;
+      const state = ensureState(art);
+      if (contentId) state.contentId = contentId;
       const tweetTextEl = findTweetTextEl(article);
-      if (tweetTextEl) art._dualangLastText = tweetTextEl.textContent || '';
+      if (tweetTextEl) state.lastText = tweetTextEl.textContent || '';
 
       // 虚拟 DOM 回收后重现：尝试从内容 ID 缓存恢复翻译
       if (contentId && !article.querySelector('.dualang-translation')) {
@@ -961,7 +959,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
 
     if (pendingQueueSet.has(article)) {
       if (highPriority) {
-        article._dualangIsHighPriority = true;
+        ensureState(article).isHighPriority = true;
         const idx = pendingQueue.indexOf(article);
         if (idx > 0) {
           pendingQueue.splice(idx, 1);
@@ -973,8 +971,9 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       return;
     }
 
-    article._dualangEnqueueTime = performance.now();
-    article._dualangIsHighPriority = highPriority;
+    const s = ensureState(article);
+    s.enqueueTime = performance.now();
+    s.isHighPriority = highPriority;
 
     pendingQueueSet.add(article);
     showStatus(article, 'queued');
@@ -1067,7 +1066,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       }
 
       // 刷新 show-more 检测基线：记录当前送翻的文本长度
-      (article as TweetArticle)._dualangLastText = tweetTextEl.textContent || '';
+      ensureState(article).lastText = tweetTextEl.textContent || '';
       batch.push({
         article,
         text,
@@ -1303,8 +1302,8 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     );
 
     // 第一次可疑：丢弃结果，走质量重试（skipCache，避免被刚写入的坏翻译绊住）
-    if (suspicious && !art._dualangQualityRetried) {
-      art._dualangQualityRetried = true;
+    if (suspicious && !ensureState(art).qualityRetried) {
+      ensureState(art).qualityRetried = true;
       logBiz('translation.quality.retry', {
         contentId: originalContentId, origLen: text.length, transLen: translated.length,
       }, 'warn');
@@ -1315,7 +1314,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
 
     // 渲染（正常结果 或 已重试过的尽量使用的结果）
     renderTranslation(article, freshTextEl, translated, text);
-    art._dualangLastText = freshTextEl.textContent || '';
+    ensureState(art).lastText = freshTextEl.textContent || '';
     if (originalContentId) {
       translationCache.set(originalContentId, {
         translated, original: text,
@@ -1344,7 +1343,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     }
     // 入队时捕获内容 ID 和文本长度基线（基线用于下次 show-more 检测）
     const originalContentId = getContentId(article);
-    (article as TweetArticle)._dualangLastText = tweetTextEl.textContent || '';
+    ensureState(article).lastText = tweetTextEl.textContent || '';
     showStatus(article, 'loading');
     const apiT0 = performance.now();
     try {
@@ -1384,8 +1383,8 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       );
 
       // 第一次可疑：重试一次（skipCache 绕过刚写入的坏翻译）
-      if (suspicious && !art._dualangQualityRetried) {
-        art._dualangQualityRetried = true;
+      if (suspicious && !ensureState(art).qualityRetried) {
+        ensureState(art).qualityRetried = true;
         logBiz('translation.quality.retry', {
           contentId: originalContentId, origLen: text.length, transLen: translated.length, mode: 'immediate',
         }, 'warn');
@@ -1395,7 +1394,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       }
 
       renderTranslation(article, freshTextEl, translated, text);
-      art._dualangLastText = freshTextEl.textContent || '';
+      ensureState(art).lastText = freshTextEl.textContent || '';
       if (originalContentId) {
         translationCache.set(originalContentId, {
           translated, original: text,
@@ -1488,7 +1487,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       e.stopPropagation();
       retryCounts.delete(article);
       // 重置质量重试额度，让手动触发的重试也能再自动重试一次
-      delete (article as TweetArticle)._dualangQualityRetried;
+      delete ensureState(article).qualityRetried;
       // 清 article 下挂着的旧翻译（可能是质量不佳但已渲染的版本）；
       // 同步摘 data-dualang-mode，避免原文被 CSS 继续隐藏造成塌陷
       article.querySelector('.dualang-translation')?.remove();
