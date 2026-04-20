@@ -4,6 +4,11 @@ import * as bubble from './super-fine-bubble';
 import { renderInlineSlots, fillSlot, clearInlineSlots } from './super-fine-render';
 import { getState, ensureState } from './article-state';
 import { telemetry } from './telemetry';
+import { normalizeDisplayMode, type DisplayMode } from './display-mode';
+import { translateViaBrowser, destroyBrowserSession } from './browser-translator';
+import { requestTranslationChunked } from './long-article-chunked';
+import { findAndPrepareGrokCards, GROK_DISCLAIMER_PREFIXES } from './grok-card';
+import { renderTranslation } from './render';
 import {
   BATCH_SIZE, SUB_BATCH_SIZE, MAX_CONCURRENT,
   TRANSLATION_CACHE_MAX, TRANSLATION_CACHE_TTL_MS,
@@ -14,12 +19,11 @@ import {
 
 type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCache?: boolean };
 
-// 展示模式：
+// 展示模式 DisplayMode 从 display-mode.ts import：
 //   append         —— 原文保留，译文附在下方（默认，最轻量）
 //   translation-only — 仅显示译文，原文 tweetTextEl 被隐藏
 //   inline         —— 段落翻译：原文 HTML 克隆 + 译文逐段交错；tweetTextEl 隐藏
 //   bilingual      —— 整体对照：克隆整段原文 HTML + 整段译文；tweetTextEl 隐藏
-type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
 
 (async function () {
   'use strict';
@@ -94,14 +98,6 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
          + telemetry.get('mutationObserverFires') + telemetry.get('queueTranslationCalls'),
   );
 
-  const VALID_DISPLAY_MODES: DisplayMode[] = ['append', 'translation-only', 'inline', 'bilingual'];
-  function normalizeDisplayMode(mode: unknown, legacyBilingual: unknown): DisplayMode {
-    if (typeof mode === 'string' && (VALID_DISPLAY_MODES as string[]).includes(mode)) {
-      return mode as DisplayMode;
-    }
-    return legacyBilingual ? 'inline' : 'append';
-  }
-
   // ========== 事件驱动调度器 ==========
   // 统一管理 flush 时机，替代散落各处的 scheduleFlush() 调用
   const scheduler = {
@@ -164,69 +160,6 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     );
   }
 
-  // ========== 浏览器本地翻译（Chrome 138+ / Edge Canary 143+ 内置 Translator API）==========
-  // W3C Translator 标准 API，Chrome 和 Edge 共用同一接口形状：
-  //   self.Translator.availability({sourceLanguage, targetLanguage}) -> 'available' | 'downloadable' | 'downloading' | 'unavailable'
-  //   self.Translator.create({sourceLanguage, targetLanguage}) -> session
-  //   session.translate(text) -> Promise<string>
-  //   session.destroy()
-  // 完全离线，无 API Key，无 token 计费；不走 background 也不走 rateLimiter。
-  //
-  // 参考：
-  //   - Chrome: https://developer.chrome.com/docs/ai/translator-api
-  //   - Edge:   https://learn.microsoft.com/en-us/microsoft-edge/web-platform/translator-api
-  //   - 规范:   https://github.com/webmachinelearning/translation-api
-  type BrowserSession = { pair: string; translate: (t: string) => Promise<string>; destroyFn: () => void };
-  let _browserSession: BrowserSession | null = null;
-
-  function hasBrowserTranslator(): boolean {
-    return typeof (self as any).Translator !== 'undefined';
-  }
-
-  async function ensureBrowserSession(sourceLang: string, targetLangFull: string): Promise<BrowserSession> {
-    const pair = `${sourceLang}:${targetLangFull}`;
-    if (_browserSession && _browserSession.pair === pair) return _browserSession;
-    if (_browserSession) { try { _browserSession.destroyFn(); } catch (_) {} _browserSession = null; }
-
-    const T = (self as any).Translator;
-    const avail = await T.availability({ sourceLanguage: sourceLang, targetLanguage: targetLangFull });
-    if (avail === 'unavailable') {
-      throw new Error(`浏览器内置翻译不支持 ${sourceLang} → ${targetLangFull}`);
-    }
-    const session: any = await T.create({ sourceLanguage: sourceLang, targetLanguage: targetLangFull });
-    _browserSession = {
-      pair,
-      translate: (text: string) => session.translate(text),
-      destroyFn: () => { try { session.destroy(); } catch (_) {} },
-    };
-    return _browserSession;
-  }
-
-  // 简化：先按"非目标语即源语为 en"处理。Chrome 138+ 也提供 LanguageDetector 可进一步精化。
-  function inferSourceLang(_text: string, target: string): string {
-    // target 形如 'zh-CN'；source 约定用 BCP-47 主语言标签
-    // 当前跳过已是目标语言的推文，所以剩下要翻译的主要是 en（以及少量其他）
-    // 简单先 'en'，后续可接入 LanguageDetector.create()
-    return target.startsWith('en') ? 'zh' : 'en';
-  }
-
-  async function translateViaBrowser(texts: string[]): Promise<ResponseData> {
-    if (!hasBrowserTranslator()) {
-      const err: any = new Error('浏览器不支持内置 Translator API，请升级到 Chrome 138+ 或 Edge Canary 143+');
-      err.retryable = false;
-      throw err;
-    }
-    const sourceLang = inferSourceLang(texts[0] || '', targetLang);
-    const session = await ensureBrowserSession(sourceLang, targetLang);
-    const translations = await Promise.all(texts.map(t => session.translate(t)));
-    return {
-      translations,
-      model: 'browser-native',
-      baseUrl: 'browser://translator',
-      fromCache: false,
-    };
-  }
-
   // ========== 统一的翻译请求入口 ==========
   // 根据 providerType 分发到本地 Translator API 或 background HTTP 路径。
   type ResponseData = {
@@ -237,108 +170,6 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     fromCache?: boolean;
   };
 
-  // 长文专用路径：把 text 按 \n\n 切成 N 段，5 段一 chunk 串行送 API，
-  // 全部完成后 join('\n\n') 作为单段译文返回，外部调用方看不出是分多次请求完成的。
-  // 串行：避免一次性占满 MAX_CONCURRENT 与 background rate limiter，让整体稳定可控。
-  //
-  // 通过 translate-stream port（不是 sendMessage）发起：
-  //   - 超时 / content 页面切走时调 port.disconnect()
-  //   - background 的 handleTranslateStream 监听 onDisconnect → AbortController.abort()
-  //     → 中途的 fetch 立即取消，释放 rate-limiter 配额；避免 sendMessage 版本
-  //     里超时后 background 仍跑完整个 chunk 的浪费
-  async function requestTranslationChunked(
-    text: string, priority: number, skipCache: boolean, strictMode: boolean,
-  ): Promise<ResponseData> {
-    const paragraphs = splitIntoParagraphs(text);
-    const translations: string[] = new Array(paragraphs.length).fill('');
-    let totalTokens = 0;
-    let meta: { model?: string; baseUrl?: string } = {};
-    const chunkSize = 5;
-
-    for (let i = 0; i < paragraphs.length; i += chunkSize) {
-      const chunkTexts = paragraphs.slice(i, i + chunkSize);
-      const chunkResult = await requestChunkViaPort(chunkTexts, priority, i, skipCache, strictMode);
-      for (let k = 0; k < chunkResult.translations.length; k++) {
-        translations[i + k] = chunkResult.translations[k];
-      }
-      totalTokens += chunkResult.totalTokens;
-      meta = { model: chunkResult.model, baseUrl: chunkResult.baseUrl };
-    }
-    return {
-      translations: [translations.join('\n\n')],
-      usage: { total_tokens: totalTokens },
-      model: meta.model,
-      baseUrl: meta.baseUrl,
-      fromCache: false,
-    };
-  }
-
-  type ChunkResult = { translations: string[]; totalTokens: number; model?: string; baseUrl?: string };
-
-  function requestChunkViaPort(
-    chunkTexts: string[], priority: number, chunkOffset: number,
-    skipCache: boolean, strictMode: boolean,
-  ): Promise<ChunkResult> {
-    return new Promise<ChunkResult>((resolve, reject) => {
-      const port = chrome.runtime.connect(undefined, { name: 'translate-stream' });
-      const out: string[] = new Array(chunkTexts.length).fill('');
-      let settled = false;
-      let chunkModel: string | undefined;
-      let chunkBaseUrl: string | undefined;
-
-      const timeout = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        try { port.disconnect(); } catch (_) {}
-        reject(new Error(`长文 chunk @${chunkOffset} 翻译超时 (${LONG_CHUNK_TIMEOUT_MS / 1000}s)`));
-      }, LONG_CHUNK_TIMEOUT_MS);
-
-      port.onMessage.addListener((msg) => {
-        if (settled) return;
-        if (msg.action === 'partial') {
-          if (typeof msg.index === 'number' && msg.index >= 0 && msg.index < out.length && msg.translated) {
-            out[msg.index] = msg.translated;
-            if (msg.model) chunkModel = msg.model;
-            if (msg.baseUrl) chunkBaseUrl = msg.baseUrl;
-          }
-        } else if (msg.action === 'done') {
-          settled = true;
-          clearTimeout(timeout);
-          // `done` 捎带一个完整 translations 数组 —— 覆写 partial 收集的结果以确保完整性
-          const finalTranslations = Array.isArray(msg.translations)
-            ? msg.translations.map((t: any, i: number) => t || out[i])
-            : out;
-          resolve({
-            translations: finalTranslations,
-            totalTokens: 0,  // translate-stream 不上报 usage（缓存命中也算 0），不影响外层统计
-            model: msg.model || chunkModel,
-            baseUrl: msg.baseUrl || chunkBaseUrl,
-          });
-          try { port.disconnect(); } catch (_) {}
-        } else if (msg.action === 'error') {
-          settled = true;
-          clearTimeout(timeout);
-          const e: any = new Error(msg.error || `长文 chunk @${chunkOffset} 失败`);
-          e.retryable = msg.retryable !== false;
-          reject(e);
-          try { port.disconnect(); } catch (_) {}
-        }
-      });
-
-      port.onDisconnect.addListener(() => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeout);
-        reject(new Error(`长文 chunk @${chunkOffset} 连接断开`));
-      });
-
-      port.postMessage({
-        action: 'translate',
-        payload: { texts: chunkTexts, priority, skipCache, strictMode },
-      });
-    });
-  }
-
   async function requestTranslation(
     texts: string[],
     priority: number,
@@ -346,7 +177,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     strictMode = false,
   ): Promise<ResponseData> {
     if (providerType === 'browser-native') {
-      return translateViaBrowser(texts);  // 浏览器本地翻译不支持 strict 模式
+      return translateViaBrowser(texts, targetLang);  // 浏览器本地翻译不支持 strict 模式
     }
     // 长文（单条 4k+ 字符 + 6+ 段落）自动切段：小模型在整包 20k 字符输入下
     // 会把 N 段输出压成 2 段，切成 5-段一组的独立 sub-batch 各自翻译能保证段落数对齐。
@@ -451,8 +282,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       const v = changes.providerType.newValue;
       providerType = v === 'browser-native' ? 'browser-native' : 'openai';
       // 切换 provider 时，清空浏览器本地 session 缓存
-      _browserSession?.destroyFn?.();
-      _browserSession = null;
+      destroyBrowserSession();
     }
   });
 
@@ -622,79 +452,6 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       action: 'translate',
       payload: { paragraphs, targetLang },
     });
-  }
-
-  /**
-   * Grok 摘要卡识别：没有 testid/role/aria，只能结构 + 语义两类信号组合。
-   * 早期纯靠结构指纹（4 个 DIV 子 + 含 time + 免责声明前缀），X.com 改一次 DOM 就挂。
-   * 现在把识别拆成多个独立信号，按置信度计分通过：
-   *   - 必选：disclaimer 短语（多语言）——这是卡的本质特征，改版也大概率保留
-   *   - 辅助：结构（4 个 div 子）、<time> 存在、容器 aria-label 提示
-   * 只要 disclaimer 命中且至少一个辅助信号命中就认；即使未来 X.com 把 4 个 div
-   * 变成 3 个或加了 SVG 图标节点，只要免责声明还在就不至于完全识别失败。
-   */
-  // 多语言免责声明开头（所有已知 locale）；通过 startsWith 容忍后续文案变化
-  const GROK_DISCLAIMER_PREFIXES = [
-    'This story is a summary of posts on X',  // en
-    '此新闻是 X 上帖子的摘要',                   // zh-CN
-    '此新聞是 X 上貼文的摘要',                   // zh-TW
-  ];
-
-  function hasGrokDisclaimer(el: Element): boolean {
-    const text = (el.textContent || '').trim();
-    return GROK_DISCLAIMER_PREFIXES.some((p) => text.startsWith(p));
-  }
-
-  function isGrokCardContainer(el: Element): boolean {
-    if (!(el instanceof Element)) return false;
-    // 必选：最后一个子节点的文本以 disclaimer 开头（子树包含 disclaimer 不够 ——
-    // Grok 卡的祖先会把整段文字拢进 textContent 但 disclaimer 不在其子首）
-    const lastChild = el.children[el.children.length - 1];
-    if (!lastChild || !hasGrokDisclaimer(lastChild)) return false;
-
-    // 至少命中一个辅助信号，排除偶发的包含 disclaimer 文本的无关容器
-    let signals = 0;
-    if (el.children.length === 4) signals++;
-    if (el.querySelector('time')) signals++;
-    // aria-label / role 上的提示（X.com 未来加上就能命中，加不上也不关键）
-    const aria = el.getAttribute('aria-label') || '';
-    if (/grok|trending|热点|趨勢/i.test(aria)) signals++;
-    return signals >= 1;
-  }
-
-  // 在一棵子树里发现所有未处理的 Grok 卡片，打上标记后返回。
-  // 用 data-dualang-grok 做 idempotent guard，避免重复处理同一张卡。
-  function findAndPrepareGrokCards(root: Element | Document): Element[] {
-    const scope: any = root instanceof Element ? root : document;
-    // 候选集：用 `:has(time)` 先粗筛再细判；浏览器支持差异用 try/catch 兜底
-    let candidates: Element[] = [];
-    try {
-      candidates = Array.from(scope.querySelectorAll('div:has(> time), div:has(time)'));
-    } catch (_) {
-      candidates = Array.from(scope.querySelectorAll('div'));
-    }
-    const cards: Element[] = [];
-    for (const el of candidates) {
-      // 从候选往上找到 4-子 + 免责声明的最小容器 —— 因为我们刚粗筛了 <time>，其祖先都可能命中
-      let node: Element | null = el;
-      for (let i = 0; i < 6 && node; i++) {
-        if (isGrokCardContainer(node)) {
-          if (!node.hasAttribute('data-dualang-grok')) {
-            // children[2] 是正文 wrapper，内层的 div[dir] 是真正的文本元素
-            const bodyWrapper = node.children[2];
-            const bodyEl = bodyWrapper?.querySelector('div[dir]') || bodyWrapper?.querySelector('div');
-            if (bodyEl) {
-              node.setAttribute('data-dualang-grok', 'true');
-              bodyEl.setAttribute('data-dualang-text', 'true');
-              cards.push(node);
-            }
-          }
-          break;
-        }
-        node = node.parentElement;
-      }
-    }
-    return cards;
   }
 
   // ========== 在去抖后分流 Show more / DOM 回收 ==========
@@ -875,7 +632,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
             });
             // 不 return，让它走后面的 Observer 注册
           } else {
-            renderTranslation(article, tweetTextEl, cached.translated, cached.original);
+            renderTranslationLocal(article, tweetTextEl, cached.translated, cached.original);
             showSuccess(article, {
               model: cached.model, baseUrl: cached.baseUrl, fromCache: true,
             });
@@ -1278,7 +1035,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     }
 
     // 渲染（正常结果 或 已重试过的尽量使用的结果）
-    renderTranslation(article, freshTextEl, translated, text);
+    renderTranslationLocal(article, freshTextEl, translated, text);
     ensureState(art).lastText = freshTextEl.textContent || '';
     if (originalContentId) {
       translationCache.set(originalContentId, {
@@ -1358,7 +1115,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
         return;
       }
 
-      renderTranslation(article, freshTextEl, translated, text);
+      renderTranslationLocal(article, freshTextEl, translated, text);
       ensureState(art).lastText = freshTextEl.textContent || '';
       if (originalContentId) {
         translationCache.set(originalContentId, {
@@ -1530,122 +1287,13 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     tweetTextEl.parentNode.insertBefore(btn, tweetTextEl.nextSibling);
   }
 
-  // ========== 渲染翻译块 ==========
-  // 4 种展示模式：
-  //   append          —— 原文 tweetText 保留可见，译文 card 追加在其下方
-  //   translation-only —— 原文隐藏（CSS 通过 article[data-dualang-mode] 控制），只显示译文
-  //   inline          —— 原文隐藏；card 内逐段交错：[克隆的原文段落 HTML] + [对应译文]
-  //   bilingual       —— 原文隐藏；card 内先显示整段原文 HTML 克隆，下方跟整段译文
-  // 为什么需要 data-dualang-mode 属性：mode 切换时旧推文保留老模式、新推文用新模式，
-  // CSS 的 :has 或属性选择器根据 article 的 mode 决定是否隐藏 tweetTextEl。
-  function renderTranslation(article, tweetTextEl, translatedText, originalText) {
-    const t0 = performance.now();
-    if (article.querySelector('.dualang-translation')) return;
-
-    const card = document.createElement('div');
-    card.className = 'dualang-translation';
-    const mode = displayMode;
-    article.setAttribute('data-dualang-mode', mode);
-
-    let translatedParas = translatedText
-      .split(/(?:\n\s*\n|---PARA---)/)
-      .map(p => p.trim())
-      .filter(Boolean);
-    if (translatedParas.length === 0) translatedParas.push(translatedText.trim());
-
-    // 译文救援：模型没有按"保留段落"指令输出 \n\n，但原文确实有多段落
-    // → 按句末标点重建段落结构，避免渲染成一大坨文字
-    if (translatedParas.length === 1 && originalText) {
-      const origParas = originalText.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean).length;
-      if (origParas >= 3) {
-        const rebuilt = rebuildParagraphs(translatedParas[0], origParas);
-        if (rebuilt.length >= 2) {
-          translatedParas = rebuilt;
-          perfLog('paraRebuild', { origParas, newParas: rebuilt.length });
-        }
-      }
-    }
-
-    if (mode === 'inline') {
-      // 段落对照：按 DOM 边界克隆原文各段，紧接对应译文；段数不对等时取原文段数为准，
-      // 多出的译文段落作为最后一段译文块；少的译文位置留空（用户能看到原文提示模型漏译）
-      card.classList.add('dualang-inline');
-      const originalParas = splitParagraphsByDom(tweetTextEl);
-      // 段数严重不匹配（比如 X Articles 的原文 DOM 只切出 5 段但译文有 25 段，因为
-      // 文章的段落边界靠 CSS block 布局而非文本节点 \n\n 分隔）→ 退回整体对照布局，
-      // 避免大量译文散落在末尾。门槛：原文段数 < 译文段数 × 0.5 视为严重不匹配。
-      const severeMismatch = originalParas.length > 0
-        && translatedParas.length > 2
-        && originalParas.length < translatedParas.length * 0.5;
-      if (originalParas.length === 0 || severeMismatch) {
-        // 退化路径：克隆整段原文 HTML + 译文整块（bilingual 风格）
-        const origBlock = document.createElement('div');
-        origBlock.className = 'dualang-original-html';
-        for (const child of Array.from(tweetTextEl.childNodes) as Node[]) {
-          origBlock.appendChild(child.cloneNode(true));
-        }
-        card.appendChild(origBlock);
-        appendTranslationParas(card, translatedParas);
-        if (severeMismatch) {
-          perfLog('inline.fallbackToBilingual', { origParas: originalParas.length, transParas: translatedParas.length });
-        }
-      } else {
-        for (let i = 0; i < originalParas.length; i++) {
-          const pair = document.createElement('div');
-          pair.className = 'dualang-inline-pair';
-          const orig = document.createElement('div');
-          orig.className = 'dualang-original-html';
-          orig.appendChild(originalParas[i]);
-          pair.appendChild(orig);
-          if (translatedParas[i]) {
-            const trans = document.createElement('div');
-            trans.className = 'dualang-para';
-            trans.textContent = translatedParas[i];
-            pair.appendChild(trans);
-          }
-          card.appendChild(pair);
-        }
-        // 译文多出的尾段：按一段译文块追加
-        for (let i = originalParas.length; i < translatedParas.length; i++) {
-          const trans = document.createElement('div');
-          trans.className = 'dualang-para';
-          trans.textContent = translatedParas[i];
-          card.appendChild(trans);
-        }
-      }
-    } else if (mode === 'bilingual') {
-      // 整体对照：克隆整段原文 HTML（保留链接/emoji/@/#）+ 整段译文
-      card.classList.add('dualang-bilingual');
-      const origBlock = document.createElement('div');
-      origBlock.className = 'dualang-original-html';
-      for (const child of Array.from(tweetTextEl.childNodes) as Node[]) {
-        origBlock.appendChild(child.cloneNode(true));
-      }
-      card.appendChild(origBlock);
-      appendTranslationParas(card, translatedParas);
-    } else {
-      // 'append' 和 'translation-only' 共享译文-only 的 card 结构；
-      // 区别只在 CSS 是否隐藏 tweetTextEl（由 data-dualang-mode 控制）
-      appendTranslationParas(card, translatedParas);
-    }
-
-    tweetTextEl.parentNode.insertBefore(card, tweetTextEl.nextSibling);
-    unobserveArticle(article);
-    const cost = performance.now() - t0;
-    telemetry.inc("renderCalls");
-    telemetry.add("renderTotalTime", cost);
-    perfLog('render', { paras: translatedParas.length, mode, costMs: cost.toFixed(2) });
-  }
-
-  // 渲染整段译文：把多个段落合并回一个 pre-wrap 块，\n\n 由 CSS 的 white-space 原生渲染为
-  // 一整行空行（与 X.com 原生 tweetText 的段落间距视觉一致）。
-  // 旧做法是每段一个 <div> + margin-top 近似，但 margin 值永远对不齐 line-height 撑出的空行。
-  function appendTranslationParas(card: HTMLElement, translatedParas: string[]) {
-    if (translatedParas.length === 0) return;
-    const p = document.createElement('div');
-    p.className = 'dualang-para';
-    p.textContent = translatedParas.join('\n\n');
-    card.appendChild(p);
+  // 包一层闭包绑定：调用方保持 renderTranslation(article, tweetTextEl, translated, original)
+  // 签名不变，内部注入 displayMode 和 onRendered 回调
+  function renderTranslationLocal(
+    article: Element, tweetTextEl: Element,
+    translatedText: string, originalText: string,
+  ) {
+    renderTranslation(article, tweetTextEl, translatedText, originalText, displayMode, unobserveArticle);
   }
 
   init();
