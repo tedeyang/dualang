@@ -5,6 +5,10 @@ import { getSettings, invalidateSettingsCache, getMoonshotKey } from './settings
 import { rateLimiter } from './rate-limiter';
 import { doTranslateSingle, doTranslateBatchRequest, doTranslateBatchStream } from './api';
 import { recordRequest, recordCacheHit, recordQualityRetry, recordError, getStats, resetStats } from './stats';
+import {
+  buildFallbackSettings, buildSuperFineSettings, applyBatchResult, runFallback,
+  isFallbackConfigured, shouldHedge, estimateTokens,
+} from './pipeline';
 
 // ===================== 设置缓存失效 =====================
 chrome.storage.onChanged.addListener((changes, area) => {
@@ -326,27 +330,12 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
       if (!moonshotKey) {
         throw new Error('Moonshot 模型需要 API Key；请在 config.json 的 providers.moonshot.apiKey 填入，或不指定 model 以使用默认 GLM');
       }
-      settings = {
-        ...baseSettings,
-        baseUrl: 'https://api.moonshot.cn/v1',
-        model: payload.model,
-        apiKey: moonshotKey,
-        maxTokens: 8192,
-        reasoningEffort: 'none',
-        enableStreaming: true,
-        fallbackEnabled: false,
-        hedgedRequestEnabled: false,
-      };
+      settings = buildSuperFineSettings(baseSettings, { model: payload.model, apiKey: moonshotKey });
     } else {
       if (!baseSettings.apiKey) {
         throw new Error('精翻需要 API Key；请在 popup 设置或 config.json 填入 SiliconFlow key');
       }
-      settings = {
-        ...baseSettings,
-        enableStreaming: true,
-        fallbackEnabled: false,
-        hedgedRequestEnabled: false,
-      };
+      settings = buildSuperFineSettings(baseSettings);
     }
 
     // content 端已经用 extractParagraphsByBlock 按 DOM block 结构切好段落
@@ -457,13 +446,7 @@ async function raceMainAndFallback(
   if (outerSignal.aborted) onOuterAbort();
   else outerSignal.addEventListener('abort', onOuterAbort, { once: true });
 
-  const fallbackSettings = {
-    ...settings,
-    apiKey: settings.fallbackApiKey,
-    baseUrl: settings.fallbackBaseUrl,
-    model: settings.fallbackModel,
-    reasoningEffort: 'none'
-  };
+  const fallbackSettings = buildFallbackSettings(settings);
 
   let mainErr: any = null;
   let fbErr: any = null;
@@ -526,15 +509,15 @@ async function raceMainAndFallback(
   }
 }
 
-async function handleTranslateBatch(texts: string[], settings: any, priority = 0, skipCache = false, strictMode = false) {
+/**
+ * 从 texts 批量提取缓存命中 + 待翻译子集。返回 results 已预填命中条目、
+ * 缺失索引数组用于后续 API 调用的 sub-batch 构造。
+ */
+async function batchCacheRead(texts: string[], settings: any, skipCache: boolean) {
   const hashes = texts.map(t => cacheKey(t, settings.targetLang, settings.model, settings.baseUrl));
-  // 质量重试路径（skipCache=true）绕过缓存读，避免刚刚写入的坏翻译把自己的重试吃掉。
-  // 依然会写入新结果，理想情况下坏翻译会被新翻译覆盖。
-  const cachedEntries = skipCache
-    ? new Array(texts.length).fill(null)
-    : await getCacheBatch(hashes);
+  const cachedEntries = skipCache ? new Array(texts.length).fill(null) : await getCacheBatch(hashes);
 
-  const results = new Array(texts.length).fill(null);
+  const results: (string | null)[] = new Array(texts.length).fill(null);
   const toTranslateIndices: number[] = [];
   const toTranslateTexts: string[] = [];
 
@@ -546,17 +529,46 @@ async function handleTranslateBatch(texts: string[], settings: any, priority = 0
       toTranslateTexts.push(texts[i]);
     }
   }
+  return { results, toTranslateIndices, toTranslateTexts };
+}
 
+/**
+ * 主 API 请求（含 RTT 采样）；shouldHedge 时走赛马路径。
+ * 返回统一形状 { translations, usage, winnerModel, winnerBaseUrl }。
+ */
+async function executeMain(
+  toTranslateTexts: string[],
+  settings: any,
+  abortSignal: AbortSignal,
+  strictMode: boolean,
+  priority: number,
+) {
+  const hedged = shouldHedge(settings, priority);
+  const mainMaxRetries = (isFallbackConfigured(settings) && !hedged) ? 0 : 3;
+  const mainT0 = performance.now();
+
+  if (hedged) {
+    return raceMainAndFallback(toTranslateTexts, settings, abortSignal, strictMode);
+  }
+  const r = await doTranslateBatchRequest(toTranslateTexts, settings, abortSignal, mainMaxRetries, strictMode);
+  recordMainRtt(performance.now() - mainT0);
+  return r;
+}
+
+async function handleTranslateBatch(texts: string[], settings: any, priority = 0, skipCache = false, strictMode = false) {
+  const { results, toTranslateIndices, toTranslateTexts } = await batchCacheRead(texts, settings, skipCache);
+
+  // 全命中：不占 rate limiter、不做 in-flight 登记
   if (toTranslateTexts.length === 0) {
     recordCacheHit(texts.length).catch(() => {});
     console.log('[Dualang] cache.hit.full', { count: texts.length, model: settings.model });
     return { translations: results, model: settings.model, baseUrl: settings.baseUrl, fromCache: true };
   }
-  // 部分命中也记录（命中数 = 总数 - 需翻译数）
   if (toTranslateTexts.length < texts.length) {
     recordCacheHit(texts.length - toTranslateTexts.length).catch(() => {});
   }
 
+  // in-flight 去重：同一批 texts 并发请求共享一个 promise
   const batchHash = cacheKey(toTranslateTexts.join('\n---BATCH---\n'), settings.targetLang, settings.model, settings.baseUrl);
   if (inFlight.has(batchHash)) {
     const apiResult = await inFlight.get(batchHash);
@@ -572,119 +584,54 @@ async function handleTranslateBatch(texts: string[], settings: any, priority = 0
     };
   }
 
-  const totalChars = toTranslateTexts.reduce((sum, t) => sum + t.length, 0);
-  const maxTokens = parseInt(settings.maxTokens, 10) || 4096;
-  const tokenEstimate = Math.ceil((totalChars + maxTokens * toTranslateTexts.length) / 3);
-  const registerTask = await rateLimiter.acquire(tokenEstimate, priority);
-
+  const registerTask = await rateLimiter.acquire(
+    estimateTokens(toTranslateTexts, settings.maxTokens),
+    priority,
+  );
   const abortController = new AbortController();
   const release = registerTask(priority, () => abortController.abort());
+  const startedAt = performance.now();
 
-  // hedged: 用户可见的请求（priority>=1）+ 已配置 fallback + 用户勾选并发赛跑
-  const shouldHedge = !!settings.hedgedRequestEnabled
-    && !!settings.fallbackEnabled
-    && !!settings.fallbackApiKey
-    && priority >= 1;
-  const fallbackConfigured = !!settings.fallbackEnabled && !!settings.fallbackApiKey;
-
-  // 如果用户已配置兜底且不是赛马模式：主只跑 1 次，失败立刻切兜底（不在主上浪费
-  // 3 次指数退避 ≈ 14s 的等待）。兜底自身保留默认 3 次重试预算。
-  const mainMaxRetries = (fallbackConfigured && !shouldHedge) ? 0 : 3;
-
-  // 非 hedged 路径也记录主 API 的 RTT，为未来自适应延迟提供样本
-  const mainT0 = performance.now();
-  const apiCall: Promise<{ translations: string[]; usage?: any; winnerModel?: string; winnerBaseUrl?: string }> = shouldHedge
-    ? raceMainAndFallback(toTranslateTexts, settings, abortController.signal, strictMode)
-    : doTranslateBatchRequest(toTranslateTexts, settings, abortController.signal, mainMaxRetries, strictMode).then(r => {
-        recordMainRtt(performance.now() - mainT0);
-        return r;
-      });
-
-  const flightPromise = apiCall
-    .then(async (apiResult) => {
-      const rtt = performance.now() - mainT0;
+  const flightPromise = executeMain(toTranslateTexts, settings, abortController.signal, strictMode, priority)
+    .then(async (apiResult: any) => {
+      const rtt = performance.now() - startedAt;
       const usedModel = apiResult.winnerModel || settings.model;
       const usedBaseUrl = apiResult.winnerBaseUrl || settings.baseUrl;
       recordRequest(usedModel, true, rtt, apiResult.usage).catch(() => {});
       console.log('[Dualang] translation.request.ok', {
         model: usedModel, rttMs: Math.round(rtt), tokens: apiResult.usage?.total_tokens, count: toTranslateTexts.length,
       });
-      for (let i = 0; i < toTranslateIndices.length; i++) {
-        const idx = toTranslateIndices[i];
-        const translated = apiResult.translations[i];
-        results[idx] = translated;
-        const hash = cacheKey(texts[idx], settings.targetLang, settings.model, settings.baseUrl);
-        await setCache(hash, { text: texts[idx], translated, lang: settings.targetLang, model: usedModel, ts: Date.now() });
-      }
+      await applyBatchResult(texts, toTranslateIndices, apiResult, results, settings, usedModel);
       return {
-        translations: results,
-        usage: apiResult.usage,
-        model: usedModel,
-        baseUrl: usedBaseUrl,
-        fromCache: false,
+        translations: results, usage: apiResult.usage,
+        model: usedModel, baseUrl: usedBaseUrl, fromCache: false,
       };
     })
     .catch(async (err: any) => {
-      const rtt = performance.now() - mainT0;
+      const rtt = performance.now() - startedAt;
       if (err.name === 'AbortError') {
         const e: any = new Error('请求被高优先级任务抢占，稍后重试');
         e.preempted = true;
         throw e;
       }
-      recordRequest(settings.model, false, rtt, undefined).catch(() => {});
+      recordRequest(settings.model, false, rtt).catch(() => {});
       recordError(settings.model, err.message || String(err)).catch(() => {});
       console.warn('[Dualang] translation.request.fail', {
         model: settings.model, rttMs: Math.round(rtt), error: err.message, retryable: err.retryable,
       });
-      // hedged 模式下主+兜底已并发尝试过，不再走"主失败→兜底"兜底分支
-      if (shouldHedge) throw err;
-      // 主失败（不论 retryable 还是 fatal）+ 已配置兜底 → 立刻切换
-      // 优先级：用兜底的第一次请求 > 在主上做 3 次退避重试
-      if (fallbackConfigured) {
-        console.log('[Dualang] fallback.activated', {
-          reason: err.message, retryable: !!err.retryable, to: settings.fallbackModel,
-        });
-        const fallbackSettings = {
-          ...settings,
-          apiKey: settings.fallbackApiKey,
-          baseUrl: settings.fallbackBaseUrl,
-          model: settings.fallbackModel,
-          reasoningEffort: 'none'
-        };
-        chrome.action.setBadgeText({ text: 'FB' }).catch(() => {});
-        chrome.action.setBadgeBackgroundColor({ color: '#f7a800' }).catch(() => {});
+      // hedged 模式下主+兜底已并发尝试过；非 hedged 且 fallback 已配置 → 立刻切换
+      // （不在主上浪费 3 次指数退避 ≈ 14s 的等待）
+      if (shouldHedge(settings, priority) || !isFallbackConfigured(settings)) throw err;
 
-        const fbT0 = performance.now();
-        const apiResult = await doTranslateBatchRequest(toTranslateTexts, fallbackSettings, null)
-          .then(r => {
-            recordRequest(fallbackSettings.model, true, performance.now() - fbT0, r.usage).catch(() => {});
-            console.log('[Dualang] translation.request.ok', {
-              model: fallbackSettings.model, rttMs: Math.round(performance.now() - fbT0),
-              tokens: r.usage?.total_tokens, via: 'fallback',
-            });
-            return r;
-          })
-          .catch(e => {
-            recordRequest(fallbackSettings.model, false, performance.now() - fbT0).catch(() => {});
-            recordError(fallbackSettings.model, e.message || String(e)).catch(() => {});
-            throw e;
-          });
-        for (let i = 0; i < toTranslateIndices.length; i++) {
-          const idx = toTranslateIndices[i];
-          const translated = apiResult.translations[i];
-          results[idx] = translated;
-          const hash = cacheKey(texts[idx], fallbackSettings.targetLang, fallbackSettings.model, fallbackSettings.baseUrl);
-          await setCache(hash, { text: texts[idx], translated, lang: fallbackSettings.targetLang, model: fallbackSettings.model, ts: Date.now() });
-        }
-        return {
-          translations: results,
-          usage: apiResult.usage,
-          model: fallbackSettings.model,
-          baseUrl: fallbackSettings.baseUrl,
-          fromCache: false,
-        };
-      }
-      throw err;
+      console.log('[Dualang] fallback.activated', {
+        reason: err.message, retryable: !!err.retryable, to: settings.fallbackModel,
+      });
+      const { apiResult, settings: fbSettings } = await runFallback(toTranslateTexts, settings);
+      await applyBatchResult(texts, toTranslateIndices, apiResult, results, fbSettings, fbSettings.model);
+      return {
+        translations: results, usage: apiResult.usage,
+        model: fbSettings.model, baseUrl: fbSettings.baseUrl, fromCache: false,
+      };
     })
     .finally(() => {
       release();
