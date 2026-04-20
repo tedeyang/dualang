@@ -1,7 +1,17 @@
 import { reportFatalError, clearErrorState } from './error-report';
-import { getProfile, resolveEndpoint, composeSystemPrompt, parseDelimitedBatch, LANG_DISPLAY, type ProviderProfile } from './profiles';
+import {
+  getProfile,
+  resolveEndpoint,
+  composeSystemPrompt,
+  parseDelimitedBatch,
+  parseDelimitedBatchWithDict,
+  buildBatchUserContent,
+  LANG_DISPLAY,
+  type ProviderProfile,
+} from './profiles';
 import { iterateSseDeltas } from './sse';
-import type { Settings, TokenUsage } from '../shared/types';
+import { filterHardCandidates } from './difficulty';
+import type { Settings, TokenUsage, DictionaryEntry } from '../shared/types';
 
 // ===================== 思考模式控制 =====================
 // 翻译任务不需要推理；关闭方式按 provider profile.thinkingControl 分发：
@@ -178,6 +188,82 @@ export async function doTranslateSingle(text: string, settings: Settings, signal
   return data;
 }
 
+export async function doAnnotateDictionary(
+  text: string,
+  settings: Settings,
+  candidates: string[],
+  signal?: AbortSignal,
+): Promise<{ entries: DictionaryEntry[] }> {
+  const profile = getProfile(settings);
+  const endpoint = resolveEndpoint(profile, settings.baseUrl || 'https://api.moonshot.cn/v1');
+  const targetLangDisplay = LANG_DISPLAY[settings.targetLang] || settings.targetLang;
+
+  // 到这里 candidates 应该已经被调用方用 filterHardCandidates 预筛过；
+  // doAnnotateDictionary 只负责把筛好的词拼 prompt 发给模型。
+  if (candidates.length === 0) return { entries: [] };
+  const candidateList = candidates.join(', ');
+
+  // level 用 GLM 金标校准的考试分级（docs/superpowers/reports/2026-04-20-glm-mixed-request-benchmark.md）
+  // 策略：候选已在本地难度阈值以上筛出；模型只做"打标签 + 给 IPA/释义"两件事，不再做筛选判断。
+  const systemPrompt =
+    `你是英文词汇助手。为给定的高难英文词（已经本地预筛）生成 IPA 音标 + ${targetLangDisplay}释义 + 难度级别。` +
+    `输出严格 JSON：{"entries":[{"term":"","ipa":"","gloss":"","level":"cet6|ielts|kaoyan"}]}。` +
+    `level 从 {cet6, ielts, kaoyan} 选 —— 六级 / 雅思 / 考研，按词的实际难度判断。` +
+    `gloss 用${targetLangDisplay}，简短（≤8 字），不要整句解释。` +
+    `候选词都应该收录；若某词确实不该注释可以省略。每个条目必须有 term 和（ipa 或 gloss）。`;
+
+  const body: any = {
+    model: settings.model || 'kimi-k2.5',
+    messages: [
+      { role: 'system', content: systemPrompt },
+      {
+        role: 'user',
+        content:
+          `TEXT:\n${text}\n\n` +
+          `CANDIDATES:\n${candidateList}\n\n` +
+          `只从 CANDIDATES 中选词；无合适词时返回 {"entries":[]}。`,
+      },
+    ],
+    temperature: 0.1,
+    stream: false,
+  };
+  applyThinkingMode(body, settings, profile);
+
+  const data = await callWithRetry(() => fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${settings.apiKey}` },
+    body: JSON.stringify(body),
+    signal
+  }).then(r => parseApiResponse(r, false)), 3, settings);
+
+  const raw = data?.choices?.[0]?.message?.content?.trim();
+  if (!raw) return { entries: [] };
+  const cleaned = stripMarkdownCode(raw);
+  try {
+    const parsed = JSON.parse(cleaned);
+    const list = Array.isArray(parsed) ? parsed : parsed?.entries;
+    if (!Array.isArray(list)) return { entries: [] };
+    const entries = list
+      .map((e: any) => {
+        const levelRaw = String(e?.level || '').toLowerCase().replace(/[^\w]/g, '');
+        const level = levelRaw === 'cet6' || levelRaw === 'ielts' || levelRaw === 'kaoyan'
+          ? (levelRaw as 'cet6' | 'ielts' | 'kaoyan')
+          : undefined;
+        const entry: DictionaryEntry = {
+          term: String(e?.term || '').trim(),
+          ipa: String(e?.ipa || '').trim(),
+          gloss: String(e?.gloss || '').trim(),
+        };
+        if (level) entry.level = level;
+        return entry;
+      })
+      .filter((e: DictionaryEntry) => !!e.term && (!!e.ipa || !!e.gloss));
+    return { entries };
+  } catch (_) {
+    return { entries: [] };
+  }
+}
+
 // ===================== 流式批量翻译（逐条推送）=====================
 
 export type OnStreamResult = (index: number, translated: string) => void;
@@ -193,7 +279,7 @@ export async function doTranslateBatchStream(
   signal: AbortSignal | null,
   onResult: OnStreamResult,
   strictMode = false,
-): Promise<{ translations: string[] }> {
+): Promise<{ translations: string[]; usage?: TokenUsage }> {
   const profile = getProfile(settings);
   const endpoint = resolveEndpoint(profile, settings.baseUrl || 'https://api.moonshot.cn/v1');
   const targetLangDisplay = LANG_DISPLAY[settings.targetLang] || settings.targetLang;
@@ -286,25 +372,71 @@ export async function doTranslateBatchStream(
   return { translations };
 }
 
+export interface BatchRequestOptions {
+  /** 需要字典融合的 index 集合（基于 texts 的 0-based 下标）。非空时启用 combined call。*/
+  smartDictIndices?: Set<number>;
+  /**
+   * 与 texts 对齐；每条的候选词列表（本地难度预筛后的高难词）。
+   * 结合 smartDictIndices 用 —— 模型被限定只能从这些候选里选词做字典。
+   * 候选为空 / null 的 index 虽在 smartDictIndices 里也不会打 "(dict)" 标（没词可选）。
+   */
+  perItemCandidates?: (string[] | null | undefined)[];
+}
+
+/**
+ * combined call 会话级熔断：某个 model 连续 3 次 combined parse 失败后，本会话不再尝试
+ * combined；让 content 的分离 annotateDictionary 路径兜底。Service Worker 重启即复位。
+ * 这避免了"每次请求都浪费一次 combined → 重试"的无谓 2x 成本。
+ */
+const combinedFailures = new Map<string, number>();
+const COMBINED_DISABLE_THRESHOLD = 3;
+function isCombinedDisabled(model: string | undefined): boolean {
+  return (combinedFailures.get(model || '') || 0) >= COMBINED_DISABLE_THRESHOLD;
+}
+function recordCombinedFailure(model: string | undefined): void {
+  const key = model || '';
+  combinedFailures.set(key, (combinedFailures.get(key) || 0) + 1);
+}
+function recordCombinedSuccess(model: string | undefined): void {
+  const key = model || '';
+  // 连续失败计数器：一次成功即清零（避免间歇性失败永久拉黑）
+  combinedFailures.delete(key);
+}
+
 export async function doTranslateBatchRequest(
   texts: string[],
   settings: Settings,
   signal: AbortSignal | null,
   maxRetries = 3,
   strictMode = false,
-) {
+  options: BatchRequestOptions = {},
+): Promise<{
+  translations: string[];
+  dictEntries?: (DictionaryEntry[] | null)[];
+  usage?: TokenUsage;
+}> {
   const profile = getProfile(settings);
   const endpoint = resolveEndpoint(profile, settings.baseUrl || 'https://api.moonshot.cn/v1');
   const targetLangDisplay = LANG_DISPLAY[settings.targetLang] || settings.targetLang;
 
-  // 单条 → 纯文本输出（零结构开销）；多条 → ===N=== 分隔符（小模型远比 JSON 可靠）
+  // 输出格式：纯文本 vs ===N=== 分隔符。
+  //   - 多条 batch：必须用分隔符（否则无法切分）
+  //   - 单条 + 字典融合：也用分隔符 —— 合并翻译 + 字典进一次 API，跳过独立 annotateDictionary
+  //     （X 滚动时 90%+ 的 sub-batch 是单条英文推文，以前 combined 基本不触发；现在每条都能用上）
+  //   - 单条无字典：纯文本最轻量
+  // 熔断：本会话该 model 连续 combined 失败 ≥ 阈值 → 强制关字典，由 content 分离字典 API 兜底。
   const isSingle = texts.length === 1;
+  const dictRequested = options.smartDictIndices && options.smartDictIndices.size > 0;
+  const dictIndices = dictRequested && !isCombinedDisabled(settings.model)
+    ? options.smartDictIndices
+    : undefined;
+  const useStructured = !isSingle || !!dictIndices;
   const systemPrompt = composeSystemPrompt(profile, targetLangDisplay, {
-    batch: !isSingle, strict: strictMode,
+    batch: useStructured, strict: strictMode, smartDict: !!dictIndices,
   });
-  const userContent = isSingle
-    ? texts[0]
-    : texts.map((t, i) => `===${i}===\n${t}`).join('\n\n');
+  const userContent = useStructured
+    ? buildBatchUserContent(texts, dictIndices, options.perItemCandidates)
+    : texts[0];
 
   const body: any = {
     model: settings.model || 'kimi-k2.5',
@@ -317,7 +449,10 @@ export async function doTranslateBatchRequest(
   };
 
   const mt = maxTokensForBatch(settings, texts);
-  if (mt !== undefined) body.max_tokens = mt;
+  if (mt !== undefined) {
+    // 字典融合会让输出变长（每条条目额外 ~30-60 tokens）；按字典条目数轻度放大
+    body.max_tokens = dictIndices ? Math.ceil(mt * 1.25) + dictIndices.size * 120 : mt;
+  }
   applyThinkingMode(body, settings, profile);
 
   const data = await callWithRetry(() => fetch(endpoint, {
@@ -330,9 +465,9 @@ export async function doTranslateBatchRequest(
   const raw = data.choices?.[0]?.message?.content?.trim();
   if (!raw) throw new Error('API 返回结果为空');
 
-  if (isSingle) {
+  // 单条无字典：纯文本解析，容错兼容模型忽略指令吐 JSON / 分隔符的情形
+  if (!useStructured) {
     const cleaned = stripMarkdownCode(raw);
-    // 通常是纯文本译文，但若模型忽略指令返回 JSON/分隔符（或 mock 测试如此），也兼容解析
     if (/^\s*[{[]/.test(cleaned) || /^===\s*\d+\s*===/m.test(cleaned)) {
       const fallback = parseDelimitedBatch(cleaned, 1);
       if (fallback[0]) return { translations: fallback, usage: data.usage };
@@ -340,7 +475,28 @@ export async function doTranslateBatchRequest(
     return { translations: [cleaned], usage: data.usage };
   }
 
-  // 多条：按 ===N=== 拆分
+  // 结构化路径：字典模式走带 ---DICT--- 的解析；否则用老的分隔符解析
+  if (dictIndices) {
+    const { translations, dictEntries } = parseDelimitedBatchWithDict(raw, texts.length);
+    const successCount = translations.filter((t) => t && t.length > 0).length;
+    if (successCount > 0) {
+      recordCombinedSuccess(settings.model);
+      return { translations, dictEntries, usage: data.usage };
+    }
+    // GLM-4-9B 等小模型偶尔被"===N=== (dict) + ---DICT---"的三层标记打懵 ——
+    // 输出退化为重复词 / 标记残缺（`===1 (dict)` 无结尾、`===D` 把 DICT 首字母当 index）。
+    // 重试一次但不带字典请求：丢字典，保住翻译主路径（比整批失败好）。
+    recordCombinedFailure(settings.model);
+    console.warn('[Dualang] combined call parse failed, retrying without smartDict', {
+      model: settings.model,
+      failures: combinedFailures.get(settings.model || ''),
+      rawPreview: raw.slice(0, 200),
+    });
+    const retried = await doTranslateBatchRequest(
+      texts, settings, signal, maxRetries, strictMode, { /* 去掉 smartDictIndices */ },
+    );
+    return retried;
+  }
   const translations = parseDelimitedBatch(raw, texts.length);
   const successCount = translations.filter((t) => t && t.length > 0).length;
   if (successCount === 0) {

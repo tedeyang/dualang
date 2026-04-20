@@ -21,6 +21,18 @@ export async function getMoonshotKey(): Promise<string> {
   return '';
 }
 
+/**
+ * 通过 provider 名读取 config.json 里的 apiKey（通用版）。
+ * 只在背景脚本里调用 —— content script 没有 config.json 的直接访问权限
+ * （web_accessible_resources 未声明；声明了反而会让任意 X 页面能拉取到 key）。
+ * Content 通过 chrome.runtime.sendMessage({ action: 'getProviderKey', provider }) 请求此接口。
+ */
+export async function getProviderKeyFromConfig(provider: string): Promise<string> {
+  if (!provider) return '';
+  const cfg = await loadLocalConfig();
+  return cfg?.providers?.[provider]?.apiKey || '';
+}
+
 let settingsCache: any = null;
 
 export function invalidateSettingsCache() {
@@ -45,6 +57,8 @@ export async function getSettings() {
     maxTokens: 4096,
     reasoningEffort: 'none',
     targetLang: 'zh-CN',
+    lineFusionEnabled: false,
+    smartDictEnabled: false,
     fallbackEnabled: false,
     fallbackBaseUrl: 'https://api.siliconflow.cn/v1',
     fallbackApiKey: defaultFallbackApiKey,

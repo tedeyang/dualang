@@ -4,10 +4,12 @@
 import { cacheKey, setCache } from './cache';
 import { doTranslateBatchRequest } from './api';
 import { recordRequest, recordError } from './stats';
-import type { Settings, TokenUsage } from '../shared/types';
+import type { Settings, TokenUsage, DictionaryEntry } from '../shared/types';
 
 export type BatchApiResult = {
   translations: string[];
+  /** 与 translations 对齐；combined call 返回，否则 undefined。*/
+  dictEntries?: (DictionaryEntry[] | null)[];
   usage?: TokenUsage;
 };
 
@@ -40,11 +42,22 @@ export async function applyBatchResult(
   results: (string | null)[],
   settings: Settings,
   cacheModel: string,
+  /**
+   * 可选：combined call 下的字典输出缓冲区，长度与 originalTexts 对齐。
+   * 只有 smartDictIndices 指定过的子集条目会被写入（三态：null / [] / [entries]）；
+   * 未指定的条目保持 undefined，由上游 content 决定是否发独立字典 API fallback。
+   */
+  dictOut?: (DictionaryEntry[] | null | undefined)[],
+  smartDictIndices?: Set<number>,
 ): Promise<void> {
   for (let i = 0; i < toTranslateIndices.length; i++) {
     const idx = toTranslateIndices[i];
     const translated = apiResult.translations[i];
     results[idx] = translated;
+    // 仅对 smartDictIndices 指定过的子集索引写 dictOut —— 保留 undefined = "not attempted"
+    if (dictOut && smartDictIndices?.has(i)) {
+      dictOut[idx] = apiResult.dictEntries?.[i] ?? null;
+    }
     const hash = cacheKey(originalTexts[idx], settings.targetLang, settings.model, settings.baseUrl);
     await setCache(hash, {
       text: originalTexts[idx],
@@ -65,6 +78,8 @@ export async function applyBatchResult(
 export async function runFallback(
   texts: string[],
   settings: Settings,
+  smartDictIndices?: Set<number>,
+  perItemCandidates?: (string[] | null | undefined)[],
 ): Promise<{ apiResult: BatchApiResult; settings: Settings }> {
   const fbSettings = buildFallbackSettings(settings);
   chrome.action.setBadgeText({ text: 'FB' }).catch(() => {});
@@ -72,7 +87,7 @@ export async function runFallback(
 
   const t0 = performance.now();
   try {
-    const apiResult = await doTranslateBatchRequest(texts, fbSettings, null);
+    const apiResult = await doTranslateBatchRequest(texts, fbSettings, null, 3, false, { smartDictIndices, perItemCandidates });
     const rtt = performance.now() - t0;
     recordRequest(fbSettings.model, true, rtt, apiResult.usage).catch(() => {});
     console.log('[Dualang] translation.request.ok', {

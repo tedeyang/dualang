@@ -23,6 +23,8 @@ export interface Settings {
   autoTranslate?: boolean;
   displayMode?: DisplayMode | null;
   bilingualMode?: boolean;   // legacy, migrated to displayMode
+  lineFusionEnabled?: boolean;
+  smartDictEnabled?: boolean;
   fallbackEnabled?: boolean;
   fallbackBaseUrl?: string;
   fallbackApiKey?: string;
@@ -35,11 +37,35 @@ export type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual'
 
 // ========== Content ↔ Background 消息契约 ==========
 
+/**
+ * 字典注释条目 —— 与 content/smart-dict.ts 的 DictEntry 同形。
+ * level 用中国学生熟悉的考试分级（bench 实测 GLM-4-9B 在 32 词金标集上 96.88% 准确）：
+ *   - cet6   六级
+ *   - ielts  雅思
+ *   - kaoyan 考研
+ * cet4（四级及以下常见词）一律不收 —— 字典注释只服务高难词。
+ */
+export type DictionaryLevel = 'cet6' | 'ielts' | 'kaoyan';
+export interface DictionaryEntry {
+  term: string;
+  ipa: string;
+  gloss: string;
+  level?: DictionaryLevel;
+}
+
 export interface TranslateBatchPayload {
   texts: string[];
   priority?: number;
   skipCache?: boolean;
   strictMode?: boolean;
+  /** 融合字典调用开关：需配合 englishFlags 才会真正产生字典条目 */
+  smartDict?: boolean;
+  /**
+   * 与 texts 对齐；true 表示该条是英文且需要字典。
+   * combined 调用在 user message 里给对应 ===N=== 打 "(dict)" 记号，让模型输出
+   * ---DICT--- 段落。content 已经做过语种识别，避免 background 重做。
+   */
+  englishFlags?: boolean[];
 }
 
 export interface TranslateSinglePayload {
@@ -70,6 +96,16 @@ export interface TokenUsage {
 /** 批量翻译返回 — translations 长度与请求 texts 一致；null 位表示未翻译（流式模式下）*/
 export interface TranslateBatchResult {
   translations: string[];
+  /**
+   * 与 translations 对齐的字典条目；三态语义用于避免 content fallback 的双重调用：
+   *   undefined   → combined 没 attempt 过这个 item（缓存命中 / 非英文 / 本地预筛 0 hard）
+   *                 → content 该发独立 annotateDictionary API
+   *   null        → combined attempt 了但模型没输出 ---DICT--- 段
+   *   []          → attempt 了，段存在但 0 条可解析条目
+   *   [entries]   → 正常字典返回
+   * content 只对 undefined 才发 fallback；其他都直接采用（可能空，但不再浪费一次 API）。
+   */
+  dictEntries?: (DictionaryEntry[] | null | undefined)[];
   usage?: TokenUsage;
   model?: string;
   baseUrl?: string;

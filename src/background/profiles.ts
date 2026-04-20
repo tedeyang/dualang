@@ -86,14 +86,136 @@ const STRICT_PREFIX = (lang: string) => `【严格模式必须遵守】
 
 `;
 
-/** 根据 profile + 是否批量 + 是否严格模式，组装最终的 system prompt */
+// Combined call（翻译 + 字典融合）：仅在 batch 里追加。user message 会给需要字典的
+// 条目在 "===N===" 后加 "(dict: word1 word2 ...)" 形式的候选词；模型按 ---DICT--- 段输出。
+//
+// level 用中国学生熟悉的考试分级（详见 docs/superpowers/reports/2026-04-20-glm-mixed-request-benchmark.md）：
+// GLM-4-9B 在 32 词金标集上 cet4/cet6/ielts/kaoyan 四分类 96.88% 准确。
+// 候选词已经在插件端用 Zipf + 音节 + 词长 本地预筛 —— 模型只需给 IPA / 释义 / level。
+const BATCH_DICT_SUFFIX = (lang: string) => `
+
+【字典融合】
+输入中标注 "===N=== (dict: w1 w2 w3)" 的条目需在译文后追加字典块；未标注的条目不要加字典块。
+括号里的词是预筛过的高难候选，字典条目只能从这些候选里选。
+
+字典块格式（四段式，竖线分隔）：
+
+===N=== (dict: w1 w2 w3)
+<译文>
+---DICT---
+原词|/IPA/|${lang}释义|level
+原词2|/IPA/|${lang}释义|level
+
+字典规则：
+1. 条目必须来自候选列表；候选外的词一律不要注释。
+2. level 从 {cet6, ielts, kaoyan} 选 —— 分别对应六级 / 雅思 / 考研。
+3. IPA 写国际音标，两头用斜线包裹；释义用${lang}，简短（≤8 字），不要整句解释。
+4. 若候选列表为空或确实都不需要注释，直接省略 ---DICT--- 段，不要写空段。
+5. 无 "(dict: ...)" 标记的条目一律不输出 ---DICT--- 段；多写会让解析失败。`;
+
+/** 根据 profile + 是否批量 + 是否严格模式 + 是否字典融合，组装最终的 system prompt */
 export function composeSystemPrompt(
   profile: ProviderProfile,
   lang: string,
-  opts: { batch: boolean; strict: boolean },
+  opts: { batch: boolean; strict: boolean; smartDict?: boolean },
 ): string {
   const base = opts.batch ? profile.systemPromptBatch(lang) : profile.systemPromptSingle(lang);
-  return opts.strict ? STRICT_PREFIX(lang) + base : base;
+  const dictSuffix = opts.batch && opts.smartDict ? BATCH_DICT_SUFFIX(lang) : '';
+  return (opts.strict ? STRICT_PREFIX(lang) : '') + base + dictSuffix;
+}
+
+import type { DictionaryEntry } from '../shared/types';
+
+/**
+ * 构造 batch 的 user message。每条前缀 "===N==="；当该 index 在 smartDictIndices 里，
+ * 若 perItemCandidates 为对应 index 提供了词列表，则附加 "(dict: w1 w2 w3)" 指示模型。
+ * 候选为空的索引不加 "(dict)" 标记 —— 模型不会误输出空 ---DICT--- 段。
+ */
+export function buildBatchUserContent(
+  texts: string[],
+  smartDictIndices?: Set<number>,
+  perItemCandidates?: (string[] | null | undefined)[],
+): string {
+  return texts
+    .map((t, i) => {
+      let mark = '';
+      if (smartDictIndices && smartDictIndices.has(i)) {
+        const candidates = perItemCandidates?.[i];
+        if (candidates && candidates.length > 0) {
+          mark = ` (dict: ${candidates.join(' ')})`;
+        }
+      }
+      return `===${i}===${mark}\n${t}`;
+    })
+    .join('\n\n');
+}
+
+/**
+ * 解析 combined 响应：同时抽取译文 + 字典。
+ * 每个 "===N===" chunk 内可能带 "---DICT---" 分隔；前段是译文，后段是每行一条的字典。
+ *
+ * 容错策略（GLM-4-9B 等小模型在多条 batch 下会偶发输出退化）：
+ *   - "===N===" 的结尾 === 允许缺失：`===1 (dict)` 也当 index=1 处理
+ *   - "(dict)" 记号可以有可以无、位置灵活
+ *   - "---DICT---" 分隔线允许 ≥ 2 连字号且大小写宽松
+ *   - 解析完全失败（0 条 hit）时回落到老的 parseDelimitedBatch（可能命中 JSON 回退）
+ */
+export function parseDelimitedBatchWithDict(
+  raw: string,
+  expectedCount: number,
+): { translations: string[]; dictEntries: (DictionaryEntry[] | null)[] } {
+  const translations = new Array<string>(expectedCount).fill('');
+  const dictEntries = new Array<DictionaryEntry[] | null>(expectedCount).fill(null);
+
+  // 宽松头部匹配：`={2,}` 开头、捕获 digit、允许任意 "(dict)" / 残缺 `===` 后缀
+  const parts = raw.split(/^={2,}\s*(\d+)\s*(?:={2,})?[^\n]*\n?/m);
+  let anyHit = false;
+  for (let i = 1; i < parts.length - 1; i += 2) {
+    const idx = parseInt(parts[i], 10);
+    if (!Number.isFinite(idx) || idx < 0 || idx >= expectedCount) continue;
+    const chunk = parts[i + 1] || '';
+
+    // DICT 分隔：前后至少 2 个连字号 + "DICT"（大小写宽松）
+    const dictSplit = chunk.split(/\n\s*-{2,}\s*DICT\s*-{2,}\s*\n?/i);
+    translations[idx] = (dictSplit[0] || '').replace(/\n{3,}$/, '').trim();
+    anyHit = true;
+
+    if (dictSplit.length > 1) {
+      const entries = parseDictLines(dictSplit.slice(1).join('\n'));
+      if (entries.length > 0) dictEntries[idx] = entries;
+    }
+  }
+  if (anyHit) return { translations, dictEntries };
+
+  // 回落：走老的非字典 JSON/分隔符解析（dictEntries 保持全 null）
+  return { translations: parseDelimitedBatch(raw, expectedCount), dictEntries };
+}
+
+function parseDictLines(body: string): DictionaryEntry[] {
+  const out: DictionaryEntry[] = [];
+  for (const raw of body.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    // 允许起始 bullet / 数字等噪声："- amazing | /ipa/ | 惊艳 | ielts" → 照常拆
+    const cleaned = line.replace(/^[\s\-*•·]+/, '');
+    const parts = cleaned.split('|').map((s) => s.trim());
+    if (parts.length < 2) continue;
+    const [term, ipa = '', gloss = '', levelRaw = ''] = parts;
+    if (!term) continue;
+    if (!ipa && !gloss) continue;
+    const level = normalizeDictLevel(levelRaw);
+    out.push(level ? { term, ipa, gloss, level } : { term, ipa, gloss });
+  }
+  return out;
+}
+
+/** 仅认可 cet6/ielts/kaoyan；其他（cet4/rare/advanced/空等）当未知处理。*/
+function normalizeDictLevel(s: string): 'cet6' | 'ielts' | 'kaoyan' | undefined {
+  const t = s.toLowerCase().replace(/[^\w]/g, '');
+  if (t === 'cet6') return 'cet6';
+  if (t === 'ielts') return 'ielts';
+  if (t === 'kaoyan') return 'kaoyan';
+  return undefined;
 }
 
 /**

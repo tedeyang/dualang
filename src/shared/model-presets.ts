@@ -16,6 +16,11 @@ export interface ModelPreset {
   /** provider 的 config.json 键（用于在 popup 加载时自动填 apiKey） */
   provider: 'moonshot' | 'siliconflow' | string;
   providerType: 'openai';
+  /**
+   * 若为 true，UI（popup 下拉 + 浮球模型列表）里不展示；但仍保留在数组中，
+   * 以便老用户 storage 里的 baseUrl/model 能被 detectPreset 反查到。
+   */
+  hidden?: boolean;
 }
 
 export const MODEL_PRESETS: ModelPreset[] = [
@@ -43,6 +48,8 @@ export const MODEL_PRESETS: ModelPreset[] = [
     provider: 'siliconflow',
     providerType: 'openai',
   },
+  // Kimi 官方（moonshot.cn）—— UI 隐藏，仅保留反查能力
+  // 付费 key 上手门槛高、普通用户更适合走 SiliconFlow 免费模型
   {
     key: 'moonshot-k2.5',
     displayName: 'Kimi k2.5',
@@ -50,6 +57,7 @@ export const MODEL_PRESETS: ModelPreset[] = [
     model: 'kimi-k2.5',
     provider: 'moonshot',
     providerType: 'openai',
+    hidden: true,
   },
   {
     key: 'moonshot-v1-8k',
@@ -58,8 +66,12 @@ export const MODEL_PRESETS: ModelPreset[] = [
     model: 'moonshot-v1-8k',
     provider: 'moonshot',
     providerType: 'openai',
+    hidden: true,
   },
 ];
+
+/** UI 可见的预设（popup 下拉、浮球模型列表均用这个）。*/
+export const VISIBLE_MODEL_PRESETS: ModelPreset[] = MODEL_PRESETS.filter((p) => !p.hidden);
 
 /** 按 baseUrl + model 反查 preset；找不到返回 undefined（用户自定义模型）*/
 export function detectPreset(baseUrl: string, model: string): ModelPreset | undefined {

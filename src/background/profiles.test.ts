@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { getProfile, resolveEndpoint, parseDelimitedBatch, composeSystemPrompt } from './profiles';
+import {
+  getProfile,
+  resolveEndpoint,
+  parseDelimitedBatch,
+  parseDelimitedBatchWithDict,
+  buildBatchUserContent,
+  composeSystemPrompt,
+} from './profiles';
 
 describe('getProfile', () => {
   it('Moonshot: baseUrl 命中', () => {
@@ -172,6 +179,104 @@ describe('parseDelimitedBatch', () => {
   });
 });
 
+describe('buildBatchUserContent', () => {
+  it('无 smartDictIndices → 普通 ===N=== 列表', () => {
+    const out = buildBatchUserContent(['a', 'b']);
+    expect(out).toBe('===0===\na\n\n===1===\nb');
+  });
+
+  it('smartDictIndices + perItemCandidates 非空 → "(dict: w1 w2)" 标注', () => {
+    const out = buildBatchUserContent(
+      ['english', '中文', 'slang'],
+      new Set([0, 2]),
+      [['mercurial', 'obscure'], null, ['lit']],
+    );
+    expect(out).toContain('===0=== (dict: mercurial obscure)\nenglish');
+    expect(out).toContain('===1===\n中文');
+    expect(out).toContain('===2=== (dict: lit)\nslang');
+  });
+
+  it('candidates 为空 / null 的索引即使在 smartDictIndices 里也不打 (dict) 标', () => {
+    const out = buildBatchUserContent(['x', 'y'], new Set([0, 1]), [[], null]);
+    expect(out).toContain('===0===\nx');
+    expect(out).toContain('===1===\ny');
+    expect(out).not.toContain('(dict');
+  });
+
+  it('不传 perItemCandidates 时也不打 (dict) 标（无候选不请求字典）', () => {
+    const out = buildBatchUserContent(['x'], new Set([0]));
+    expect(out).toBe('===0===\nx');
+  });
+});
+
+describe('parseDelimitedBatchWithDict', () => {
+  it('仅译文（无 ---DICT--- 段）→ translations 齐全，dictEntries 全 null', () => {
+    const raw = '===0===\n译文A\n\n===1===\n译文B';
+    const { translations, dictEntries } = parseDelimitedBatchWithDict(raw, 2);
+    expect(translations).toEqual(['译文A', '译文B']);
+    expect(dictEntries).toEqual([null, null]);
+  });
+
+  it('部分条目带 ---DICT---：对应索引返回条目（含 level）其他为 null', () => {
+    const raw =
+      '===0=== (dict)\n这是英文原文的译文。\n---DICT---\namazing|/əˈmeɪzɪŋ/|惊艳|cet6\nmercurial|/mɜːˈkjʊəriəl/|善变|ielts\n\n' +
+      '===1===\n这是中文原文不需要字典。';
+    const { translations, dictEntries } = parseDelimitedBatchWithDict(raw, 2);
+    expect(translations[0]).toBe('这是英文原文的译文。');
+    expect(translations[1]).toBe('这是中文原文不需要字典。');
+    expect(dictEntries[0]).toEqual([
+      { term: 'amazing', ipa: '/əˈmeɪzɪŋ/', gloss: '惊艳', level: 'cet6' },
+      { term: 'mercurial', ipa: '/mɜːˈkjʊəriəl/', gloss: '善变', level: 'ielts' },
+    ]);
+    expect(dictEntries[1]).toBeNull();
+  });
+
+  it('宽松分隔符：多个 - 号、前导 bullet 都能解析，含 level', () => {
+    const raw =
+      '===0=== (dict)\n译文\n----- DICT -----\n- obscure|/əbˈskjʊə/|晦涩|cet6\n* enigmatic|/ˌenɪɡˈmætɪk/|神秘|kaoyan';
+    const { translations, dictEntries } = parseDelimitedBatchWithDict(raw, 1);
+    expect(translations[0]).toBe('译文');
+    expect(dictEntries[0]).toEqual([
+      { term: 'obscure', ipa: '/əbˈskjʊə/', gloss: '晦涩', level: 'cet6' },
+      { term: 'enigmatic', ipa: '/ˌenɪɡˈmætɪk/', gloss: '神秘', level: 'kaoyan' },
+    ]);
+  });
+
+  it('缺 level 字段或 level 非法值时，level 字段被省略（不塞 undefined/cet4）', () => {
+    const raw =
+      '===0=== (dict)\n译文\n---DICT---\nok|/ok/|好的\nfoo|/fu:/|福|cet4\nbar|/bɑ:/|吧|unknown';
+    const { dictEntries } = parseDelimitedBatchWithDict(raw, 1);
+    expect(dictEntries[0]).toEqual([
+      { term: 'ok', ipa: '/ok/', gloss: '好的' },
+      { term: 'foo', ipa: '/fu:/', gloss: '福' },
+      { term: 'bar', ipa: '/bɑ:/', gloss: '吧' },
+    ]);
+  });
+
+  it('畸形字典行（缺字段/空行）安全跳过，不影响译文', () => {
+    const raw =
+      '===0=== (dict)\n译文\n---DICT---\nbroken\n|only pipes|\nok|/ok/|好的|ielts\n';
+    const { translations, dictEntries } = parseDelimitedBatchWithDict(raw, 1);
+    expect(translations[0]).toBe('译文');
+    expect(dictEntries[0]).toEqual([{ term: 'ok', ipa: '/ok/', gloss: '好的', level: 'ielts' }]);
+  });
+
+  it('完全没分隔符时回落到老的 parseDelimitedBatch（dictEntries 全 null）', () => {
+    const raw = '{"results":[{"index":0,"translated":"A"}]}';
+    const { translations, dictEntries } = parseDelimitedBatchWithDict(raw, 1);
+    expect(translations).toEqual(['A']);
+    expect(dictEntries).toEqual([null]);
+  });
+
+  it('结尾 === 缺失（`===1 (dict)`）时也能提取 index（小模型退化兜底）', () => {
+    const raw = '===1 (dict)\n第二条译文。\n\n===2===\n第三条译文。';
+    const { translations } = parseDelimitedBatchWithDict(raw, 3);
+    expect(translations[0]).toBe('');
+    expect(translations[1]).toBe('第二条译文。');
+    expect(translations[2]).toBe('第三条译文。');
+  });
+});
+
 describe('composeSystemPrompt', () => {
   const p = getProfile({ model: 'kimi-k2.5' });
 
@@ -198,5 +303,22 @@ describe('composeSystemPrompt', () => {
     const got = composeSystemPrompt(p, '简体中文', { batch: false, strict: true });
     expect(got.startsWith('【严格模式必须遵守】')).toBe(true);
     expect(got).not.toContain('===N===');
+  });
+
+  it('批量 + smartDict → 附加字典融合说明，含 cet6/ielts/kaoyan 分级指令 + 候选列表语义', () => {
+    const got = composeSystemPrompt(p, '简体中文', { batch: true, strict: false, smartDict: true });
+    expect(got).toContain('===N===');
+    expect(got).toContain('---DICT---');
+    // 新版 user message 形如 "===0=== (dict: w1 w2)"，prompt 说明里用 "(dict:" 前缀描述
+    expect(got).toContain('(dict:');
+    expect(got).toContain('候选');
+    expect(got).toContain('cet6');
+    expect(got).toContain('ielts');
+    expect(got).toContain('kaoyan');
+  });
+
+  it('单条 + smartDict 不添加字典说明（字典仅在 batch 路径）', () => {
+    const got = composeSystemPrompt(p, '简体中文', { batch: false, strict: false, smartDict: true });
+    expect(got).not.toContain('---DICT---');
   });
 });
