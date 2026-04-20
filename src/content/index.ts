@@ -39,7 +39,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
   // TweetArticle 只是 Element 的别名，保留供 JSDoc / 可读性
   type TweetArticle = Element;
 
-  const processedTweets = new WeakSet();
+  let processedTweets = new WeakSet();
   const pendingQueue: TweetArticle[] = [];
   const pendingQueueSet = new Set<Element>();
   const translatingSet = new Set<Element>();
@@ -256,23 +256,97 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
   }
 
   // ========== 开关 & 设置变更监听 ==========
-  chrome.runtime.onMessage.addListener((request: any, _sender, _sendResponse) => {
-    if (request.action === 'toggle') {
-      enabled = request.enabled;
-      console.log('[Dualang] toggled, enabled=', enabled);
-      if (enabled) {
-        scanAndQueue(document.body);
-        if (autoTranslate) flushQueue();
-      }
+
+  /**
+   * 关闭翻译时：清理所有已注入的 UI（译文卡、状态点、手动按钮、CSS mode 属性），
+   * 停清待处理队列和 in-flight 追踪集合，让原文完整恢复。
+   * 不清 translationCache —— 再次开启时可秒回显已翻译的内容。
+   */
+  function disableAndReset(): void {
+    // 清 UI
+    for (const el of Array.from(document.querySelectorAll('.dualang-translation'))) el.remove();
+    for (const el of Array.from(document.querySelectorAll('.dualang-status'))) el.remove();
+    for (const el of Array.from(document.querySelectorAll('.dualang-btn'))) el.remove();
+    for (const el of Array.from(document.querySelectorAll('[data-dualang-mode]'))) {
+      el.removeAttribute('data-dualang-mode');
     }
+    // 清队列/跟踪集合
+    pendingQueue.length = 0;
+    pendingQueueSet.clear();
+    translatingSet.clear();
+    // processedTweets 是 WeakSet —— 清不掉，保留也无所谓：
+    // 重新 enable 时 scanAndQueue 会先 processedTweets.has() 跳过这些 article；
+    // 为保证 re-enable 能重新注入 UI，这里无法直接清 WeakSet —— 改由 enable 时
+    // 创建新的 WeakSet。但 processedTweets 是 const；改成 let 以便重置。
+  }
+
+  /**
+   * 开启翻译时：重新扫全页面 + 触发 flush。
+   * processedTweets 已在 disableAndReset 被换新（见 applyEnabledChange）。
+   */
+  function enableAndScan(): void {
+    scanAndQueue(document.body);
+    if (autoTranslate) scheduler.request();
+  }
+
+  function applyEnabledChange(nextEnabled: boolean): void {
+    if (enabled === nextEnabled) return;
+    enabled = nextEnabled;
+    if (!enabled) {
+      disableAndReset();
+    } else {
+      // 换 processedTweets 让 scanAndQueue 重新注入 UI
+      processedTweets = new WeakSet();
+      enableAndScan();
+    }
+    logBiz('toggle', { enabled });
+  }
+
+  /**
+   * displayMode 切换时对已翻译的 article 即时重渲染：
+   * 遍历所有挂了 .dualang-translation 的 article → 从 translationCache 按 contentId
+   * 取回译文 → 清旧 card → 调 renderTranslationLocal 按新 mode 渲染。
+   * 找不到 cache（缓存超 30min TTL 或 translationCache 被 GC）的直接跳过，下次重翻即可。
+   */
+  function reRenderAllForModeChange(): void {
+    const articles = Array.from(document.querySelectorAll('article[data-dualang-mode], article .dualang-translation'));
+    // 去重到 article 本身（可能匹配到嵌套 translation 元素）
+    const roots = new Set<Element>();
+    for (const el of articles) {
+      const art = (el as Element).closest?.('article[data-testid="tweet"]') || el;
+      if (art instanceof Element) roots.add(art);
+    }
+    let reRendered = 0;
+    for (const article of roots) {
+      const contentId = getContentId(article);
+      const entry = contentId ? translationCache.get(contentId) : undefined;
+      if (!entry) continue;
+      const tweetTextEl = findTweetTextEl(article);
+      if (!tweetTextEl) continue;
+      article.querySelector('.dualang-translation')?.remove();
+      article.removeAttribute('data-dualang-mode');
+      renderTranslationLocal(article, tweetTextEl, entry.translated, entry.original);
+      reRendered++;
+    }
+    logBiz('rerender.onModeChange', { articles: roots.size, reRendered, mode: displayMode });
+  }
+
+  chrome.runtime.onMessage.addListener((request: any, _sender, _sendResponse) => {
+    // 右键菜单发来的 toggle（向后兼容）
+    if (request.action === 'toggle') applyEnabledChange(!!request.enabled);
     return false;
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'sync') return;
-    if (changes.targetLang)                  targetLang     = changes.targetLang.newValue    || 'zh-CN';
+    if (changes.enabled !== undefined)        applyEnabledChange(changes.enabled.newValue !== false);
+    if (changes.targetLang)                   targetLang     = changes.targetLang.newValue    || 'zh-CN';
     if (changes.autoTranslate !== undefined)  autoTranslate  = changes.autoTranslate.newValue !== false;
-    if (changes.displayMode !== undefined)    displayMode    = normalizeDisplayMode(changes.displayMode.newValue, false);
+    if (changes.displayMode !== undefined) {
+      const prev = displayMode;
+      displayMode = normalizeDisplayMode(changes.displayMode.newValue, false);
+      if (prev !== displayMode && enabled) reRenderAllForModeChange();
+    }
     if (changes.enableStreaming !== undefined) enableStreaming = !!changes.enableStreaming.newValue;
     if (changes.providerType !== undefined) {
       const v = changes.providerType.newValue;
@@ -280,6 +354,8 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       // 切换 provider 时，清空浏览器本地 session 缓存
       destroyBrowserSession();
     }
+    // baseUrl / model / apiKey 变化：content 侧不需要做什么；background 的
+    // settingsCache 已通过同一 onChanged 失效，下次请求即用新 provider
   });
 
   // ========== 两层 IntersectionObserver ==========
