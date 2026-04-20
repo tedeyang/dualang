@@ -4,7 +4,7 @@ import * as bubble from './super-fine-bubble';
 import { renderInlineSlots, fillSlot, clearInlineSlots } from './super-fine-render';
 import {
   BATCH_SIZE, SUB_BATCH_SIZE, MAX_CONCURRENT,
-  TRANSLATION_CACHE_MAX,
+  TRANSLATION_CACHE_MAX, TRANSLATION_CACHE_TTL_MS,
   SCHEDULER_URGENT_DELAY_MS, SCHEDULER_IDLE_DELAY_MS, SCHEDULER_MAX_AGGREGATE_MS,
   SHOW_MORE_STABLE_MS,
   REQUEST_TIMEOUT_MS, LONG_CHUNK_TIMEOUT_MS, STREAM_TIMEOUT_MS, SUPER_FINE_TIMEOUT_MS,
@@ -46,8 +46,36 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
 
   // 按内容 ID 缓存翻译结果（不依赖 DOM 引用，虚拟 DOM 回收后可恢复）
   // 同时记录模型信息，以便 scanAndQueue 恢复时也能显示品牌图标
-  type TranslationCacheEntry = { translated: string; original: string; model?: string; baseUrl?: string };
-  const translationCache = new Map<string, TranslationCacheEntry>();
+  type TranslationCacheEntry = { translated: string; original: string; model?: string; baseUrl?: string; ts: number };
+  /**
+   * LRU + TTL 两道淘汰：
+   *   - 容量上限：触顶时淘汰最旧插入项（Map 自然保留插入序）
+   *   - TTL：get 命中但超龄视为 miss 并删除，长会话里老译文不会永远占位
+   * set 本身不会回写 ts；每次 set 都是新鲜的。
+   */
+  const translationCache = {
+    _map: new Map<string, TranslationCacheEntry>(),
+    get(key: string): TranslationCacheEntry | undefined {
+      const entry = this._map.get(key);
+      if (!entry) return undefined;
+      if (Date.now() - entry.ts > TRANSLATION_CACHE_TTL_MS) {
+        this._map.delete(key);
+        return undefined;
+      }
+      return entry;
+    },
+    has(key: string): boolean {
+      return this.get(key) !== undefined;
+    },
+    set(key: string, value: Omit<TranslationCacheEntry, 'ts'>) {
+      this._map.set(key, { ...value, ts: Date.now() });
+      if (this._map.size > TRANSLATION_CACHE_MAX) {
+        const firstKey = this._map.keys().next().value!;
+        this._map.delete(firstKey);
+      }
+    },
+    delete(key: string) { this._map.delete(key); },
+  };
   let viewportObserver = null;
   let preloadObserver = null;
   let activeRequests = 0;
@@ -252,7 +280,12 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
   // 长文专用路径：把 text 按 \n\n 切成 N 段，5 段一 chunk 串行送 API，
   // 全部完成后 join('\n\n') 作为单段译文返回，外部调用方看不出是分多次请求完成的。
   // 串行：避免一次性占满 MAX_CONCURRENT 与 background rate limiter，让整体稳定可控。
-  // 超时：单 chunk 60s（比普通请求 30s 宽），因为 5 段 ~4k 字符输入时 GLM-4-9B 偶尔需要更久。
+  //
+  // 通过 translate-stream port（不是 sendMessage）发起：
+  //   - 超时 / content 页面切走时调 port.disconnect()
+  //   - background 的 handleTranslateStream 监听 onDisconnect → AbortController.abort()
+  //     → 中途的 fetch 立即取消，释放 rate-limiter 配额；避免 sendMessage 版本
+  //     里超时后 background 仍跑完整个 chunk 的浪费
   async function requestTranslationChunked(
     text: string, priority: number, skipCache: boolean, strictMode: boolean,
   ): Promise<ResponseData> {
@@ -261,26 +294,15 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     let totalTokens = 0;
     let meta: { model?: string; baseUrl?: string } = {};
     const chunkSize = 5;
+
     for (let i = 0; i < paragraphs.length; i += chunkSize) {
       const chunkTexts = paragraphs.slice(i, i + chunkSize);
-      const response: any = await Promise.race([
-        chrome.runtime.sendMessage({
-          action: 'translate',
-          payload: { texts: chunkTexts, priority, skipCache, strictMode },
-        }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error(`长文 chunk 翻译超时 (${LONG_CHUNK_TIMEOUT_MS / 1000}s)`)), LONG_CHUNK_TIMEOUT_MS)),
-      ]);
-      if (!response?.success) {
-        const e: any = new Error(response?.error || `长文 chunk @${i} 失败`);
-        e.retryable = response?.retryable !== false;
-        throw e;
+      const chunkResult = await requestChunkViaPort(chunkTexts, priority, i, skipCache, strictMode);
+      for (let k = 0; k < chunkResult.translations.length; k++) {
+        translations[i + k] = chunkResult.translations[k];
       }
-      const data = response.data;
-      for (let k = 0; k < (data.translations || []).length; k++) {
-        translations[i + k] = data.translations[k];
-      }
-      totalTokens += data.usage?.total_tokens || 0;
-      meta = { model: data.model, baseUrl: data.baseUrl };
+      totalTokens += chunkResult.totalTokens;
+      meta = { model: chunkResult.model, baseUrl: chunkResult.baseUrl };
     }
     return {
       translations: [translations.join('\n\n')],
@@ -289,6 +311,72 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       baseUrl: meta.baseUrl,
       fromCache: false,
     };
+  }
+
+  type ChunkResult = { translations: string[]; totalTokens: number; model?: string; baseUrl?: string };
+
+  function requestChunkViaPort(
+    chunkTexts: string[], priority: number, chunkOffset: number,
+    skipCache: boolean, strictMode: boolean,
+  ): Promise<ChunkResult> {
+    return new Promise<ChunkResult>((resolve, reject) => {
+      const port = chrome.runtime.connect(undefined, { name: 'translate-stream' });
+      const out: string[] = new Array(chunkTexts.length).fill('');
+      let settled = false;
+      let chunkModel: string | undefined;
+      let chunkBaseUrl: string | undefined;
+
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try { port.disconnect(); } catch (_) {}
+        reject(new Error(`长文 chunk @${chunkOffset} 翻译超时 (${LONG_CHUNK_TIMEOUT_MS / 1000}s)`));
+      }, LONG_CHUNK_TIMEOUT_MS);
+
+      port.onMessage.addListener((msg) => {
+        if (settled) return;
+        if (msg.action === 'partial') {
+          if (typeof msg.index === 'number' && msg.index >= 0 && msg.index < out.length && msg.translated) {
+            out[msg.index] = msg.translated;
+            if (msg.model) chunkModel = msg.model;
+            if (msg.baseUrl) chunkBaseUrl = msg.baseUrl;
+          }
+        } else if (msg.action === 'done') {
+          settled = true;
+          clearTimeout(timeout);
+          // `done` 捎带一个完整 translations 数组 —— 覆写 partial 收集的结果以确保完整性
+          const finalTranslations = Array.isArray(msg.translations)
+            ? msg.translations.map((t: any, i: number) => t || out[i])
+            : out;
+          resolve({
+            translations: finalTranslations,
+            totalTokens: 0,  // translate-stream 不上报 usage（缓存命中也算 0），不影响外层统计
+            model: msg.model || chunkModel,
+            baseUrl: msg.baseUrl || chunkBaseUrl,
+          });
+          try { port.disconnect(); } catch (_) {}
+        } else if (msg.action === 'error') {
+          settled = true;
+          clearTimeout(timeout);
+          const e: any = new Error(msg.error || `长文 chunk @${chunkOffset} 失败`);
+          e.retryable = msg.retryable !== false;
+          reject(e);
+          try { port.disconnect(); } catch (_) {}
+        }
+      });
+
+      port.onDisconnect.addListener(() => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(new Error(`长文 chunk @${chunkOffset} 连接断开`));
+      });
+
+      port.postMessage({
+        action: 'translate',
+        payload: { texts: chunkTexts, priority, skipCache, strictMode },
+      });
+    });
   }
 
   async function requestTranslation(
@@ -461,7 +549,6 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
   // 含免责声明。检测后我们给卡片打 data-dualang-grok="true"，body 段落打
   // data-dualang-text="true"，之后就能复用 tweet 的翻译管线（只需把 tweetText 查询
   // 改成同时支持两种标记）。
-  const GROK_DISCLAIMER_MARKER = 'This story is a summary of posts on X';
 
   function findTweetTextEl(container: Element): Element | null {
     // 三种文本容器都识别：
@@ -577,18 +664,42 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     });
   }
 
+  /**
+   * Grok 摘要卡识别：没有 testid/role/aria，只能结构 + 语义两类信号组合。
+   * 早期纯靠结构指纹（4 个 DIV 子 + 含 time + 免责声明前缀），X.com 改一次 DOM 就挂。
+   * 现在把识别拆成多个独立信号，按置信度计分通过：
+   *   - 必选：disclaimer 短语（多语言）——这是卡的本质特征，改版也大概率保留
+   *   - 辅助：结构（4 个 div 子）、<time> 存在、容器 aria-label 提示
+   * 只要 disclaimer 命中且至少一个辅助信号命中就认；即使未来 X.com 把 4 个 div
+   * 变成 3 个或加了 SVG 图标节点，只要免责声明还在就不至于完全识别失败。
+   */
+  // 多语言免责声明开头（所有已知 locale）；通过 startsWith 容忍后续文案变化
+  const GROK_DISCLAIMER_PREFIXES = [
+    'This story is a summary of posts on X',  // en
+    '此新闻是 X 上帖子的摘要',                   // zh-CN
+    '此新聞是 X 上貼文的摘要',                   // zh-TW
+  ];
+
+  function hasGrokDisclaimer(el: Element): boolean {
+    const text = (el.textContent || '').trim();
+    return GROK_DISCLAIMER_PREFIXES.some((p) => text.startsWith(p));
+  }
+
   function isGrokCardContainer(el: Element): boolean {
     if (!(el instanceof Element)) return false;
-    if (el.children.length !== 4) return false;
-    // 排除页面级 4-子容器（BUTTON / HEADER / MAIN 等）：Grok 卡内部 4 个孩子都是 DIV
-    for (const c of Array.from(el.children)) {
-      if (c.tagName !== 'DIV') return false;
-    }
-    if (!el.querySelector('time')) return false;
-    // 免责声明应该是 children[3] 的首字符串；如果是包含 Grok 卡的祖先，children[3]
-    // 是更大的块（含其他内容），textContent 开头不会是免责声明。
-    const lastChildText = (el.children[3]?.textContent || '').trim();
-    return lastChildText.startsWith(GROK_DISCLAIMER_MARKER);
+    // 必选：最后一个子节点的文本以 disclaimer 开头（子树包含 disclaimer 不够 ——
+    // Grok 卡的祖先会把整段文字拢进 textContent 但 disclaimer 不在其子首）
+    const lastChild = el.children[el.children.length - 1];
+    if (!lastChild || !hasGrokDisclaimer(lastChild)) return false;
+
+    // 至少命中一个辅助信号，排除偶发的包含 disclaimer 文本的无关容器
+    let signals = 0;
+    if (el.children.length === 4) signals++;
+    if (el.querySelector('time')) signals++;
+    // aria-label / role 上的提示（X.com 未来加上就能命中，加不上也不关键）
+    const aria = el.getAttribute('aria-label') || '';
+    if (/grok|trending|热点|趨勢/i.test(aria)) signals++;
+    return signals >= 1;
   }
 
   // 在一棵子树里发现所有未处理的 Grok 卡片，打上标记后返回。
@@ -732,7 +843,8 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
           if (node.nodeType !== Node.ELEMENT_NODE) continue;
           const el = node as Element;
           const hasTweet = el.matches?.('article[data-testid="tweet"]') || el.querySelector?.('article[data-testid="tweet"]');
-          const hasGrokMarker = (el.textContent || '').includes(GROK_DISCLAIMER_MARKER);
+          const text = el.textContent || '';
+          const hasGrokMarker = GROK_DISCLAIMER_PREFIXES.some((p) => text.includes(p));
           if (hasTweet || hasGrokMarker) {
             pendingScanRoots.add(el);
           }
@@ -781,9 +893,9 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       if (tweetTextEl) art._dualangLastText = tweetTextEl.textContent || '';
 
       // 虚拟 DOM 回收后重现：尝试从内容 ID 缓存恢复翻译
-      if (contentId && translationCache.has(contentId) && !article.querySelector('.dualang-translation')) {
-        const cached = translationCache.get(contentId)!;
-        if (tweetTextEl) {
+      if (contentId && !article.querySelector('.dualang-translation')) {
+        const cached = translationCache.get(contentId);
+        if (cached && tweetTextEl) {
           // 精确匹配原文：内容 ID 是稳定的但内容可能被编辑/扩展/更新，
           // 只有 extractText 输出与缓存完全一致时才信任缓存。
           // 任何差异（编辑 / show-more 展开 / 截断→全文 / 引号空格变化）都作废缓存条目，
@@ -1209,10 +1321,6 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
         translated, original: text,
         model: meta?.model, baseUrl: meta?.baseUrl,
       });
-      if (translationCache.size > TRANSLATION_CACHE_MAX) {
-        const firstKey = translationCache.keys().next().value!;
-        translationCache.delete(firstKey);
-      }
     }
 
     if (suspicious) {
@@ -1293,10 +1401,6 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
           translated, original: text,
           model: response.data.model, baseUrl: response.data.baseUrl,
         });
-        if (translationCache.size > TRANSLATION_CACHE_MAX) {
-          const firstKey = translationCache.keys().next().value!;
-          translationCache.delete(firstKey);
-        }
       }
 
       if (suspicious) {

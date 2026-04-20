@@ -205,8 +205,11 @@ async function handleTranslateStream(payload: any, port: chrome.runtime.Port) {
       return;
     }
 
+    // skipCache=true（质量重试）时跳过缓存读，避免刚落盘的坏翻译把自己的重试吞掉
+    const skipCache = !!payload.skipCache;
+    const strictMode = !!payload.strictMode;
     const hashes = texts.map(t => cacheKey(t, settings.targetLang, settings.model, settings.baseUrl));
-    const cachedEntries = await getCacheBatch(hashes);
+    const cachedEntries = skipCache ? new Array(texts.length).fill(null) : await getCacheBatch(hashes);
 
     const results = new Array(texts.length).fill(null);
     const toTranslateIndices: number[] = [];
@@ -260,7 +263,8 @@ async function handleTranslateStream(payload: any, port: chrome.runtime.Port) {
           // 写缓存
           const hash = cacheKey(texts[originalIndex], settings.targetLang, settings.model, settings.baseUrl);
           setCache(hash, { text: texts[originalIndex], translated, lang: settings.targetLang, model: settings.model, ts: Date.now() }).catch(() => {});
-        }
+        },
+        strictMode,
       );
 
       // 补全流式未推送的条目

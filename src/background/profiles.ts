@@ -166,21 +166,14 @@ const QWEN3_PROFILE: ProviderProfile = {
   systemPromptBatch: BATCH_PROMPT,
 };
 
-// Qwen2.5 及更早：
-//   - 无 thinking 参数（误传 enable_thinking 会 400 或诱发 "on on on" 退化循环）
-//   - 温度敏感：实测 T=0.3 在 280+ 字符输入上约 30% 概率陷入退化循环，4422 token 爆 max_tokens；
-//     T=0.7/1.0 更不稳定。T=0.1 是唯一能稳定处理长文本的温度（bench v2 实测）。
-//     并且 T=0.1 也减少短文本的数字类错误（如 "2028 年"→"208 年"）。
-//   - 流式输出偶发乱码（输出里出现 U+FFFD / `�`）：SiliconFlow 上的 Qwen2.5-7B 在 CJK
-//     翻译中有小概率在 SSE 分片边界切断多字节 UTF-8 字符，服务端下发时已带 `�`。
-//     禁用 streaming 强制走 `response.json()` 整包解码，这个问题消失。
+// Qwen2.5 / Qwen1.5 / 无版本号 Qwen；ADR: docs/decisions/qwen-legacy-temperature.md
 const QWEN_LEGACY_PROFILE: ProviderProfile = {
   id: 'qwen-legacy',
-  matchModel: /qwen/i,  // 排序放在 QWEN3 之后，先匹配 qwen3，兜住 qwen2.5 / qwen1.5 / Pro/Qwen 等
+  matchModel: /qwen/i,  // 顺序敏感：QWEN3 之后匹配，见 profiles.test.ts
   endpointPath: '/chat/completions',
-  temperature: () => 0.1,  // 从 0.3 降到 0.1：bench v2 实测稳定门槛
+  temperature: () => 0.1,
   thinkingControl: 'omit',
-  supportsStreaming: false,  // 流式下发偶发 `�` 乱码，禁用
+  supportsStreaming: false,
   systemPromptSingle: SINGLE_PROMPT,
   systemPromptBatch: BATCH_PROMPT,
 };
@@ -196,10 +189,8 @@ const GLM46_PROFILE: ProviderProfile = {
   systemPromptBatch: BATCH_PROMPT,
 };
 
-// GLM-4-9B / 4-32B / 4-Plus 等非 4.6 系列（z.ai 原生、SiliconFlow 托管）：
-// 和 Qwen 同类问题 —— 流式输出偶发 `�` + 字符复读（"， ， ，" / "就 不 就不应该"），
-// 服务端在 SSE 分片边界切了 CJK 字符。禁流式后整包下发消失。
-// 顺序敏感：必须在 GLM46 之后，否则会把 GLM-4.6 也吞掉。
+// GLM-4-9B / 4-32B / 4-Plus 非 4.6 系列；ADR: docs/decisions/glm-legacy-streaming.md
+// 顺序敏感：GLM46 之后匹配，见 profiles.test.ts
 const GLM_LEGACY_PROFILE: ProviderProfile = {
   id: 'glm-legacy',
   matchModel: /glm-4/i,

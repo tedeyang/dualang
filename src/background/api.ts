@@ -1,5 +1,6 @@
 import { reportFatalError, clearErrorState } from './error-report';
 import { getProfile, resolveEndpoint, composeSystemPrompt, parseDelimitedBatch, LANG_DISPLAY, type ProviderProfile } from './profiles';
+import { iterateSseDeltas } from './sse';
 
 // ===================== 思考模式控制 =====================
 // 翻译任务不需要推理；关闭方式按 provider profile.thinkingControl 分发：
@@ -138,44 +139,8 @@ export async function callWithRetry(fn: () => Promise<any>, maxRetries = 3, sett
 // ===================== 流式解析 =====================
 
 async function parseStream(response: Response) {
-  const reader = response.body!.getReader();
-  const decoder = new TextDecoder('utf-8');
-  let buffer = '';
   let result = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop()!;
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('data:')) continue;
-      const data = trimmed.slice(5).trim();
-      if (data === '[DONE]') continue;
-      try {
-        const json = JSON.parse(data);
-        const delta = json.choices?.[0]?.delta?.content;
-        if (delta) result += delta;
-      } catch (e) {}
-    }
-  }
-
-  // 流结束后 flush decoder 的内部字节缓冲，避免最后一个多字节字符残留成 `�`
-  buffer += decoder.decode();
-
-  if (buffer.trim().startsWith('data:')) {
-    const data = buffer.trim().slice(5).trim();
-    if (data && data !== '[DONE]') {
-      try {
-        const json = JSON.parse(data);
-        const delta = json.choices?.[0]?.delta?.content;
-        if (delta) result += delta;
-      } catch (e) {}
-    }
-  }
-
+  for await (const delta of iterateSseDeltas(response)) result += delta;
   return result.trim();
 }
 
@@ -264,9 +229,6 @@ export async function doTranslateBatchStream(
     return r;
   }), 3, settings) as Response;
 
-  const reader = response.body!.getReader();
-  const decoder = new TextDecoder('utf-8');
-  let sseBuffer = '';
   let accumulated = '';
   const emittedIndices = new Set<number>();
 
@@ -295,41 +257,9 @@ export async function doTranslateBatchStream(
     }
   }
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    sseBuffer += decoder.decode(value, { stream: true });
-    const lines = sseBuffer.split('\n');
-    sseBuffer = lines.pop()!;
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('data:')) continue;
-      const data = trimmed.slice(5).trim();
-      if (data === '[DONE]') continue;
-      try {
-        const json = JSON.parse(data);
-        const delta = json.choices?.[0]?.delta?.content;
-        if (delta) {
-          accumulated += delta;
-          tryEmitCompleted();
-        }
-      } catch (_) {}
-    }
-  }
-
-  // 流结束后 flush decoder 的内部字节缓冲，避免最后一个多字节字符残留成 `�`
-  sseBuffer += decoder.decode();
-
-  // SSE buffer 残留
-  if (sseBuffer.trim().startsWith('data:')) {
-    const data = sseBuffer.trim().slice(5).trim();
-    if (data && data !== '[DONE]') {
-      try {
-        const json = JSON.parse(data);
-        const delta = json.choices?.[0]?.delta?.content;
-        if (delta) accumulated += delta;
-      } catch (_) {}
-    }
+  for await (const delta of iterateSseDeltas(response)) {
+    accumulated += delta;
+    tryEmitCompleted();
   }
 
   // 终局解析：单条纯文本 or 分隔符切分
