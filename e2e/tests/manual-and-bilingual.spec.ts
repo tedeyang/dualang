@@ -88,6 +88,8 @@ async function saveDisplayMode(popupPage: any, mode: 'append' | 'translation-onl
   await popupPage.locator('#maxTokens').fill('4096');
   await popupPage.locator('#targetLang').selectOption('zh-CN');
   await popupPage.locator('#autoTranslate').evaluate((el: HTMLInputElement) => { el.checked = true; });
+  await popupPage.locator('#lineFusionEnabled').evaluate((el: HTMLInputElement) => { el.checked = false; });
+  await popupPage.locator('#smartDictEnabled').evaluate((el: HTMLInputElement) => { el.checked = false; });
   await popupPage.locator('#displayMode').selectOption(mode);
   await popupPage.locator('#saveBtn').click();
   await expect(popupPage.locator('#status')).toHaveText('设置已保存');
@@ -187,5 +189,169 @@ test.describe('Display Mode: 持久化与迁移', () => {
     });
     await popupPage.reload();
     await expect(popupPage.locator('#displayMode')).toHaveValue('inline');
+  });
+});
+
+// 智能字典路由：区分 system prompt 里是"英文阅读词汇助手"的字典请求 vs 普通翻译
+async function setupDictApi(
+  context: any,
+  opts: { entries?: Array<{ term: string; ipa: string; gloss: string; level?: 'cet6' | 'ielts' | 'kaoyan' }>; failDict?: boolean; translated?: string } = {},
+) {
+  const translated = opts.translated ?? '火星将会令人惊叹。';
+  const entries = opts.entries ?? [{ term: 'amazing', ipa: '/əˈmeɪzɪŋ/', gloss: '惊艳', level: 'cet6' as const }];
+  await context.route('https://api.moonshot.cn/v1/chat/completions', async (route: any) => {
+    const body = JSON.parse(route.request().postData() || '{}');
+    const system = body?.messages?.[0]?.content || '';
+    if (String(system).includes('英文阅读词汇助手')) {
+      if (opts.failDict) {
+        await route.fulfill({
+          status: 500,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: { message: 'simulated dict failure', type: 'server_error' } }),
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ choices: [{ message: { content: JSON.stringify({ entries }) } }] }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ results: [{ index: 0, translated }] }) } }]
+      }),
+    });
+  });
+}
+
+test.describe('Enhancements: line fusion + smart dictionary', () => {
+  test('bilingual + 逐行融合：多行原文渲染 line-fusion pair 并隐藏 tweetText', async ({ popupPage, context }) => {
+    await saveDisplayMode(popupPage, 'bilingual');
+    await popupPage.locator('#lineFusionEnabled').evaluate((el: HTMLInputElement) => { el.checked = true; });
+    await popupPage.locator('#saveBtn').click();
+    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+
+    await setupApi(context, '第一行译文。\n第二行译文。');
+    const page = await context.newPage();
+    await page.goto(mockPagePath);
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    await expect(page.locator('#tweet-1 .dualang-line-fusion-pair').first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('#tweet-1[data-dualang-line-fusion="true"]')).toHaveCount(1);
+    await page.close();
+  });
+
+  test('append + 逐行融合：pair 内含原文行（不再是孤立分隔线）', async ({ popupPage, context }) => {
+    await saveDisplayMode(popupPage, 'append');
+    await popupPage.locator('#lineFusionEnabled').evaluate((el: HTMLInputElement) => { el.checked = true; });
+    await popupPage.locator('#saveBtn').click();
+    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+
+    await setupApi(context, '第一行译文。\n第二行译文。');
+    const page = await context.newPage();
+    await page.goto(mockPagePath);
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    // pair 里必须同时有原文行和译文行 —— append 之前的 bug 是只渲染译文+分隔线
+    const pairs = page.locator('#tweet-1 .dualang-line-fusion-pair');
+    await expect(pairs.first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('#tweet-1 .dualang-line-fusion-orig').first()).toBeVisible();
+    await expect(page.locator('#tweet-1 .dualang-line-fusion-trans').first()).toBeVisible();
+    // fusion 激活后 tweetText 必须隐藏（否则原文重复）
+    await expect(page.locator('#tweet-1 [data-testid="tweetText"]')).toBeHidden();
+    await page.close();
+  });
+
+  test('单行原文不触发逐行融合', async ({ popupPage, context }) => {
+    await saveDisplayMode(popupPage, 'append');
+    await popupPage.locator('#lineFusionEnabled').evaluate((el: HTMLInputElement) => { el.checked = true; });
+    await popupPage.locator('#saveBtn').click();
+    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+
+    await setupApi(context, '紧凑模式单行翻译。');
+    const page = await context.newPage();
+    await page.goto(mockPagePath);
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    // tweet-3 是单行英文
+    await expect(page.locator('#tweet-3 .dualang-translation')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('#tweet-3 .dualang-line-fusion-pair')).toHaveCount(0);
+    await expect(page.locator('#tweet-3[data-dualang-line-fusion]')).toHaveCount(0);
+    await page.close();
+  });
+
+  test('智能字典：英文原文在 append 模式下出现【音标 释义】注释（真实 DOM span）', async ({ popupPage, context }) => {
+    await saveDisplayMode(popupPage, 'append');
+    await popupPage.locator('#smartDictEnabled').evaluate((el: HTMLInputElement) => { el.checked = true; });
+    await popupPage.locator('#saveBtn').click();
+    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+
+    await setupDictApi(context);
+    const page = await context.newPage();
+    await page.goto(mockPagePath);
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await expect(page.locator('#tweet-1 .dualang-translation')).toBeVisible({ timeout: 5000 });
+    const defSpan = page.locator('#tweet-1 [data-testid="tweetText"] .dualang-dict-term .dualang-dict-def').first();
+    await expect(defSpan).toBeVisible({ timeout: 5000 });
+    // 格式：【释义 /ipa/】 —— 译文在前，IPA 在后；不再显示 level 徽章
+    await expect(defSpan).toHaveText('【惊艳 /əˈmeɪzɪŋ/】');
+    // level 仍持久化到 data-level，便于未来扩展，但不影响文本渲染
+    await expect(defSpan).toHaveAttribute('data-level', 'cet6');
+    await page.close();
+  });
+
+  test('translation-only 模式下跳过字典注释（原文被隐藏）', async ({ popupPage, context }) => {
+    await saveDisplayMode(popupPage, 'translation-only');
+    await popupPage.locator('#smartDictEnabled').evaluate((el: HTMLInputElement) => { el.checked = true; });
+    await popupPage.locator('#saveBtn').click();
+    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+
+    await setupDictApi(context);
+    const page = await context.newPage();
+    await page.goto(mockPagePath);
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await expect(page.locator('#tweet-1 .dualang-translation')).toBeVisible({ timeout: 5000 });
+    // 等够时间，确认字典 span 始终不出现
+    await page.waitForTimeout(800);
+    await expect(page.locator('#tweet-1 .dualang-dict-term')).toHaveCount(0);
+    await page.close();
+  });
+
+  test('中文原文不触发字典（非英文短路）', async ({ popupPage, context }) => {
+    await saveDisplayMode(popupPage, 'append');
+    await popupPage.locator('#smartDictEnabled').evaluate((el: HTMLInputElement) => { el.checked = true; });
+    await popupPage.locator('#saveBtn').click();
+    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+
+    await setupDictApi(context);
+    const page = await context.newPage();
+    await page.goto(mockPagePath);
+    await page.setViewportSize({ width: 1280, height: 800 });
+    // tweet-4 是简体中文 —— 扩展识别后被跳过翻译；dict 同样短路
+    await page.waitForTimeout(1500);
+    await expect(page.locator('#tweet-4 .dualang-dict-term')).toHaveCount(0);
+    await page.close();
+  });
+
+  test('字典 API 失败不影响主翻译（译文卡仍正常渲染）', async ({ popupPage, context }) => {
+    await saveDisplayMode(popupPage, 'append');
+    await popupPage.locator('#smartDictEnabled').evaluate((el: HTMLInputElement) => { el.checked = true; });
+    await popupPage.locator('#saveBtn').click();
+    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+
+    await setupDictApi(context, { failDict: true });
+    const page = await context.newPage();
+    await page.goto(mockPagePath);
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await expect(page.locator('#tweet-1 .dualang-translation')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('#tweet-1 .dualang-translation')).toContainText('火星将会令人惊叹');
+    // 等字典请求确实跑完
+    await page.waitForTimeout(800);
+    await expect(page.locator('#tweet-1 .dualang-dict-term')).toHaveCount(0);
+    await page.close();
   });
 });
