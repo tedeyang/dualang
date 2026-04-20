@@ -32,14 +32,32 @@ article[data-dualang-mode="bilingual"] [data-testid="tweetText"] {
   display: none;
 }
 
-/* 对照模式下的译文配色：
- * 用偏冷一点的浅色（#c5ccd3，luminance 约 80%），相比原文的纯白（#e7e9ea）
- * 有微妙色温差异可辨识"这是译文"，同时避免过暗影响阅读。
- * 旧值 #8b98a5 太暗（luminance ~60%），已被用户反馈难读。
+/* ===== 对照模式下的强调权重 =====
+ * 对照有两种风格：
+ *   - append（强调原文）：原文 X 原生白，译文稍暗降低权重
+ *   - bilingual（强调译文）：原文稍暗降低权重，译文 X 原生白
+ * inline（段落对照）不在"强调"体系内：两者都保留次要色，段落对应就是主视觉信号。
+ *
+ * 色阶：主 #e7e9ea（X 原生白）/ 次 #8899a6（中灰，luminance ~60%）。
+ * 之前 bilingual 用 #c5ccd3 相对原文只有一档差异，现在改成两档分明的"强调 vs 非强调"。
  */
-.dualang-inline .dualang-inline-pair .dualang-para,
-.dualang-bilingual .dualang-para {
+
+/* inline 段落对照：两行都保留次要色（不分强调）*/
+.dualang-inline .dualang-inline-pair .dualang-para {
   color: #c5ccd3;
+}
+
+/* append 强调原文：译文变暗 */
+article[data-dualang-mode="append"] .dualang-translation .dualang-para {
+  color: #8899a6;
+}
+
+/* bilingual 强调译文：原文变暗、译文保持原生白 */
+.dualang-bilingual .dualang-original-html {
+  color: #8899a6;
+}
+.dualang-bilingual .dualang-para {
+  color: #e7e9ea;
 }
 
 /* ===== 段落对照模式（inline）===== */
@@ -51,11 +69,23 @@ article[data-dualang-mode="bilingual"] [data-testid="tweetText"] {
   margin-top: 4px;  /* pair 内：原文段落与对应译文间保持紧凑 */
 }
 
-/* ===== 整体对照模式（bilingual）===== */
+/* ===== 原文和译文之间的分割线 =====
+ * 两种强调模式都展示 —— 视觉上把原文和译文明确分成两块。
+ *   - bilingual 模式：线在克隆原文块下边缘（card 内部）
+ *   - append 模式：线在 .dualang-translation card 顶部（tweetTextEl 是 X 自己的元素，
+ *     不碰它的 padding；用 card 的上边框达到同样的视觉效果）
+ *
+ * 颜色 #2f3336 与 X 自己的分割线一致。
+ */
 .dualang-bilingual .dualang-original-html {
   margin-bottom: 12px;
   padding-bottom: 12px;
   border-bottom: 1px solid #2f3336;
+}
+article[data-dualang-mode="append"] .dualang-translation {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #2f3336;
 }
 
 /* ===== 手动翻译按钮 ===== */
