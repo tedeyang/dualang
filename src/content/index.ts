@@ -1,4 +1,4 @@
-import { shouldSkipContent, isAlreadyTargetLanguage, extractText, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, rebuildParagraphs, splitParagraphsByDom, splitIntoParagraphs, extractAnchoredBlocks, isLongText, isLongRichElement } from './utils';
+import { shouldSkipContent, isAlreadyTargetLanguage, extractText, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, isVerbatimReturn, rebuildParagraphs, splitParagraphsByDom, splitIntoParagraphs, extractAnchoredBlocks, isLongText, isLongRichElement } from './utils';
 import { getModelMeta } from '../shared/model-meta';
 import * as bubble from './super-fine-bubble';
 import { renderInlineSlots, fillSlot, clearInlineSlots } from './super-fine-render';
@@ -8,6 +8,7 @@ import { normalizeDisplayMode, type DisplayMode } from './display-mode';
 import { requestTranslationChunked } from './long-article-chunked';
 import { findAndPrepareGrokCards, GROK_DISCLAIMER_PREFIXES } from './grok-card';
 import { renderTranslation } from './render';
+import { isLikelyEnglishText, extractDictionaryCandidates, applyDictionaryAnnotations, clearDictionaryAnnotations, type DictEntry } from './smart-dict';
 import {
   BATCH_SIZE, SUB_BATCH_SIZE, MAX_CONCURRENT,
   TRANSLATION_CACHE_MAX, TRANSLATION_CACHE_TTL_MS,
@@ -31,6 +32,8 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
   let targetLang = 'zh-CN';
   let autoTranslate = true;
   let displayMode: DisplayMode = 'append';
+  let lineFusionEnabled = false;
+  let smartDictEnabled = false;
   let enableStreaming = false;
 
   // Article 级别的状态通过 WeakMap<Element, ArticleState> 管理（见 article-state.ts）
@@ -73,6 +76,41 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       }
     },
     delete(key: string) { this._map.delete(key); },
+  };
+  type DictCacheEntry = { entries: DictEntry[]; ts: number };
+  // 与 translationCache 同结构：TTL 过期 + 超出 MAX 时淘汰最旧（Map 迭代顺序即插入顺序）。
+  // 之前无上限 —— 长会话滚动会无声地把 Map 撑到数万条。
+  const dictCache = {
+    _map: new Map<string, DictCacheEntry>(),
+    key(contentId: string, originalText: string): string {
+      return `${contentId}|${originalText}`;
+    },
+    get(key: string): DictCacheEntry | undefined {
+      const entry = this._map.get(key);
+      if (!entry) return undefined;
+      if (Date.now() - entry.ts > TRANSLATION_CACHE_TTL_MS) {
+        this._map.delete(key);
+        return undefined;
+      }
+      // LRU touch：命中后重新插入，保持最近使用在末尾
+      this._map.delete(key);
+      this._map.set(key, entry);
+      return entry;
+    },
+    set(key: string, entries: DictEntry[]) {
+      if (this._map.has(key)) this._map.delete(key);
+      this._map.set(key, { entries, ts: Date.now() });
+      if (this._map.size > TRANSLATION_CACHE_MAX) {
+        const firstKey = this._map.keys().next().value!;
+        this._map.delete(firstKey);
+      }
+    },
+    dropByContentId(contentId: string) {
+      const prefix = `${contentId}|`;
+      for (const k of this._map.keys()) {
+        if (k.startsWith(prefix)) this._map.delete(k);
+      }
+    },
   };
   let viewportObserver = null;
   let preloadObserver = null;
@@ -165,6 +203,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     model?: string;
     baseUrl?: string;
     fromCache?: boolean;
+    dictEntries?: (DictEntry[] | null)[];
   };
 
   async function requestTranslation(
@@ -178,10 +217,19 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     if (texts.length === 1 && isLongText(texts[0])) {
       return requestTranslationChunked(texts[0], priority, skipCache, strictMode);
     }
+    // Combined call：字典开关开且非 translation-only 时，对每条英文文本请求字典融合。
+    // 非英文条目置 false，background 在 prompt 里就不标 "(dict)" —— 模型不会白算字典。
+    const englishFlags = smartDictEnabled && displayMode !== 'translation-only'
+      ? texts.map((t) => isLikelyEnglishText(t))
+      : undefined;
     const response: any = await Promise.race([
       chrome.runtime.sendMessage({
         action: 'translate',
-        payload: { texts, priority, skipCache, strictMode },
+        payload: {
+          texts, priority, skipCache, strictMode,
+          smartDict: !!englishFlags && englishFlags.some(Boolean),
+          englishFlags,
+        },
       }),
       new Promise((_, reject) => setTimeout(() => reject(new Error(`翻译请求超时 (${REQUEST_TIMEOUT_MS / 1000}s)`)), REQUEST_TIMEOUT_MS)),
     ]);
@@ -217,6 +265,8 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       autoTranslate: true,
       displayMode: null,  // null 哨兵：未设时根据老 bilingualMode 迁移
       bilingualMode: false,
+      lineFusionEnabled: false,
+      smartDictEnabled: false,
       enableStreaming: false,
     });
     enabled         = settings.enabled;
@@ -224,9 +274,11 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     autoTranslate   = settings.autoTranslate !== false;
     // 迁移：老用户 displayMode 未设，根据 bilingualMode 推导；bilingualMode=true → 'inline'（升级到段落对照）
     displayMode     = normalizeDisplayMode(settings.displayMode, settings.bilingualMode);
+    lineFusionEnabled = !!settings.lineFusionEnabled;
+    smartDictEnabled = !!settings.smartDictEnabled;
     enableStreaming  = !!settings.enableStreaming;
     perfLog('init', {
-      enabled, targetLang, autoTranslate, displayMode,
+      enabled, targetLang, autoTranslate, displayMode, lineFusionEnabled, smartDictEnabled,
       initCostMs: (performance.now() - t0).toFixed(2)
     });
     ensureBgPort();
@@ -261,6 +313,13 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     for (const el of Array.from(document.querySelectorAll('.dualang-btn'))) el.remove();
     for (const el of Array.from(document.querySelectorAll('[data-dualang-mode]'))) {
       el.removeAttribute('data-dualang-mode');
+    }
+    for (const el of Array.from(document.querySelectorAll('[data-dualang-line-fusion]'))) {
+      el.removeAttribute('data-dualang-line-fusion');
+    }
+    for (const el of Array.from(document.querySelectorAll('.dualang-dict-term'))) {
+      const term = el as HTMLElement;
+      term.replaceWith(document.createTextNode(term.textContent || ''));
     }
     // 清队列/跟踪集合
     pendingQueue.length = 0;
@@ -317,10 +376,163 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       if (!tweetTextEl) continue;
       article.querySelector('.dualang-translation')?.remove();
       article.removeAttribute('data-dualang-mode');
+      article.removeAttribute('data-dualang-line-fusion');
       renderTranslationLocal(article, tweetTextEl, entry.translated, entry.original);
+      if (smartDictEnabled) {
+        void maybeApplySmartDictionary(article, tweetTextEl, entry.original, contentId || undefined);
+      } else {
+        clearDictWithBaseline(article, tweetTextEl);
+      }
       reRendered++;
     }
     logBiz('rerender.onModeChange', { articles: roots.size, reRendered, mode: displayMode });
+  }
+
+  /**
+   * 根据当前 displayMode 决定字典 span 要注入到哪些 DOM 元素。
+   *   - append:          tweetTextEl 可见 → 直接注入
+   *   - translation-only: 原文被隐藏，用户看不到英文原词 → 不注字典
+   *   - inline / bilingual / lineFusion: tweetTextEl 被 CSS 隐藏，用户看到的是 card 里
+   *     的 `.dualang-original-html` 克隆块 → 注入到克隆才可见
+   * 返回空数组表示该 mode 不展示字典。
+   */
+  function dictTargetEls(article: Element, fallback: Element): Element[] {
+    if (displayMode === 'translation-only') return [];
+    if (displayMode === 'append') return [fallback];
+    const clones = Array.from(article.querySelectorAll<HTMLElement>(
+      '.dualang-translation .dualang-original-html'
+    ));
+    // card 尚未渲染时退回到 fallback（稀有边界：应用字典早于渲染）
+    return clones.length > 0 ? clones : [fallback];
+  }
+
+  /**
+   * 给字典操作包一层基线同步：每次 apply/clear 后把 ensureState(article).lastText
+   * 更新为当前 tweetText 文本。否则下一轮 MutationObserver 比较 currentText vs lastText
+   * 时会看到字典 span 带来的 `【ipa gloss】` 差异，误判为 show-more 触发重翻循环。
+   *
+   * 同时在 apply 时先清掉所有候选位置（tweetText + 所有克隆块）的残留 span ——
+   * mode 切换后旧位置可能有遗留。
+   */
+  function applyDictWithBaseline(article: Element, fallback: Element, entries: DictEntry[]): void {
+    // 清残留：旧 mode 下打过字典 → 切到新 mode → 老位置的 span 得先扫干净
+    clearDictionaryAnnotations(fallback);
+    article.querySelectorAll<HTMLElement>('.dualang-translation .dualang-original-html')
+      .forEach((el) => clearDictionaryAnnotations(el));
+    article.querySelectorAll<HTMLElement>('.dualang-line-fusion-orig')
+      .forEach((el) => clearDictionaryAnnotations(el));
+    // 按当前 mode 决定目标，注入
+    const targets = dictTargetEls(article, fallback);
+    for (const t of targets) applyDictionaryAnnotations(t, entries);
+    ensureState(article as TweetArticle).lastText = fallback.textContent || '';
+  }
+
+  function clearDictWithBaseline(article: Element, fallback: Element): void {
+    // clear 通吃：tweetText + 所有克隆块 + lineFusion 原文行都清一遍（防 mode 切换后残留）
+    clearDictionaryAnnotations(fallback);
+    article.querySelectorAll<HTMLElement>('.dualang-translation .dualang-original-html')
+      .forEach((el) => clearDictionaryAnnotations(el));
+    article.querySelectorAll<HTMLElement>('.dualang-line-fusion-orig')
+      .forEach((el) => clearDictionaryAnnotations(el));
+    ensureState(article as TweetArticle).lastText = fallback.textContent || '';
+  }
+
+  function normalizeDictionaryEntries(raw: any): DictEntry[] {
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map((e: any) => ({
+        term: String(e?.term || '').trim(),
+        ipa: String(e?.ipa || '').trim(),
+        gloss: String(e?.gloss || '').trim(),
+        level: e?.level,
+      }))
+      .filter((e: DictEntry) => !!e.term && (!!e.ipa || !!e.gloss));
+  }
+
+  async function maybeApplySmartDictionary(
+    article: Element,
+    tweetTextEl: Element,
+    originalText: string,
+    contentId?: string,
+  ): Promise<void> {
+    if (!smartDictEnabled || displayMode === 'translation-only') {
+      clearDictWithBaseline(article, tweetTextEl);
+      return;
+    }
+    if (!isLikelyEnglishText(originalText)) {
+      clearDictWithBaseline(article, tweetTextEl);
+      return;
+    }
+
+    const stableContentId = contentId || getContentId(article) || '';
+    if (!stableContentId) return;
+    const key = dictCache.key(stableContentId, originalText);
+    const cached = dictCache.get(key);
+    if (cached) {
+      applyDictWithBaseline(article, tweetTextEl, cached.entries);
+      return;
+    }
+
+    const candidates = extractDictionaryCandidates(originalText);
+    if (candidates.length === 0) {
+      logBiz('dict.skip.noCandidates', { textLen: originalText.length });
+      return;
+    }
+
+    try {
+      const resp: any = await chrome.runtime.sendMessage({
+        action: 'annotateDictionary',
+        payload: {
+          text: originalText,
+          targetLang,
+          candidates,
+          contentId: stableContentId,
+        },
+      });
+      if (!resp?.success) {
+        logBiz('dict.response.fail', { error: resp?.error }, 'warn');
+        return;
+      }
+      const entries = normalizeDictionaryEntries(resp?.data?.entries);
+      logBiz('dict.response.ok', {
+        candidates: candidates.length, entries: entries.length,
+      });
+      if (entries.length === 0) return;
+      dictCache.set(key, entries);
+      if (contentId) {
+        const cur = getContentId(article);
+        if (cur && cur !== contentId) return;
+      }
+      applyDictWithBaseline(article, tweetTextEl, entries);
+    } catch (err: any) {
+      // 字典失败静默降级，不影响主翻译链路 —— 但记一笔方便排查
+      logBiz('dict.request.err', { error: err?.message }, 'warn');
+    }
+  }
+
+  /**
+   * 字典开关 toggle 的快速通路：只在已渲染的 article 上加/移字典 span；
+   * 不重建译文 card，也不广播字典 API 请求（只在缓存命中时还原注释）。
+   */
+  function toggleDictionaryAcrossVisible(on: boolean): void {
+    const articles = Array.from(document.querySelectorAll<Element>('article[data-dualang-mode]'));
+    for (const article of articles) {
+      const tweetTextEl = findTweetTextEl(article);
+      if (!tweetTextEl) continue;
+      if (!on) {
+        clearDictWithBaseline(article, tweetTextEl);
+        continue;
+      }
+      // 仅在 cache 命中时注释；cache miss 下不发 API —— 避免 toggle 瞬时放大 N 条请求。
+      // 新 article 会在后续翻译完成时正常走 maybeApplySmartDictionary 的 API 路径。
+      const contentId = getContentId(article);
+      if (!contentId) continue;
+      const entry = translationCache.get(contentId);
+      if (!entry) continue;
+      if (!isLikelyEnglishText(entry.original)) continue;
+      const cached = dictCache.get(dictCache.key(contentId, entry.original));
+      if (cached) applyDictWithBaseline(article, tweetTextEl, cached.entries);
+    }
   }
 
   chrome.runtime.onMessage.addListener((request: any, _sender, _sendResponse) => {
@@ -338,6 +550,19 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       const prev = displayMode;
       displayMode = normalizeDisplayMode(changes.displayMode.newValue, false);
       if (prev !== displayMode && enabled) reRenderAllForModeChange();
+    }
+    if (changes.lineFusionEnabled !== undefined) {
+      const prev = lineFusionEnabled;
+      lineFusionEnabled = !!changes.lineFusionEnabled.newValue;
+      if (prev !== lineFusionEnabled && enabled) reRenderAllForModeChange();
+    }
+    if (changes.smartDictEnabled !== undefined) {
+      const prev = smartDictEnabled;
+      smartDictEnabled = !!changes.smartDictEnabled.newValue;
+      // 切换字典不需要重建译文 card —— 只在已有的原文里加/移 span 即可。
+      // reRenderAllForModeChange 会重渲染每张 card 并对每条缓存的译文重新发字典请求，
+      // 一次 toggle 可能同时发几十条 API 请求；span-only 快速通路避开这类放大。
+      if (prev !== smartDictEnabled && enabled) toggleDictionaryAcrossVisible(smartDictEnabled);
     }
     if (changes.enableStreaming !== undefined) enableStreaming = !!changes.enableStreaming.newValue;
     // baseUrl / model / apiKey 变化：content 侧不需要做什么；background 的
@@ -547,7 +772,11 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
 
     // 真正的 Show more / 文本变化：立即翻译
     telemetry.inc("showMoreDetected");
-    if (currentContentId) translationCache.delete(currentContentId);
+    if (currentContentId) {
+      translationCache.delete(currentContentId);
+      dictCache.dropByContentId(currentContentId);
+    }
+    clearDictWithBaseline(article, tweetTextEl);
     perfLog('showMore', {
       contentId: currentContentId,
       prevLen: getState(article)?.lastText?.length,
@@ -579,6 +808,13 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       const articlesCheckedThisFlush = new Set<Element>();
 
       for (const mutation of mutations) {
+        // 忽略我们自己注入的字典 span 产生的 mutation —— 否则 applyDictionaryAnnotations
+        // 会把所属 article 标为"文本变化"并触发 show-more 重翻循环
+        if (mutation.target && (mutation.target as Element).nodeType === Node.ELEMENT_NODE) {
+          const target = mutation.target as Element;
+          if (target.closest?.('.dualang-dict-term') || target.closest?.('.dualang-dict-def')) continue;
+        }
+
         // 任何涉及 article 子树的 mutation 都可能是 show-more/recycle
         // 通过 target 或 addedNodes 溯源到所属 article
         const candidates: Element[] = [];
@@ -589,6 +825,8 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
         for (const node of mutation.addedNodes) {
           if (node.nodeType !== Node.ELEMENT_NODE) continue;
           const el = node as Element;
+          // 忽略我们自己新增的字典 span
+          if (el.classList?.contains?.('dualang-dict-term') || el.classList?.contains?.('dualang-dict-def')) continue;
           const art = el.closest?.('article[data-testid="tweet"]');
           if (art && !candidates.includes(art)) candidates.push(art);
         }
@@ -686,6 +924,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
           const stale = !cached.original || currentText !== cached.original;
           if (stale) {
             translationCache.delete(contentId);
+            dictCache.dropByContentId(contentId);
             logBiz('cache.invalidate.stale', {
               contentId,
               cachedLen: cached.original?.length,
@@ -695,6 +934,11 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
             // 不 return，让它走后面的 Observer 注册
           } else {
             renderTranslationLocal(article, tweetTextEl, cached.translated, cached.original);
+            if (smartDictEnabled) {
+              void maybeApplySmartDictionary(article, tweetTextEl, cached.original, contentId);
+            } else {
+              clearDictWithBaseline(article, tweetTextEl);
+            }
             showSuccess(article, {
               model: cached.model, baseUrl: cached.baseUrl, fromCache: true,
             });
@@ -933,8 +1177,12 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
           tokens: perItem,
           fromCache: !!data.fromCache,
         };
+        // combined call 返回的 dictEntries 与 subBatch 顺序对齐；单次请求字典+翻译省一半 RTT
+        const dictBatch: (DictEntry[] | null)[] | undefined = Array.isArray(data.dictEntries)
+          ? data.dictEntries
+          : undefined;
         for (let j = 0; j < subBatch.length; j++) {
-          renderAndCacheResult(subBatch[j], translations[j], meta);
+          renderAndCacheResult(subBatch[j], translations[j], meta, dictBatch?.[j] ?? null);
         }
       }).catch((err) => {
         const rtt = performance.now() - apiT0;
@@ -1052,7 +1300,12 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
   }
 
   // ========== 渲染单条翻译结果 + 写入内容 ID 缓存 ==========
-  function renderAndCacheResult(item: BatchItem, translated: string, meta?: TranslateMeta) {
+  function renderAndCacheResult(
+    item: BatchItem,
+    translated: string,
+    meta?: TranslateMeta,
+    freshDictEntries?: DictEntry[] | null,
+  ) {
     const { article, tweetTextEl, text, contentId: originalContentId } = item;
     translatingSet.delete(article);
 
@@ -1075,6 +1328,16 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     }
 
     const art = article as TweetArticle;
+
+    // 模型原样回译（短推 / 全专有名词 / 引用）—— 不是"翻译失败"，是"无需翻译"。
+    // 这种情况之前会走两次质量重试然后亮红叉（"点击强制重新翻译"），UX 很吵；
+    // 直接 showPassAndHide 和跳过非英文推文等同处理。仅对新鲜结果判定，缓存一致值不重复判定。
+    if (!meta?.fromCache && isVerbatimReturn(text, translated)) {
+      logBiz('translation.verbatim.pass', { contentId: originalContentId, origLen: text.length }, 'warn');
+      showPassAndHide(article);
+      return;
+    }
+
     // 只对新鲜的 API 结果做质量检查；缓存返回的翻译是之前已经"落盘"的决策，
     // 即使当初不完美，重试也会拿到同样的结果（它就是从哪儿来的）。
     // 可疑 = 长度坍缩 或 语言错了（如目标中文但输出英文）
@@ -1106,12 +1369,28 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
 
     if (suspicious) {
       // 重试后仍可疑：告知用户而非假装成功
+      clearDictWithBaseline(article, freshTextEl);
       logBiz('translation.quality.give_up', {
         contentId: originalContentId, origLen: text.length, transLen: translated.length,
       }, 'warn');
       showFail(article, '译文与原文段落数差异过大，点击强制重新翻译', { model: meta?.model, baseUrl: meta?.baseUrl });
     } else {
       showSuccess(article, meta || {});
+      // 字典三态消费（避免双重 API 浪费）：
+      //   freshDictEntries === undefined → combined 没 attempt 过 → 走 fallback 独立字典 API
+      //   freshDictEntries === null / [] → attempt 了但模型没给 → 静默跳过，不再发
+      //   freshDictEntries = [...]        → 直接渲染，省一次 RTT
+      if (Array.isArray(freshDictEntries) && freshDictEntries.length > 0) {
+        if (smartDictEnabled && displayMode !== 'translation-only') {
+          if (originalContentId) {
+            dictCache.set(dictCache.key(originalContentId, text), freshDictEntries);
+          }
+          applyDictWithBaseline(article, freshTextEl, freshDictEntries);
+        }
+      } else if (freshDictEntries === undefined) {
+        void maybeApplySmartDictionary(article, freshTextEl, text, originalContentId || undefined);
+      }
+      // null / [] 路径：combined 已经判定过，不再重试，用户该条无字典（模型认为都是易词）
     }
   }
 
@@ -1158,6 +1437,14 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
 
       const art = article as TweetArticle;
       const isCacheHit = !!response.data.fromCache;
+
+      // 模型原样回译 → showPass（详见 renderAndCacheResult 里的同款处理）
+      if (!isCacheHit && isVerbatimReturn(text, translated)) {
+        logBiz('translation.verbatim.pass', { contentId: originalContentId, origLen: text.length, mode: 'immediate' }, 'warn');
+        showPassAndHide(article);
+        return;
+      }
+
       // 同上：缓存返回的翻译不再做质量检查 — 它就是之前落盘的决策
       const suspicious = !isCacheHit && (
         hasSuspiciousLineMismatch(text, translated) ||
@@ -1185,6 +1472,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       }
 
       if (suspicious) {
+        clearDictWithBaseline(article, freshTextEl);
         logBiz('translation.quality.give_up', {
           contentId: originalContentId, origLen: text.length, transLen: translated.length, mode: 'immediate',
         }, 'warn');
@@ -1198,6 +1486,19 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
           tokens: response.data.usage?.total_tokens,
           fromCache: !!response.data.fromCache,
         });
+        // 三态字典：undefined=没 attempt → fallback；null/[]=attempt 空 → 跳过；[entries]=渲染
+        const freshDictEntries = Array.isArray(response.data.dictEntries)
+          ? response.data.dictEntries[0]
+          : undefined;
+        if (Array.isArray(freshDictEntries) && freshDictEntries.length > 0
+            && smartDictEnabled && displayMode !== 'translation-only') {
+          if (originalContentId) {
+            dictCache.set(dictCache.key(originalContentId, text), freshDictEntries);
+          }
+          applyDictWithBaseline(article, freshTextEl, freshDictEntries);
+        } else if (freshDictEntries === undefined) {
+          void maybeApplySmartDictionary(article, freshTextEl, text, originalContentId || undefined);
+        }
       }
     } catch (err: any) {
       telemetry.inc("apiErrors");
@@ -1274,6 +1575,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       // 同步摘 data-dualang-mode，避免原文被 CSS 继续隐藏造成塌陷
       article.querySelector('.dualang-translation')?.remove();
       article.removeAttribute('data-dualang-mode');
+      article.removeAttribute('data-dualang-line-fusion');
       hideStatus(article, true);
       // 手动重试走立即通道 + skipCache：强制新 API 调用，绕过已缓存的坏翻译
       const tweetTextEl = findTweetTextEl(article);
@@ -1353,7 +1655,15 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     article: Element, tweetTextEl: Element,
     translatedText: string, originalText: string,
   ) {
-    renderTranslation(article, tweetTextEl, translatedText, originalText, displayMode, unobserveArticle);
+    renderTranslation(
+      article,
+      tweetTextEl,
+      translatedText,
+      originalText,
+      displayMode,
+      { lineFusionEnabled },
+      unobserveArticle,
+    );
   }
 
   init();

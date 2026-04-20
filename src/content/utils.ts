@@ -151,7 +151,15 @@ export function rebuildParagraphs(translated: string, targetParaCount: number): 
   const perPara = Math.ceil(sentences.length / targetParaCount);
   const paras: string[] = [];
   for (let i = 0; i < sentences.length; i += perPara) {
-    paras.push(sentences.slice(i, i + perPara).join(''));
+    const chunk = sentences.slice(i, i + perPara);
+    // CJK 句末标点（。！？）本身带分隔，拼接时不需要空格；
+    // 西文标点后需要空格保持可读性。
+    let joined = chunk[0];
+    for (let j = 1; j < chunk.length; j++) {
+      const needsSpace = !/[。！？]$/.test(joined);
+      joined += (needsSpace ? ' ' : '') + chunk[j];
+    }
+    paras.push(joined);
   }
   return paras.filter(Boolean);
 }
@@ -193,6 +201,22 @@ export function isWrongLanguage(translated: string, targetLang: string): boolean
   const cjkMatches = stripped.match(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\u3400-\u4dbf\uf900-\ufaff]/gu);
   const cjkCount = cjkMatches ? cjkMatches.length : 0;
   return cjkCount / stripped.length < 0.3;
+}
+
+/**
+ * 模型"不翻译"行为检测：译文归一化后与原文完全一致（忽略空白 / 大小写）。
+ * 通常出现在：
+ *   - 超短推文（"Lit."、"Ok"）
+ *   - 纯专有名词 / 品牌名（"Notion Obsidian"）
+ *   - 纯引用 / hashtag 拼凑
+ * 这类推文没翻译价值，不应该走"质量重试 + fail 红叉"链路；直接当"已跳过"处理。
+ */
+export function isVerbatimReturn(original: string, translated: string): boolean {
+  const norm = (s: string) => s.trim().replace(/\s+/g, ' ').toLowerCase();
+  const a = norm(original);
+  const b = norm(translated);
+  if (!a || !b) return false;
+  return a === b;
 }
 
 function countSignificantLines(s: string): number {

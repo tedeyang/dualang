@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect } from 'vitest';
-import { isAlreadyTargetLanguage, shouldSkipContent, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, rebuildParagraphs, splitParagraphsByDom, extractAnchoredBlocks } from './utils';
+import { isAlreadyTargetLanguage, shouldSkipContent, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, isVerbatimReturn, rebuildParagraphs, splitParagraphsByDom, extractAnchoredBlocks } from './utils';
 
 // ========== isAlreadyTargetLanguage ==========
 
@@ -306,6 +306,30 @@ describe('isWrongLanguage', () => {
     // 注：isWrongLanguage 只管"输出是不是目标语言"，不查"内容有没有意义"
     // 实际的 "这条翻译" 垃圾靠 hasSuspiciousLineMismatch 和 prompt 修正捕获
     expect(isWrongLanguage('这条翻译', 'zh-CN')).toBe(false);
+  });
+});
+
+describe('isVerbatimReturn', () => {
+  it('完全相同 → true', () => {
+    expect(isVerbatimReturn('Mars is amazing.', 'Mars is amazing.')).toBe(true);
+  });
+
+  it('只差空白 / 大小写 → true（模型偶尔改 casing）', () => {
+    expect(isVerbatimReturn('Mars IS amazing.', 'mars is amazing.')).toBe(true);
+    expect(isVerbatimReturn('Hello  world', 'hello world')).toBe(true);
+  });
+
+  it('真翻译 → false', () => {
+    expect(isVerbatimReturn('Mars is amazing.', '火星将会令人惊叹。')).toBe(false);
+  });
+
+  it('部分翻译（含专有名词）→ false', () => {
+    expect(isVerbatimReturn('Check Notion', 'Notion 值得看看')).toBe(false);
+  });
+
+  it('空字符串 → false（避免误判 empty 翻译）', () => {
+    expect(isVerbatimReturn('', '')).toBe(false);
+    expect(isVerbatimReturn('hi', '')).toBe(false);
   });
 
   it('目标为英文时不做此检查（即使输出是中文也算正常）', () => {
