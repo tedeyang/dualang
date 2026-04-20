@@ -1,7 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 
 // Mock chrome-dependent modules before importing api.ts
-vi.mock('./settings', () => ({ LANG_DISPLAY: {} }));
 vi.mock('./error-report', () => ({ reportFatalError: vi.fn(), clearErrorState: vi.fn() }));
 
 const { classifyApiError, applyThinkingMode } = await import('./api');

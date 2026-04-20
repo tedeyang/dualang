@@ -1,7 +1,14 @@
-import { shouldSkipContent, isAlreadyTargetLanguage, extractText, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, rebuildParagraphs, splitParagraphsByDom, splitIntoParagraphs, extractParagraphsByBlock, extractAnchoredBlocks } from './utils';
+import { shouldSkipContent, isAlreadyTargetLanguage, extractText, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, rebuildParagraphs, splitParagraphsByDom, splitIntoParagraphs, extractAnchoredBlocks, isLongText, isLongRichElement } from './utils';
 import { getModelMeta } from '../shared/model-meta';
 import * as bubble from './super-fine-bubble';
 import { renderInlineSlots, fillSlot, clearInlineSlots } from './super-fine-render';
+import {
+  BATCH_SIZE, SUB_BATCH_SIZE, MAX_CONCURRENT,
+  TRANSLATION_CACHE_MAX,
+  SCHEDULER_URGENT_DELAY_MS, SCHEDULER_IDLE_DELAY_MS, SCHEDULER_MAX_AGGREGATE_MS,
+  SHOW_MORE_STABLE_MS,
+  REQUEST_TIMEOUT_MS, LONG_CHUNK_TIMEOUT_MS, STREAM_TIMEOUT_MS, SUPER_FINE_TIMEOUT_MS,
+} from './constants';
 
 type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCache?: boolean };
 
@@ -39,14 +46,10 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
 
   // 按内容 ID 缓存翻译结果（不依赖 DOM 引用，虚拟 DOM 回收后可恢复）
   // 同时记录模型信息，以便 scanAndQueue 恢复时也能显示品牌图标
-  const TRANSLATION_CACHE_MAX = 5000;
   type TranslationCacheEntry = { translated: string; original: string; model?: string; baseUrl?: string };
   const translationCache = new Map<string, TranslationCacheEntry>();
   let viewportObserver = null;
   let preloadObserver = null;
-  const BATCH_SIZE = 20;
-  const SUB_BATCH_SIZE = 5;
-  const MAX_CONCURRENT = 5;
   let activeRequests = 0;
   const retryCounts = new WeakMap();
 
@@ -128,11 +131,11 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
         return;
       }
 
-      const delay = urgent ? 80 : 200;
+      const delay = urgent ? SCHEDULER_URGENT_DELAY_MS : SCHEDULER_IDLE_DELAY_MS;
 
       if (this._timer) {
-        // 800ms 硬上限防饿死
-        if (performance.now() - this._timerCreatedAt >= 800) {
+        // 聚合窗口硬上限防饿死
+        if (performance.now() - this._timerCreatedAt >= SCHEDULER_MAX_AGGREGATE_MS) {
           this._cancel();
           flushQueue();
           return;
@@ -246,17 +249,6 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     fromCache?: boolean;
   };
 
-  // 长文门槛：超过这些阈值就按段落切块独立翻译，避免小模型在 20k+ 字符整包输入下
-  // 把原本的 N 段压成 2 段输出（inline 模式下会出现大量空 pair）。
-  const LONG_ARTICLE_CHARS = 4000;
-  const LONG_ARTICLE_PARAS = 6;
-
-  function isLongArticle(text: string): boolean {
-    if (text.length < LONG_ARTICLE_CHARS) return false;
-    // splitIntoParagraphs：有 \n\n 按 \n\n 切，没有就按单 \n 切（X Articles tight layout）
-    return splitIntoParagraphs(text).length >= LONG_ARTICLE_PARAS;
-  }
-
   // 长文专用路径：把 text 按 \n\n 切成 N 段，5 段一 chunk 串行送 API，
   // 全部完成后 join('\n\n') 作为单段译文返回，外部调用方看不出是分多次请求完成的。
   // 串行：避免一次性占满 MAX_CONCURRENT 与 background rate limiter，让整体稳定可控。
@@ -276,7 +268,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
           action: 'translate',
           payload: { texts: chunkTexts, priority, skipCache, strictMode },
         }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error(`长文 chunk 翻译超时 (60s)`)), 60000)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`长文 chunk 翻译超时 (${LONG_CHUNK_TIMEOUT_MS / 1000}s)`)), LONG_CHUNK_TIMEOUT_MS)),
       ]);
       if (!response?.success) {
         const e: any = new Error(response?.error || `长文 chunk @${i} 失败`);
@@ -310,7 +302,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     }
     // 长文（单条 4k+ 字符 + 6+ 段落）自动切段：小模型在整包 20k 字符输入下
     // 会把 N 段输出压成 2 段，切成 5-段一组的独立 sub-batch 各自翻译能保证段落数对齐。
-    if (texts.length === 1 && isLongArticle(texts[0])) {
+    if (texts.length === 1 && isLongText(texts[0])) {
       return requestTranslationChunked(texts[0], priority, skipCache, strictMode);
     }
     const response: any = await Promise.race([
@@ -318,7 +310,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
         action: 'translate',
         payload: { texts, priority, skipCache, strictMode },
       }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('翻译请求超时 (30s)')), 30000)),
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`翻译请求超时 (${REQUEST_TIMEOUT_MS / 1000}s)`)), REQUEST_TIMEOUT_MS)),
     ]);
     if (!response?.success) {
       const e: any = new Error(response?.error || '翻译失败');
@@ -526,7 +518,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       try { port?.disconnect(); } catch (_) {}
       bubble.setBubbleState(articleId, 'failed');
       logBiz('translation.superFine.fail', { error: 'timeout' }, 'warn');
-    }, 600_000);
+    }, SUPER_FINE_TIMEOUT_MS);
 
     try {
       port = chrome.runtime.connect(undefined, { name: 'super-fine' });
@@ -674,10 +666,9 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
     translateImmediate(article, tweetTextEl);
   }
 
-  // 静默期去抖：每次新 mutation 到达都重置计时器，只在 mutation 停歇 STABLE_MS 之后
+  // 静默期去抖：每次新 mutation 到达都重置计时器，只在 mutation 停歇 SHOW_MORE_STABLE_MS 之后
   // 才触发 show-more/recycle 处理。这把阈值的含义从"X.com 展开总时长"(硬编码假设)
   // 变成"mutation 批次之间的间隔"(浏览器事件循环特性) — 不论 X.com 的动画多长都能自适应。
-  const SHOW_MORE_STABLE_MS = 80;
   function scheduleShowMoreCheck(article: TweetArticle) {
     if (article._dualangShowMoreTimer) clearTimeout(article._dualangShowMoreTimer);
     article._dualangShowMoreTimer = setTimeout(() => {
@@ -825,10 +816,7 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       // （避免 querySelector 优先命中同 article 内的短 tweetText 预览元素）
       if (isXArticle(article)) {
         const richTextEl = article.querySelector('[data-testid="twitterArticleRichTextView"]');
-        const blocks = richTextEl ? extractAnchoredBlocks(richTextEl) : [];
-        const longByBlocks = blocks.length >= 6;
-        const longByChars = richTextEl ? (richTextEl.textContent || '').length >= 4000 : false;
-        if (longByBlocks && longByChars) {
+        if (richTextEl && isLongRichElement(richTextEl)) {
           article.setAttribute('data-dualang-long-article', 'true');
           if (!article.getAttribute('data-dualang-article-id')) {
             article.setAttribute('data-dualang-article-id', contentId || ('la-' + Math.random().toString(36).slice(2, 10)));
@@ -1162,12 +1150,12 @@ type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
       if (anyStuck) {
         perfLog('streamTimeout', { batchSize: batch.length });
         releaseSlot();
-        const e: any = new Error('流式翻译超时 (30s)');
+        const e: any = new Error(`流式翻译超时 (${STREAM_TIMEOUT_MS / 1000}s)`);
         e.retryable = true;
         handleSubBatchError(e, batch, apiT0, performance.now() - apiT0);
         try { port.disconnect(); } catch (_) {}
       }
-    }, 30000);
+    }, STREAM_TIMEOUT_MS);
   }
 
   // ========== 渲染单条翻译结果 + 写入内容 ID 缓存 ==========

@@ -7,6 +7,21 @@
 // Profile 的匹配顺序：第一个命中的生效；`matchBaseUrl`（substring）和
 // `matchModel`（regex）任一命中即算。都不命中则回落到 GENERIC_PROFILE。
 
+// BCP-47 语言代码 → prompt 里拼中文的显示名。
+// 放在这里（而不是 settings.ts）是因为它只被 prompt 拼装消费。
+export const LANG_DISPLAY: Record<string, string> = {
+  'zh-CN': '简体中文',
+  'zh-TW': '繁体中文（台湾正体）',
+  'en':    '英语',
+  'ja':    '日语',
+  'ko':    '韩语',
+  'fr':    '法语',
+  'de':    '德语',
+  'es':    '西班牙语',
+  'ru':    '俄语',
+  'pt':    '葡萄牙语',
+};
+
 export type ThinkingControl =
   | 'omit'                      // 省略 reasoning_effort 即关闭（Moonshot / OpenAI 等）
   | 'enable-thinking-false'     // body.enable_thinking = false（Qwen 系列）

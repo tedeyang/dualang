@@ -67,6 +67,50 @@ describe('getProfile', () => {
     expect(p.systemPromptSingle('简体中文')).toContain('简体中文');
     expect(p.systemPromptBatch('英语')).toContain('英语');
   });
+
+  // ===================== 顺序敏感性防御 =====================
+  // PROFILES 数组内部顺序对正确性是 load-bearing 的：
+  //   - QWEN3 必须在 QWEN_LEGACY 之前，否则 /qwen/i 会先命中把 qwen3 也吞掉
+  //   - GLM46 必须在 GLM_LEGACY 之前，否则 /glm-4/i 会先命中把 4.6 也吞掉
+  //   - MOONSHOT 用 baseUrl 匹配，和 model 无关，任意位置都行
+  // 这些单测不是给"新模型"加覆盖的，是保护现有顺序不被重排破坏。
+  describe('profile 匹配顺序（重排即回归）', () => {
+    it('Qwen3 不能被 Qwen legacy /qwen/i 吞掉', () => {
+      expect(getProfile({ model: 'Qwen/Qwen3-8B' }).id).toBe('qwen3');
+      expect(getProfile({ model: 'qwen3-72b' }).id).toBe('qwen3');
+      expect(getProfile({ model: 'QwQ-32B-Preview' }).id).toBe('qwen3');
+    });
+
+    it('Qwen2.5 / 1.5 / 无版本号都落到 qwen-legacy', () => {
+      expect(getProfile({ model: 'Qwen/Qwen2.5-7B-Instruct' }).id).toBe('qwen-legacy');
+      expect(getProfile({ model: 'Qwen/Qwen1.5-7B' }).id).toBe('qwen-legacy');
+      expect(getProfile({ model: 'qwen-7b-chat' }).id).toBe('qwen-legacy');
+    });
+
+    it('GLM 4.6 不能被 glm-legacy /glm-4/i 吞掉', () => {
+      expect(getProfile({ model: 'glm-4.6' }).id).toBe('glm-4.6');
+      expect(getProfile({ model: 'glm-4-6' }).id).toBe('glm-4.6');
+      expect(getProfile({ model: 'GLM-4.6' }).id).toBe('glm-4.6');
+    });
+
+    it('GLM 4.0-5.x 范围都落 glm-legacy（仅 4.6 走 46 profile）', () => {
+      expect(getProfile({ model: 'THUDM/GLM-4-9B-0414' }).id).toBe('glm-legacy');
+      expect(getProfile({ model: 'GLM-4-Plus' }).id).toBe('glm-legacy');
+      expect(getProfile({ model: 'glm-4-32b' }).id).toBe('glm-legacy');
+    });
+
+    it('Moonshot baseUrl 匹配优先于 generic fallback', () => {
+      // 即使 model 名看起来像 generic
+      expect(getProfile({ baseUrl: 'https://api.moonshot.cn/v1', model: 'gpt-4' }).id).toBe('moonshot');
+    });
+
+    it('thinkingControl 通过 profile 间接暴露顺序错乱', () => {
+      // 如果 QWEN_LEGACY 抢先命中 Qwen3，thinkingControl 会变成 'omit'（错）
+      expect(getProfile({ model: 'Qwen/Qwen3-8B' }).thinkingControl).toBe('enable-thinking-false');
+      // 如果 GLM_LEGACY 抢先命中 GLM-4.6，thinkingControl 会变成 'omit'（错）
+      expect(getProfile({ model: 'glm-4.6' }).thinkingControl).toBe('thinking-disabled');
+    });
+  });
 });
 
 describe('resolveEndpoint', () => {

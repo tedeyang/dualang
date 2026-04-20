@@ -21,19 +21,6 @@ export async function getMoonshotKey(): Promise<string> {
   return '';
 }
 
-export const LANG_DISPLAY: Record<string, string> = {
-  'zh-CN': '简体中文',
-  'zh-TW': '繁体中文（台湾正体）',
-  'en':    '英语',
-  'ja':    '日语',
-  'ko':    '韩语',
-  'fr':    '法语',
-  'de':    '德语',
-  'es':    '西班牙语',
-  'ru':    '俄语',
-  'pt':    '葡萄牙语',
-};
-
 let settingsCache: any = null;
 
 export function invalidateSettingsCache() {

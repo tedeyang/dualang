@@ -4,79 +4,116 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Dualang is a Chrome Extension (Manifest V3) for X.com/Twitter that provides bilingual translation using the Kimi (Moonshot) OpenAI-compatible API. There is no build step — the extension is loaded directly into Chrome as an unpacked extension.
+Dualang ("X 光速翻译") is a Chrome Extension (Manifest V3) for X.com / Twitter that provides streaming bilingual translation. It is **OpenAI-compatible provider agnostic** — default is SiliconFlow's free `THUDM/GLM-4-9B-0414`; Moonshot Kimi, Qwen (via SiliconFlow), and the W3C Translator API (Chrome 138+ / Edge Canary 143+) are first-class alternates. Super-fine (long-article) translation defaults to GLM as well; Moonshot Kimi is opt-in.
+
+## Commands
+
+```bash
+npm install           # install esbuild + vitest + chrome-types
+npm run build         # one-shot production bundle: src/content/index.ts → content.js, src/background/index.ts → background.js
+npm run build:dev     # inline sourcemaps
+npm run watch         # esbuild --watch
+npm test              # vitest run (unit tests)
+npm run test:watch    # vitest watch
+
+cd e2e && npm install && npx playwright test                    # full e2e
+cd e2e && npx playwright test tests/translation.spec.ts         # single spec
+cd e2e && npx playwright test --ui                              # Playwright UI
+```
+
+**`content.js` / `background.js` are build outputs** — gitignored. Source of truth is `src/`. `popup.js` is legacy raw JS (not yet bundled; see TODO in popup refactor).
 
 ## Loading the Extension
 
-1. Open `chrome://extensions/`
-2. Enable Developer Mode
-3. Click "Load unpacked" and select the `dualang/` directory
+1. `npm run build` (or `npm run watch` during development)
+2. `chrome://extensions/` → Developer Mode → Load unpacked → pick the repo root
 
-## Running E2E Tests
+## E2E Test Harness
 
-```bash
-cd e2e
-npm install
-npx playwright test                          # all tests (headless, no browser window)
-npx playwright test tests/translation.spec.ts  # single file
-npx playwright test --ui                     # Playwright UI mode
+Playwright spawns `uv run python3 -m http.server 9999` from repo root (`reuseExistingServer: false`, ephemeral Chromium profile). Fixture uses `headless: false` + `--headless=new` (Chrome 112+ headless supports SW / extensions; `headless: true` does not).
+
+## Runtime Architecture
+
+Three contexts, wired by `chrome.runtime.sendMessage` and `chrome.runtime.connect` ports.
+
+### `src/background/` — Service Worker
+
+- **`index.ts`** — entry point: message router (`translate` / `getStats` / `resetStats` / `getHedgeStats`), port handlers (`keepalive` / `translate-stream` / `super-fine`), context menu, hedged-request orchestration, main→fallback switch, RTT sampling for adaptive hedge delay. Currently a large god function; see `handleTranslateBatch` for the main pipeline.
+- **`api.ts`** — `doTranslateSingle` / `doTranslateBatchRequest` / `doTranslateBatchStream`. Batch protocol uses `===N===` delimiter (7-9B models handle it more reliably than JSON). Streaming uses SSE with incremental emission on each detected boundary.
+- **`profiles.ts`** — Provider profile registry (strategy pattern). Each profile carries `endpointPath`, `temperature(settings)`, `thinkingControl` (`omit` / `enable-thinking-false` / `thinking-disabled`), `supportsStreaming`, `systemPromptSingle/Batch`. Profile order matters: QWEN3 before QWEN_LEGACY, GLM46 before GLM_LEGACY, Moonshot by baseUrl, generic fallback last.
+- **`cache.ts`** — two-tier LRU: L1 in-memory `memCacheMap` (2000 entries) + L2 `chrome.storage.local['dualang_cache_v1']` (5000 entries, LRU eviction 20% on overflow). `cacheKey(text, lang, model, baseUrl)` = djb2 of `normalizeText(text) + '|' + lang + '|' + model + '|' + baseUrl`. Batch read via `getCacheBatch(hashes)` (single storage.get).
+- **`rate-limiter.ts`** — `RateLimiter` singleton. Limits: `MAX_CONCURRENCY=100`, `MAX_RPM=500`, `MAX_TPM=3_000_000`, `MAX_TPD=Infinity`. Priority preemption: running task with lower priority gets `abort()` when higher-priority one queues. IO chain (`_withIoLock`) serializes storage RMW to avoid counter loss. `priority>=2` (user-immediate actions) bypasses limits and IO lock.
+- **`settings.ts`** — `getSettings()` memoizes `chrome.storage.sync.get(...)` in `settingsCache`; `chrome.storage.onChanged` invalidates. `LANG_DISPLAY` maps BCP-47 codes to Chinese display names for prompts. `getMoonshotKey()` pulls super-fine opt-in key from `config.json` or sync settings.
+- **`stats.ts`** — per-model aggregate (reqs / successes / RTT / tokens), cache hits, quality retries, last 20 errors. Persists to `chrome.storage.local['dualang_stats_v1']` debounced 2s. Consumed by popup Stats tab.
+- **`error-report.ts`** — fatal-error badge writer (shown on popup as banner, clicked to dismiss).
+
+### `src/content/` — X.com injection
+
+- **`index.ts`** — large IIFE (currently undergoing refactor): scheduler, IntersectionObserver viewport/preload, MutationObserver for dynamic loads + show-more + DOM recycle, pendingQueue + dedup Set, streaming vs sendMessage dispatch, render pipeline across 4 display modes, browser-native Translator session, status indicators, super-fine wire-up.
+- **`super-fine-bubble.ts`** — right-side floating bubble state machine (`idle` / `translating` / `done` / `failed`), Y-axis drag with localStorage persistence, hover mini-panel with cancel/retry, X文 logo via CSS `color-mix(--progress)` + bubble/extension icons sharing the design.
+- **`super-fine-render.ts`** — inline slot skeletons inserted after each original DOM block via `insertBefore(slot, block.el.nextSibling)`. Preserves original `<img>` / `<video>` / `<a>` / `@mention`.
+- **`utils.ts`** — `shouldSkipContent`, `isAlreadyTargetLanguage` (CJK / kana / hangul / latin ratio), `extractText` (uses innerText to keep CSS block boundaries), `splitParagraphsByDom` (TreeWalker + Range for HTML-preserving paragraph split), `extractAnchoredBlocks` (leaf-block walker returning `{el, kind: 'text' | 'img-alt', text}`), `getContentId` (strategy chain: X status / Mastodon / Reddit / HN / YouTube / Bluesky / `data-*` / Grok title / `el.id`).
+
+### `src/shared/`
+
+- **`types.ts`** — message-contract interfaces + `normalizeText`. Currently partially used (ongoing typing-tightening refactor).
+- **`model-meta.ts`** — brand icon + one-liner + deploy URL for a given `(model, baseUrl)`. Used by content's success-status icon. Duplicated in `popup.js` (TODO: bundle popup and dedupe).
+
+### Container abstraction
+
+`findTweetTextEl(container)` resolves three selectors uniformly:
+- `[data-testid="tweetText"]` — normal tweets
+- `[data-dualang-text="true"]` — Grok summary card body (marked by `findAndPrepareGrokCards`)
+- `[data-testid="twitterArticleRichTextView"]` — X Articles long-form body
+
+Grok cards have no stable testid/role; detection uses 4-div children + internal `<time>` + disclaimer text prefix. Once matched, card gets `data-dualang-grok="true"` and body gets `data-dualang-text="true"`.
+
+### Display modes (`displayMode`, 4 values)
+
+- `append` (default) — original tweetText visible, translation card appended below.
+- `translation-only` — original hidden via `article[data-dualang-mode="translation-only"] [data-testid="tweetText"] { display: none }`, only translation.
+- `inline` (段落对照) — `splitParagraphsByDom(tweetTextEl)` clones original paragraph DOM (preserves `<a>` / `<img>` / mentions), each paired with matching translation inside `.dualang-inline-pair`.
+- `bilingual` (整体对照) — whole original HTML clone + whole translation.
+
+Legacy migration: `bilingualMode=true` (no `displayMode`) → `'inline'`; otherwise `'append'`. `data-dualang-mode` is set per-article at render time, so flipping the mode only affects newly-translated cards.
+
+## Request Flow
+
+### Normal translation (viewport / preload / manual click)
+
+1. Content `scanAndQueue` registers each article with `viewportObserver` + `preloadObserver` (rootMargin ≈ `viewportHeight`).
+2. On observer hit → `queueTranslation` enqueues + dedup Set. Scheduler flushes batches of 20, split into sub-batches of 5 with max 5 concurrent.
+3. `requestTranslation` dispatches: browser-native → `translateViaBrowser`; long article single text → `requestTranslationChunked` (5-paragraph chunks, serial); normal → `chrome.runtime.sendMessage({action:'translate', payload:{texts, priority, skipCache, strictMode}})` with 30s timeout.
+4. Background `handleTranslateBatch`: cache batch-read → in-flight dedup by batch-hash → rate-limiter acquire → hedged vs non-hedged → main→fallback fallback → cache write → stats record. Returns `{translations, model, baseUrl, fromCache, usage}`.
+5. Content renders per `displayMode`, caches result in `translationCache` keyed by `getContentId(article)`.
+
+### Super-fine (long X Articles)
+
+1. Content detects long article (`isXArticle && blocks≥6 && chars≥4000`), skips auto-translate, `bubble.trackArticle(article)`.
+2. User clicks bubble → `translateArticleSuperFine`: `extractAnchoredBlocks` → `renderInlineSlots` (skeletons after each original block) → `chrome.runtime.connect({name:'super-fine'})` port.
+3. Background `handleSuperFineStream`: default GLM via `baseSettings`; Moonshot opt-in only if `payload.model` starts `moonshot-`/`kimi-`. Serial chunks of 5 paragraphs each via `doTranslateBatchStream`. Emits `meta` / `partial` (per paragraph) / `progress` (per chunk) / `chunkFail` / `done` / `error`.
+4. Content `fillSlot(article, index, text)` on each partial; bubble state → `done` / `failed` on terminal.
+
+### Quality retry
+
+`hasSuspiciousLineMismatch(original, translated)` + `isWrongLanguage(translated, target)` flag compressed/wrong-language output. First occurrence → `_dualangQualityRetried=true` + re-queue with `skipCache=true, strictMode=true` (STRICT_PREFIX prompt forbids summarization). Second occurrence → surface `showFail` with click-to-force-retry.
+
+## Test Layout
+
+```
+src/**/*.test.ts          # vitest unit tests (150)
+e2e/tests/*.spec.ts       # Playwright specs
+e2e/fixtures/x-mock.html  # mock tweets: EN link/img/plain, zh-CN/zh-TW (should skip),
+                          # URL-only (skip), show-more, long article fixture
 ```
 
-Tests run headless automatically. The fixture uses `headless: false` + `--headless=new` arg (Chrome 112+ headless with extension/Service Worker support — `headless: true` breaks extension loading).
+Key specs: `translation.spec.ts` (core + batch + paragraph split), `cache.spec.ts` (L1/L2), `target-lang.spec.ts` (prompt content), `manual-and-bilingual.spec.ts` (4 displayModes), `skip-and-extract.spec.ts` (skip conditions / extractText with links+imgs), `super-fine-bubble.spec.ts` (bubble + long-article gate), `status-and-reliability.spec.ts`, `auto-translate.spec.ts`, `settings.spec.ts`, `real-scenarios.spec.ts`.
 
-The test suite starts a Python HTTP server on port 9999 (`uv run python3 -m http.server 9999` from repo root). `reuseExistingServer: false` ensures Playwright owns the server lifecycle (avoids stale-process failures). Tests load the extension into an ephemeral Chromium profile (empty string passed to `launchPersistentContext`).
+## Non-obvious conventions
 
-## Architecture
-
-The extension has three runtime contexts communicating via `chrome.runtime.sendMessage`:
-
-**`background.js` (Service Worker)**
-- Proxies all Kimi API calls to avoid CORS issues from X.com
-- `RateLimiter` class enforces concurrent request cap (3), RPM (20), TPM (500k), TPD (1.5M) — limits stored in `chrome.storage.local`
-- **Two-tier cache**: L1 in-memory LRU Map (`memCacheMap`, 200 entries) + L2 `chrome.storage.local` under `dualang_cache_v1` (500 entries, LRU eviction of 20% when full). Cache hits on L1 are zero-IO.
-- **Batch cache reads**: `getCacheBatch(hashes)` reads all L2 cache keys in a single `storage.get` call instead of N sequential reads
-- **Settings memory cache**: `getSettings()` caches the result in `settingsCache`; `chrome.storage.onChanged` invalidates it so the Service Worker never does synchronous storage reads on the hot path
-- `cacheKey(text, lang, model, baseUrl)` uses `normalizeText()` + djb2 hash so minor whitespace differences don't cause cache misses
-- Batch translation sends up to 5 tweets per API call with `response_format: { type: 'json_object' }`, parsing `{"results":[{"index":N,"translated":"..."}]}`
-- `LANG_DISPLAY` map translates language codes to Chinese names for system prompts (e.g., `zh-CN` → `简体中文`)
-- `temperature` is `1` for `kimi-k2.5` models, `0.3` for others
-
-**`content.js` (injected into x.com and localhost:9999)**
-- `MutationObserver` detects dynamically loaded tweets (`article[data-testid="tweet"]`), Grok AI summary cards (detected by 4-div children + `<time>` + disclaimer text), X Articles (inside `article[data-testid="tweet"]` with `[data-testid="twitterArticleRichTextView"]` body), and "Show more" expansions
-- `findTweetTextEl(container)` helper unifies three text container selectors: `[data-testid="tweetText"]` (tweets), `[data-dualang-text="true"]` (Grok body, marked by us), `[data-testid="twitterArticleRichTextView"]` (X Articles long-form body)
-- `IntersectionObserver` (rootMargin `0px 0px 600px 0px`) pre-queues tweets before they enter the viewport
-- **Translation modes**: if `autoTranslate=true`, tweets are queued automatically; if `false`, a `<button class="dualang-btn">译</button>` is injected for manual translation
-- **Display modes** (`displayMode` setting, 4 values; replaces the old boolean `bilingualMode`):
-  - `'append'` (default) — original tweetText stays, translation appended below
-  - `'translation-only'` — original hidden via `article[data-dualang-mode]` CSS selector; only translation shown
-  - `'inline'` (段落对照) — `splitParagraphsByDom(tweetTextEl)` clones each original paragraph's DOM (preserves `<a>` / `<img>` / `@mention`), rendered as `.dualang-inline > .dualang-inline-pair > [.dualang-original-html + .dualang-para]` below the hidden tweetText
-  - `'bilingual'` (整体对照) — full original HTML clone + full translation as `.dualang-bilingual > [.dualang-original-html + .dualang-para...]`
-  - Legacy migration: old `bilingualMode=true` (no `displayMode` set) → `'inline'`; otherwise `'append'`
-  - `data-dualang-mode` is set per article at render time, so mode switching only affects newly-translated tweets — existing cards keep their original mode until page reload
-- Queue uses `pendingQueue` (Array) + `pendingQueueSet` (Set) for O(1) deduplication
-- `BATCH_SIZE=20` tweets dequeued per flush, split into `SUB_BATCH_SIZE=5` parallel API calls — first 5 results render immediately
-- Retries failed sub-batches up to 2× with 2s delay (5s on 429/rate-limit)
-- `isAlreadyTargetLanguage(text, lang)` checks CJK ratio (zh), kana ratio (ja), hangul ratio (ko), latin ratio (en) — skips translation if already in target language
-- `shouldSkipContent(text)` skips URL-only tweets (stripped < 6 chars) and pure emoji/symbol tweets
-
-**`popup.js` / `popup.html`**
-- Settings: API endpoint, API key, model, reasoning effort, max tokens, target language (10 options), auto-translate toggle, `displayMode` (4 options: 译文下方 / 仅译文 / 段落对照 / 整体对照)
-- All settings persisted via `chrome.storage.sync`
-
-**`styles.css`** — injected into X.com pages; styles `.dualang-translation`, `.dualang-btn`, `.dualang-original-html`, `.dualang-inline-pair`, `.dualang-bilingual` and uses `article[data-dualang-mode]` attribute selectors to hide the original `[data-testid="tweetText"]` for non-`append` modes
-
-## Test Structure
-
-```
-e2e/
-  fixtures/x-mock.html       # Mock X.com page with 7 tweet types
-  tests/
-    fixtures.ts              # Playwright fixture: extension context, extensionId, popupPage
-    translation.spec.ts      # Core translation, batch, paragraph splitting
-    cache.spec.ts            # L1/L2 cache hit behavior
-    target-lang.spec.ts      # Target language setting + API prompt content
-    manual-and-bilingual.spec.ts  # autoTranslate=false button + 4 displayMode variants
-    skip-and-extract.spec.ts      # Skip conditions (zh/url/emoji), extractText with links/imgs
-```
-
-The mock HTML tweets cover: English with `<a>` links, English with `<img alt>` emoji, English single-para, Simplified Chinese (should skip), Traditional Chinese (should skip), URL-only (should skip), Show more expandable.
+- **DOM expandos** — `_dualang*` fields are attached to article Elements (enqueue time, high-priority flag, content-ID snapshot, show-more baseline, quality-retry budget, super-fine port). Migration to `WeakMap<Element, ArticleState>` is in progress.
+- **`data-dualang-mode` attribute** drives CSS visibility of the original `tweetText`. Removal on render / cache-restore / fail-retry is load-bearing — forgetting it causes layout shift.
+- **Profile matching is order-sensitive** — see the PROFILES array comment in `profiles.ts`. `/qwen/i` matches qwen3; `/glm-4/i` matches 4.6.
+- **`priority>=2`** = user-immediate (show-more / manual button / retry); bypasses rate-limiter IO lock. Long waits on user-visible actions are a UX regression.
+- **Stream decoder flush** — after reader loop, call `decoder.decode()` (no args) to flush trailing bytes; otherwise the last multi-byte CJK char can render as `U+FFFD`. Both `parseStream` and `doTranslateBatchStream` do this.
+- **Streaming is disabled for Qwen2.5 / GLM-4-9B** in profiles — their SiliconFlow-hosted SSE splits CJK mid-character on chunk boundaries; `response.json()` integral decode avoids the corruption.

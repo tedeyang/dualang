@@ -1,8 +1,7 @@
 const RATE_LIMIT_KEY = 'dualang_rate_limit_v1';
 const MAX_CONCURRENCY = 100;
 const MAX_RPM = 500;
-const MAX_TPM = 3000000;
-const MAX_TPD = Infinity;
+const MAX_TPM = 3_000_000;
 
 export type RegisterTaskFn = (priority: number, abortFn: () => void) => () => void;
 
@@ -16,6 +15,11 @@ interface QueueItem {
 interface RunningTask {
   priority: number;
   abort: () => void;
+}
+
+interface RateLimitState {
+  requests: number[];                       // timestamps within last 60s
+  tokensPerMin: Array<{ ts: number; count: number }>;
 }
 
 export class RateLimiter {
@@ -69,17 +73,14 @@ export class RateLimiter {
     const next = this.queue.shift()!;
 
     // priority >= 2 是用户即时操作（Show more / 手动按钮 / 重试）。
-    // 绕过 _checkLimits 冷却、也不等 IO 锁 — 宁可让服务端返 429，也不让用户
+    // 绕过 _checkAndPersist 冷却、也不等 IO 锁 — 宁可让服务端返 429，也不让用户
     // 眼前的内容被低优先级的 RPM/TPM 本地等待 sleep 卡住。
     // 持久化仍 fire-and-forget（计数最终还是会被记录，可能与锁内 RMW 有极少量
     // 丢失，但 priority 2 请求本就稀疏，可接受）。
     const bypassLimits = next.priority >= 2;
     const work = bypassLimits
       ? (() => { this._persistAdd(next.tokenEstimate).catch(() => {}); return Promise.resolve(); })()
-      : this._withIoLock(async () => {
-          await this._checkLimits(next.tokenEstimate);
-          await this._persistAdd(next.tokenEstimate);
-        });
+      : this._withIoLock(() => this._checkAndPersist(next.tokenEstimate));
 
     work
       .then(() => {
@@ -87,16 +88,23 @@ export class RateLimiter {
           this.running++;
           const task = { priority, abort: abortFn };
           this.runningTasks.push(task);
-          return () => {
-            this.running--;
-            const idx = this.runningTasks.indexOf(task);
-            if (idx !== -1) this.runningTasks.splice(idx, 1);
-            this._preemptionPending = false;
-            this._process();
-          };
+          return () => this._release(task);
         });
       })
-      .catch(err => next.reject(err));
+      .catch(err => {
+        // registerTask 永远不会被调用 —— 如果 abort 是作为 victim 触发的，
+        // 释放流程（_release）不会跑，必须在此兜底清除抢占锁，避免死锁。
+        this._preemptionPending = false;
+        next.reject(err);
+      });
+  }
+
+  private _release(task: RunningTask) {
+    this.running--;
+    const idx = this.runningTasks.indexOf(task);
+    if (idx !== -1) this.runningTasks.splice(idx, 1);
+    this._preemptionPending = false;
+    this._process();
   }
 
   _findLowestPriorityRunning() {
@@ -104,53 +112,59 @@ export class RateLimiter {
     return this.runningTasks.reduce((min, t) => t.priority < min.priority ? t : min);
   }
 
-  async _checkLimits(tokenEstimate: number) {
-    const data = await chrome.storage.local.get(RATE_LIMIT_KEY);
-    const rl = data[RATE_LIMIT_KEY] || { requests: [], tokensPerMin: [], tokensPerDay: [] };
+  /**
+   * 合并后的 RMW：单次 storage.get 读配额状态 → check → push → 单次 storage.set。
+   * 原实现拆成 _checkLimits + _persistAdd 两次 round-trip，多一次 IO。
+   * 若触发 RPM/TPM 上限则 sleep + 递归重入；递归时不再续借 ioLock（_withIoLock 已
+   * 把本次整个流程序列化，内部 sleep 期间其他 acquire 会在 ioChain 上等）。
+   */
+  async _checkAndPersist(tokenEstimate: number): Promise<void> {
+    const rl = await this._loadPruned();
     const now = Date.now();
 
-    const requests = (rl.requests || []).filter(ts => now - ts < 60000);
-    const tokensPerMin = (rl.tokensPerMin || []).filter(r => now - r.ts < 60000);
-    const tokensPerDay = (rl.tokensPerDay || []).filter(r => now - r.ts < 24 * 60 * 60 * 1000);
-
-    if (requests.length >= MAX_RPM) {
-      const wait = requests[requests.length - MAX_RPM] + 60000 - now;
+    if (rl.requests.length >= MAX_RPM) {
+      const wait = rl.requests[rl.requests.length - MAX_RPM] + 60_000 - now;
       if (wait > 0) {
         await this._sleep(wait);
-        return this._checkLimits(tokenEstimate);
+        return this._checkAndPersist(tokenEstimate);
       }
     }
 
-    const tpmSum = tokensPerMin.reduce((s, r) => s + r.count, 0);
+    const tpmSum = rl.tokensPerMin.reduce((s, r) => s + r.count, 0);
     if (tpmSum + tokenEstimate > MAX_TPM) {
-      const earliest = tokensPerMin[0]?.ts || now;
-      const wait = earliest + 60000 - now;
+      const earliest = rl.tokensPerMin[0]?.ts || now;
+      const wait = earliest + 60_000 - now;
       if (wait > 0) {
         await this._sleep(wait);
-        return this._checkLimits(tokenEstimate);
+        return this._checkAndPersist(tokenEstimate);
       }
     }
-
-    const tpdSum = tokensPerDay.reduce((s, r) => s + r.count, 0);
-    if (tpdSum + tokenEstimate > MAX_TPD) {
-      throw new Error('超出每日 Token 限额，请明天再试');
-    }
-  }
-
-  async _persistAdd(tokenEstimate: number) {
-    const data = await chrome.storage.local.get(RATE_LIMIT_KEY);
-    const rl = data[RATE_LIMIT_KEY] || { requests: [], tokensPerMin: [], tokensPerDay: [] };
-    const now = Date.now();
-
-    rl.requests = (rl.requests || []).filter(ts => now - ts < 60000);
-    rl.tokensPerMin = (rl.tokensPerMin || []).filter(r => now - r.ts < 60000);
-    rl.tokensPerDay = (rl.tokensPerDay || []).filter(r => now - r.ts < 24 * 60 * 60 * 1000);
 
     rl.requests.push(now);
     rl.tokensPerMin.push({ ts: now, count: tokenEstimate });
-    rl.tokensPerDay.push({ ts: now, count: tokenEstimate });
-
     await chrome.storage.local.set({ [RATE_LIMIT_KEY]: rl });
+  }
+
+  /**
+   * priority>=2 用户即时操作的轻量追加路径：不做限额检查，仅记账。
+   * fire-and-forget；小量竞态丢失可接受（这类请求本就稀疏）。
+   */
+  async _persistAdd(tokenEstimate: number): Promise<void> {
+    const rl = await this._loadPruned();
+    const now = Date.now();
+    rl.requests.push(now);
+    rl.tokensPerMin.push({ ts: now, count: tokenEstimate });
+    await chrome.storage.local.set({ [RATE_LIMIT_KEY]: rl });
+  }
+
+  private async _loadPruned(): Promise<RateLimitState> {
+    const data = await chrome.storage.local.get(RATE_LIMIT_KEY);
+    const raw = data[RATE_LIMIT_KEY] || {};
+    const now = Date.now();
+    return {
+      requests: (raw.requests || []).filter((ts: number) => now - ts < 60_000),
+      tokensPerMin: (raw.tokensPerMin || []).filter((r: { ts: number }) => now - r.ts < 60_000),
+    };
   }
 
   _sleep(ms: number) {

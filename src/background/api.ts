@@ -1,6 +1,5 @@
-import { LANG_DISPLAY } from './settings';
 import { reportFatalError, clearErrorState } from './error-report';
-import { getProfile, resolveEndpoint, composeSystemPrompt, parseDelimitedBatch, type ProviderProfile } from './profiles';
+import { getProfile, resolveEndpoint, composeSystemPrompt, parseDelimitedBatch, LANG_DISPLAY, type ProviderProfile } from './profiles';
 
 // ===================== 思考模式控制 =====================
 // 翻译任务不需要推理；关闭方式按 provider profile.thinkingControl 分发：
@@ -66,7 +65,7 @@ export function classifyApiError(status: number, bodyText: string) {
     return { retryable: false, message: '账户额度不足或已停用，请检查账户余额和账单详情' };
   }
   if (status === 429 && type === 'engine_overloaded_error') {
-    return { retryable: true, message: 'Kimi 服务繁忙，请稍后重试', retryAfter: 5 };
+    return { retryable: true, message: '翻译服务繁忙，请稍后重试', retryAfter: 5 };
   }
   if (status === 429 && type === 'rate_limit_reached_error') {
     const secondsMatch = errorMessage.match(/after\s+(\d+)\s+seconds/i);
@@ -81,9 +80,9 @@ export function classifyApiError(status: number, bodyText: string) {
   if (status === 401) return { retryable: false, message: 'API Key 无效或已过期，请在扩展设置中检查' };
   if (status === 403) return { retryable: false, message: '没有权限访问该 API，请联系管理员' };
   if (status === 404) return { retryable: false, message: `模型不存在或无权访问: ${errorMessage}` };
-  if (status >= 500) return { retryable: true, message: `Kimi 服务端错误 (${status})，请稍后重试`, retryAfter: 3 };
+  if (status >= 500) return { retryable: true, message: `翻译服务端错误 (${status})，请稍后重试`, retryAfter: 3 };
 
-  return { retryable: status >= 500 || status === 429, message: `Kimi API 错误 (${status}): ${errorMessage}`, retryAfter: 3 };
+  return { retryable: status >= 500 || status === 429, message: `翻译 API 错误 (${status}): ${errorMessage}`, retryAfter: 3 };
 }
 
 // ===================== 响应解析 =====================
@@ -100,7 +99,7 @@ export async function parseApiResponse(response: Response, isStream: boolean) {
 
   if (isStream) {
     const translated = await parseStream(response);
-    if (!translated) throw new Error('Kimi API 流式返回结果为空');
+    if (!translated) throw new Error('翻译 API 流式返回结果为空');
     return { translated };
   } else {
     return await response.json();

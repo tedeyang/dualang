@@ -272,6 +272,23 @@ export function extractParagraphsByBlock(el: Element): string[] {
   return extractAnchoredBlocks(el).map((b) => b.text);
 }
 
+// ===================== 长文判定 =====================
+// 统一门槛：≥ 4000 字符 且 ≥ 6 段落/段块。
+// 两种输入路径：纯文本（走 chunked 翻译）和 rich DOM（走浮球精翻）。
+export const LONG_ARTICLE_CHARS = 4000;
+export const LONG_ARTICLE_PARAS = 6;
+
+export function isLongText(text: string): boolean {
+  if (text.length < LONG_ARTICLE_CHARS) return false;
+  return splitIntoParagraphs(text).length >= LONG_ARTICLE_PARAS;
+}
+
+export function isLongRichElement(el: Element): boolean {
+  const chars = (el.textContent || '').length;
+  if (chars < LONG_ARTICLE_CHARS) return false;
+  return extractAnchoredBlocks(el).length >= LONG_ARTICLE_PARAS;
+}
+
 /**
  * 把 tweetText 元素按段落边界切成 N 个 DocumentFragment，保留原 HTML
  * （`<a>` / `<img alt>` / `<span>` 等），供"段落对照"模式用来克隆原文段落。
