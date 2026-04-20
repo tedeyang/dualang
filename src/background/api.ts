@@ -1,6 +1,7 @@
 import { reportFatalError, clearErrorState } from './error-report';
 import { getProfile, resolveEndpoint, composeSystemPrompt, parseDelimitedBatch, LANG_DISPLAY, type ProviderProfile } from './profiles';
 import { iterateSseDeltas } from './sse';
+import type { Settings, TokenUsage } from '../shared/types';
 
 // ===================== 思考模式控制 =====================
 // 翻译任务不需要推理；关闭方式按 provider profile.thinkingControl 分发：
@@ -8,7 +9,7 @@ import { iterateSseDeltas } from './sse';
 //   - 'enable-thinking-false':     body.enable_thinking = false（Qwen 系列）
 //   - 'thinking-disabled':         body.thinking = { type: 'disabled' }（GLM-4.6+）
 // 具体哪个模型用哪条策略由 src/background/profiles.ts 登记。
-export function applyThinkingMode(body: any, settings: any, profile?: ProviderProfile): void {
+export function applyThinkingMode(body: any, settings: Settings, profile?: ProviderProfile): void {
   const effort = settings.reasoningEffort;
   const wantThinking = !!effort && effort !== 'none';
 
@@ -34,12 +35,12 @@ export function applyThinkingMode(body: any, settings: any, profile?: ProviderPr
 
 // ===================== body 构造辅助 =====================
 
-function maxTokensPerItem(settings: any): number | undefined {
-  const n = parseInt(settings.maxTokens, 10);
+function maxTokensPerItem(settings: Settings): number | undefined {
+  const n = parseInt(String(settings.maxTokens ?? ''), 10);
   return !isNaN(n) && n > 0 ? n : undefined;
 }
 
-function maxTokensForBatch(settings: any, texts: string[]): number | undefined {
+function maxTokensForBatch(settings: Settings, texts: string[]): number | undefined {
   const maxPerItem = maxTokensPerItem(settings);
   if (maxPerItem === undefined) return undefined;
   // 输出长度 ≈ 输入 / 3 + 每条 80 token 的 JSON 结构开销；取与 user 设置上限的较大者
@@ -109,7 +110,7 @@ export async function parseApiResponse(response: Response, isStream: boolean) {
 
 // ===================== 重试 =====================
 
-export async function callWithRetry(fn: () => Promise<any>, maxRetries = 3, settings: any = null) {
+export async function callWithRetry(fn: () => Promise<any>, maxRetries = 3, settings: Settings | null = null) {
   let lastError: any;
   for (let i = 0; i <= maxRetries; i++) {
     try {
@@ -146,7 +147,7 @@ async function parseStream(response: Response) {
 
 // ===================== 翻译请求 =====================
 
-export async function doTranslateSingle(text: string, settings: any, signal?: AbortSignal, strictMode = false) {
+export async function doTranslateSingle(text: string, settings: Settings, signal?: AbortSignal, strictMode = false) {
   const profile = getProfile(settings);
   const endpoint = resolveEndpoint(profile, settings.baseUrl || 'https://api.moonshot.cn/v1');
   const targetLangDisplay = LANG_DISPLAY[settings.targetLang] || settings.targetLang;
@@ -188,7 +189,7 @@ export type OnStreamResult = (index: number, translated: string) => void;
  */
 export async function doTranslateBatchStream(
   texts: string[],
-  settings: any,
+  settings: Settings,
   signal: AbortSignal | null,
   onResult: OnStreamResult,
   strictMode = false,
@@ -287,7 +288,7 @@ export async function doTranslateBatchStream(
 
 export async function doTranslateBatchRequest(
   texts: string[],
-  settings: any,
+  settings: Settings,
   signal: AbortSignal | null,
   maxRetries = 3,
   strictMode = false,

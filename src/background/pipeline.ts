@@ -4,27 +4,14 @@
 import { cacheKey, setCache } from './cache';
 import { doTranslateBatchRequest } from './api';
 import { recordRequest, recordError } from './stats';
-
-export type Settings = {
-  apiKey: string;
-  baseUrl: string;
-  model: string;
-  targetLang: string;
-  maxTokens?: number | string;
-  reasoningEffort?: string;
-  enableStreaming?: boolean;
-  hedgedRequestEnabled?: boolean;
-  hedgedDelayMs?: number | 'auto';
-  fallbackEnabled?: boolean;
-  fallbackApiKey?: string;
-  fallbackBaseUrl?: string;
-  fallbackModel?: string;
-};
+import type { Settings, TokenUsage } from '../shared/types';
 
 export type BatchApiResult = {
   translations: string[];
-  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+  usage?: TokenUsage;
 };
+
+export type { Settings };
 
 /**
  * 把主 settings 复写成 fallback 路径的 settings。

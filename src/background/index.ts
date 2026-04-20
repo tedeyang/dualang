@@ -9,6 +9,7 @@ import {
   buildFallbackSettings, buildSuperFineSettings, applyBatchResult, runFallback,
   isFallbackConfigured, shouldHedge, estimateTokens,
 } from './pipeline';
+import type { Settings, TokenUsage } from '../shared/types';
 
 // ===================== 设置缓存失效 =====================
 chrome.storage.onChanged.addListener((changes, area) => {
@@ -123,7 +124,7 @@ function getAdaptiveHedgeDelayMs(): number {
 }
 
 /** 把设置里的 hedgedDelayMs（'auto' | 数字）解析成实际毫秒 */
-function resolveHedgeDelayMs(settings: any): number {
+function resolveHedgeDelayMs(settings: Settings): number {
   const v = settings.hedgedDelayMs;
   if (v === 'auto' || v === undefined || v === null) return getAdaptiveHedgeDelayMs();
   const n = typeof v === 'number' ? v : parseInt(v, 10);
@@ -324,7 +325,7 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
     const wantsMoonshot = typeof payload.model === 'string' &&
       (payload.model.startsWith('moonshot-') || payload.model.startsWith('kimi-'));
 
-    let settings: any;
+    let settings: Settings;  // filled by one of the two branches below
     if (wantsMoonshot) {
       const moonshotKey = await getMoonshotKey();
       if (!moonshotKey) {
@@ -434,10 +435,10 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
 //   - N     → 固定 Nms
 async function raceMainAndFallback(
   texts: string[],
-  settings: any,
+  settings: Settings,
   outerSignal: AbortSignal,
   strictMode = false,
-): Promise<{ translations: string[]; usage?: any; winnerModel: string; winnerBaseUrl: string }> {
+): Promise<{ translations: string[]; usage?: TokenUsage; winnerModel: string; winnerBaseUrl: string }> {
   const hedgeDelayMs = resolveHedgeDelayMs(settings);
 
   const mainAbort = new AbortController();
@@ -466,7 +467,7 @@ async function raceMainAndFallback(
   //   2) 主在延迟期内失败 → 立刻启动兜底，不再等 — "fallback" 语义优先于"赛跑"语义
   //   3) 主在延迟期内成功 → 兜底永不启动（节省配额）；fbP 会保持 pending，
   //      但 Promise.any 已用主的结果 resolve，不会挂起
-  const fbP = new Promise<{ translations: string[]; usage?: any }>((resolve, reject) => {
+  const fbP = new Promise<{ translations: string[]; usage?: TokenUsage }>((resolve, reject) => {
     let fbFired = false;
     const fireFallback = () => {
       if (fbFired) return;
@@ -513,7 +514,7 @@ async function raceMainAndFallback(
  * 从 texts 批量提取缓存命中 + 待翻译子集。返回 results 已预填命中条目、
  * 缺失索引数组用于后续 API 调用的 sub-batch 构造。
  */
-async function batchCacheRead(texts: string[], settings: any, skipCache: boolean) {
+async function batchCacheRead(texts: string[], settings: Settings, skipCache: boolean) {
   const hashes = texts.map(t => cacheKey(t, settings.targetLang, settings.model, settings.baseUrl));
   const cachedEntries = skipCache ? new Array(texts.length).fill(null) : await getCacheBatch(hashes);
 
@@ -538,7 +539,7 @@ async function batchCacheRead(texts: string[], settings: any, skipCache: boolean
  */
 async function executeMain(
   toTranslateTexts: string[],
-  settings: any,
+  settings: Settings,
   abortSignal: AbortSignal,
   strictMode: boolean,
   priority: number,
@@ -555,7 +556,7 @@ async function executeMain(
   return r;
 }
 
-async function handleTranslateBatch(texts: string[], settings: any, priority = 0, skipCache = false, strictMode = false) {
+async function handleTranslateBatch(texts: string[], settings: Settings, priority = 0, skipCache = false, strictMode = false) {
   const { results, toTranslateIndices, toTranslateTexts } = await batchCacheRead(texts, settings, skipCache);
 
   // 全命中：不占 rate limiter、不做 in-flight 登记
