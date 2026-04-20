@@ -14,9 +14,8 @@ export interface ModelPreset {
   /** 模型 id（要和 profiles.ts 的 matchModel 对齐） */
   model: string;
   /** provider 的 config.json 键（用于在 popup 加载时自动填 apiKey） */
-  provider: 'moonshot' | 'siliconflow' | 'browser' | string;
-  /** 'openai' HTTP 路径 vs 浏览器内置 Translator */
-  providerType: 'openai' | 'browser-native';
+  provider: 'moonshot' | 'siliconflow' | string;
+  providerType: 'openai';
 }
 
 export const MODEL_PRESETS: ModelPreset[] = [
@@ -59,14 +58,6 @@ export const MODEL_PRESETS: ModelPreset[] = [
     model: 'moonshot-v1-8k',
     provider: 'moonshot',
     providerType: 'openai',
-  },
-  {
-    key: 'browser-native',
-    displayName: '浏览器本地',
-    baseUrl: 'browser://translator',
-    model: 'browser-native',
-    provider: 'browser',
-    providerType: 'browser-native',
   },
 ];
 

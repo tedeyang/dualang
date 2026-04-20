@@ -98,11 +98,8 @@ async function ensureLoaded() {
   if (!loaded) await load();
 }
 
-/** 归一化模型 key —— 浏览器本地翻译统一算 'browser-native'，避免 Chrome/Edge 分开统计 */
 function normalizeModelKey(model: string | undefined): string {
-  if (!model) return 'unknown';
-  if (model === 'browser-native') return 'browser-native';
-  return model;
+  return model || 'unknown';
 }
 
 export async function recordRequest(

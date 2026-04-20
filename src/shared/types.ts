@@ -1,7 +1,7 @@
 // ========== 翻译设置（chrome.storage.sync + config.json 的合并形态）==========
 // 字段默认值在 background/settings.ts 的 getSettings 里；popup 里也是同一套。
 
-export type ProviderType = 'openai' | 'browser-native';
+export type ProviderType = 'openai';
 export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high';
 export type HedgedDelayMode = 'auto' | number;
 

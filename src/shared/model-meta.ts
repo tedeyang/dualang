@@ -7,8 +7,6 @@
 //   - SiliconFlow:    https://siliconflow.cn/pricing (GLM-4-9B 等免费托管入口)
 //   - 通义千问 Qwen:  https://chat.qwen.ai/ (图标来自 chat.qwen.ai，SiliconFlow 上的 Qwen 模型仍归属阿里品牌)
 //   - 智谱 z.ai:      https://z.ai/
-//   - Chrome 内置:    https://developer.chrome.com/docs/ai/translator-api  (138+, 桌面)
-//   - Edge 内置:      https://learn.microsoft.com/en-us/microsoft-edge/web-platform/translator-api  (Canary 143+)
 
 export type ModelMeta = {
   modelName: string;          // 显示名：'Kimi (Moonshot)' / 'GLM (z.ai)'
@@ -26,25 +24,6 @@ export type ModelMeta = {
 export function getModelMeta(model: string, baseUrl: string): ModelMeta {
   const m = (model || '').toLowerCase();
   const b = (baseUrl || '').toLowerCase();
-
-  // 浏览器本地翻译：按运行时 UA 区分 Chrome / Edge
-  if (m === 'browser-native' || b.startsWith('browser://translator')) {
-    const isEdge = typeof navigator !== 'undefined' && /Edg\//.test(navigator.userAgent || '');
-    if (isEdge) {
-      return {
-        modelName: 'Microsoft Edge 本地翻译',
-        modelDescription: 'Edge 内置 Translator API — 完全离线、无需 API Key',
-        iconUrl: chrome.runtime.getURL('icons/edge.svg'),
-        apiDeployUrl: 'https://www.microsoft.com/edge/',
-      };
-    }
-    return {
-      modelName: 'Google Chrome 本地翻译',
-      modelDescription: 'Chrome 内置 Translator API — 完全离线、无需 API Key',
-      iconUrl: chrome.runtime.getURL('icons/chrome.svg'),
-      apiDeployUrl: 'https://www.google.com/chrome/',
-    };
-  }
 
   // 点击目标：服务方的品牌官网首页（不是控制台/平台页）
   let apiDeployUrl = b ? safeOrigin(baseUrl) : 'https://openai.com/';

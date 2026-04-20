@@ -5,7 +5,6 @@ import { renderInlineSlots, fillSlot, clearInlineSlots } from './super-fine-rend
 import { getState, ensureState } from './article-state';
 import { telemetry } from './telemetry';
 import { normalizeDisplayMode, type DisplayMode } from './display-mode';
-import { translateViaBrowser, destroyBrowserSession } from './browser-translator';
 import { requestTranslationChunked } from './long-article-chunked';
 import { findAndPrepareGrokCards, GROK_DISCLAIMER_PREFIXES } from './grok-card';
 import { renderTranslation } from './render';
@@ -33,7 +32,6 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
   let autoTranslate = true;
   let displayMode: DisplayMode = 'append';
   let enableStreaming = false;
-  let providerType: 'openai' | 'browser-native' = 'openai';
 
   // Article 级别的状态通过 WeakMap<Element, ArticleState> 管理（见 article-state.ts）
   // TweetArticle 只是 Element 的别名，保留供 JSDoc / 可读性
@@ -161,7 +159,6 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
   }
 
   // ========== 统一的翻译请求入口 ==========
-  // 根据 providerType 分发到本地 Translator API 或 background HTTP 路径。
   type ResponseData = {
     translations: string[];
     usage?: { total_tokens?: number };
@@ -176,9 +173,6 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     skipCache = false,
     strictMode = false,
   ): Promise<ResponseData> {
-    if (providerType === 'browser-native') {
-      return translateViaBrowser(texts, targetLang);  // 浏览器本地翻译不支持 strict 模式
-    }
     // 长文（单条 4k+ 字符 + 6+ 段落）自动切段：小模型在整包 20k 字符输入下
     // 会把 N 段输出压成 2 段，切成 5-段一组的独立 sub-batch 各自翻译能保证段落数对齐。
     if (texts.length === 1 && isLongText(texts[0])) {
@@ -224,7 +218,6 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       displayMode: null,  // null 哨兵：未设时根据老 bilingualMode 迁移
       bilingualMode: false,
       enableStreaming: false,
-      providerType: 'openai'
     });
     enabled         = settings.enabled;
     targetLang      = settings.targetLang   || 'zh-CN';
@@ -232,7 +225,6 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     // 迁移：老用户 displayMode 未设，根据 bilingualMode 推导；bilingualMode=true → 'inline'（升级到段落对照）
     displayMode     = normalizeDisplayMode(settings.displayMode, settings.bilingualMode);
     enableStreaming  = !!settings.enableStreaming;
-    providerType    = settings.providerType === 'browser-native' ? 'browser-native' : 'openai';
     perfLog('init', {
       enabled, targetLang, autoTranslate, displayMode,
       initCostMs: (performance.now() - t0).toFixed(2)
@@ -348,12 +340,6 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       if (prev !== displayMode && enabled) reRenderAllForModeChange();
     }
     if (changes.enableStreaming !== undefined) enableStreaming = !!changes.enableStreaming.newValue;
-    if (changes.providerType !== undefined) {
-      const v = changes.providerType.newValue;
-      providerType = v === 'browser-native' ? 'browser-native' : 'openai';
-      // 切换 provider 时，清空浏览器本地 session 缓存
-      destroyBrowserSession();
-    }
     // baseUrl / model / apiKey 变化：content 侧不需要做什么；background 的
     // settingsCache 已通过同一 onChanged 失效，下次请求即用新 provider
   });
@@ -924,7 +910,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       const apiT0 = performance.now();
       const hasHighPriority = subBatch.some(b => b.highPriority);
 
-      // 统一通过 requestTranslation 分发（openai HTTP 或 browser-native）。内含 30s 超时保护。
+      // 统一通过 requestTranslation 分发（含 30s 超时保护）。
       withSlot(() =>
         requestTranslation(texts, hasHighPriority ? 1 : 0, false)
       ).then((data) => {

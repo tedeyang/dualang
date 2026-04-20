@@ -40,7 +40,7 @@ export async function getSettings() {
     apiKey: localConfig?.providers?.siliconflow?.apiKey || defaultApiKey,
     baseUrl: 'https://api.siliconflow.cn/v1',
     model: 'THUDM/GLM-4-9B-0414',
-    providerType: 'openai',           // 'openai' | 'browser-native'（后者不走 background，仅 content 用）
+    providerType: 'openai',
     enableStreaming: false,
     maxTokens: 4096,
     reasoningEffort: 'none',

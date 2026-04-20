@@ -276,23 +276,6 @@ test.describe('Realistic X.com DOM scenarios', () => {
     expect(errText).toMatch(/bad key to log|invalid_api_key|API Key/);
   });
 
-  test('选择浏览器本地翻译预设 → 保存后 API/模型字段被禁用，providerType 持久化', async ({ popupPage }) => {
-    await popupPage.locator('#preset').selectOption('browser-native');
-    // API Key / baseUrl / model 等 HTTP 相关字段应被置灰
-    await expect(popupPage.locator('#apiKey')).toBeDisabled();
-    await expect(popupPage.locator('#baseUrl')).toBeDisabled();
-    await expect(popupPage.locator('#model')).toBeDisabled();
-    await expect(popupPage.locator('#maxTokens')).toBeDisabled();
-
-    await popupPage.locator('#saveBtn').click();
-    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
-
-    // 刷新 popup，字段仍是 browser-native
-    await popupPage.reload();
-    await expect(popupPage.locator('#preset')).toHaveValue('browser-native');
-    await expect(popupPage.locator('#apiKey')).toBeDisabled();
-  });
-
   test('质量重试用严格 prompt，API 收到 strictMode=true', async ({ context, popupPage }) => {
     await savePopup(popupPage);
 

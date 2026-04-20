@@ -146,37 +146,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
   fallbackPresetSelect.value = detectFallbackPreset(settings.fallbackBaseUrl, settings.fallbackModel);
 
-  // 浏览器本地翻译不需要 API Key / baseUrl；切换时锁定相关输入
-  function applyBrowserNativeMode(on) {
-    const disabled = on;
-    apiKeyInput.disabled = disabled;
-    baseUrlInput.disabled = disabled;
-    modelInput.disabled = disabled;
-    maxTokensInput.disabled = disabled;
-    reasoningEffortSelect.disabled = disabled;
-    enableStreamingCheckbox.disabled = disabled;
-    fallbackEnabledCheckbox.disabled = disabled; // fallback 是 HTTP API 专用概念
-    if (on) {
-      apiKeyInput.placeholder = '浏览器本地翻译无需 API Key';
-    } else {
-      apiKeyInput.placeholder = 'sk-...';
-    }
-  }
-  applyBrowserNativeMode(settings.providerType === 'browser-native');
-
   presetSelect.addEventListener('change', () => {
     const key = presetSelect.value;
     if (PRESETS[key]) {
       baseUrlInput.value = PRESETS[key].baseUrl;
       modelInput.value = PRESETS[key].model;
-      const isBrowserNative = PRESETS[key].providerType === 'browser-native';
-      applyBrowserNativeMode(isBrowserNative);
-      if (isBrowserNative) {
-        apiKeyInput.value = 'browser-native'; // 占位，通过非空校验
-      } else {
-        const providerKey = localConfig?.providers?.[PRESETS[key].provider]?.apiKey;
-        if (providerKey) apiKeyInput.value = providerKey;
-      }
+      const providerKey = localConfig?.providers?.[PRESETS[key].provider]?.apiKey;
+      if (providerKey) apiKeyInput.value = providerKey;
     }
   });
 
@@ -208,14 +184,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
-    const presetKey = presetSelect.value;
-    const providerType = (PRESETS[presetKey]?.providerType) || 'openai';
-
     await chrome.storage.sync.set({
       baseUrl,
       apiKey,
       model: (modelInput.value || 'moonshot-v1-8k').trim(),
-      providerType,
+      providerType: 'openai',
       reasoningEffort: reasoningEffortSelect.value,
       maxTokens,
       enableStreaming: enableStreamingCheckbox.checked,
@@ -279,15 +252,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // 与 src/shared/model-meta.ts 对齐的品牌检测 —— 供 popup 内嵌渲染。
   // 保持最小实现，只用 baseUrl / 模型名就能判出图标路径和友好名称。
-  function modelBrand(modelKey) {
+  function modelBrand(modelKey: string) {
     const m = String(modelKey || '').toLowerCase();
-    if (modelKey === 'browser-native') {
-      const isEdge = /Edg\//.test(navigator.userAgent || '');
-      return {
-        iconUrl: chrome.runtime.getURL(isEdge ? 'icons/edge.svg' : 'icons/chrome.svg'),
-        displayName: isEdge ? 'Edge 本地' : 'Chrome 本地',
-      };
-    }
     if (m.includes('kimi') || m.includes('moonshot')) {
       return { iconUrl: chrome.runtime.getURL('icons/kimi.png'), displayName: modelKey };
     }

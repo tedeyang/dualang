@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Dualang ("X 光速翻译") is a Chrome Extension (Manifest V3) for X.com / Twitter that provides streaming bilingual translation. It is **OpenAI-compatible provider agnostic** — default is SiliconFlow's free `THUDM/GLM-4-9B-0414`; Moonshot Kimi, Qwen (via SiliconFlow), and the W3C Translator API (Chrome 138+ / Edge Canary 143+) are first-class alternates. Super-fine (long-article) translation defaults to GLM as well; Moonshot Kimi is opt-in.
+Dualang ("X 光速翻译") is a Chrome Extension (Manifest V3) for X.com / Twitter that provides streaming bilingual translation. It is **OpenAI-compatible provider agnostic** — default is SiliconFlow's free `THUDM/GLM-4-9B-0414`; Moonshot Kimi and Qwen (via SiliconFlow) are first-class alternates. Super-fine (long-article) translation defaults to GLM as well; Moonshot Kimi is opt-in.
 
 ## Commands
 
@@ -49,7 +49,7 @@ Three contexts, wired by `chrome.runtime.sendMessage` and `chrome.runtime.connec
 
 ### `src/content/` — X.com injection
 
-- **`index.ts`** — large IIFE (currently undergoing refactor): scheduler, IntersectionObserver viewport/preload, MutationObserver for dynamic loads + show-more + DOM recycle, pendingQueue + dedup Set, streaming vs sendMessage dispatch, render pipeline across 4 display modes, browser-native Translator session, status indicators, super-fine wire-up.
+- **`index.ts`** — large IIFE (currently undergoing refactor): scheduler, IntersectionObserver viewport/preload, MutationObserver for dynamic loads + show-more + DOM recycle, pendingQueue + dedup Set, streaming vs sendMessage dispatch, render pipeline across 4 display modes, status indicators, super-fine wire-up.
 - **`super-fine-bubble.ts`** — right-side floating bubble state machine (`idle` / `translating` / `done` / `failed`), Y-axis drag with localStorage persistence, hover mini-panel with cancel/retry, X文 logo via CSS `color-mix(--progress)` + bubble/extension icons sharing the design.
 - **`super-fine-render.ts`** — inline slot skeletons inserted after each original DOM block via `insertBefore(slot, block.el.nextSibling)`. Preserves original `<img>` / `<video>` / `<a>` / `@mention`.
 - **`utils.ts`** — `shouldSkipContent`, `isAlreadyTargetLanguage` (CJK / kana / hangul / latin ratio), `extractText` (uses innerText to keep CSS block boundaries), `splitParagraphsByDom` (TreeWalker + Range for HTML-preserving paragraph split), `extractAnchoredBlocks` (leaf-block walker returning `{el, kind: 'text' | 'img-alt', text}`), `getContentId` (strategy chain: X status / Mastodon / Reddit / HN / YouTube / Bluesky / `data-*` / Grok title / `el.id`).
@@ -83,7 +83,7 @@ Legacy migration: `bilingualMode=true` (no `displayMode`) → `'inline'`; otherw
 
 1. Content `scanAndQueue` registers each article with `viewportObserver` + `preloadObserver` (rootMargin ≈ `viewportHeight`).
 2. On observer hit → `queueTranslation` enqueues + dedup Set. Scheduler flushes batches of 20, split into sub-batches of 5 with max 5 concurrent.
-3. `requestTranslation` dispatches: browser-native → `translateViaBrowser`; long article single text → `requestTranslationChunked` (5-paragraph chunks, serial); normal → `chrome.runtime.sendMessage({action:'translate', payload:{texts, priority, skipCache, strictMode}})` with 30s timeout.
+3. `requestTranslation` dispatches: long article single text → `requestTranslationChunked` (5-paragraph chunks, serial); normal → `chrome.runtime.sendMessage({action:'translate', payload:{texts, priority, skipCache, strictMode}})` with 30s timeout.
 4. Background `handleTranslateBatch`: cache batch-read → in-flight dedup by batch-hash → rate-limiter acquire → hedged vs non-hedged → main→fallback fallback → cache write → stats record. Returns `{translations, model, baseUrl, fromCache, usage}`.
 5. Content renders per `displayMode`, caches result in `translationCache` keyed by `getContentId(article)`.
 
