@@ -111,15 +111,26 @@ dict 属性里的词是预筛过的高难候选，字典条目只能从这些候
 4. 若候选都不需要注释，直接省略 ---DICT--- 段，不要写空段。
 5. 无 dict 属性的条目一律不输出 ---DICT--- 段；多写会让解析失败。`;
 
-/** 根据 profile + 是否批量 + 是否严格模式 + 是否字典融合，组装最终的 system prompt */
+// 试试手气 — 用户点击品牌 logo 触发的重译加强前缀。强调"精准 / 更地道 / 上下文一致"，
+// 鼓励模型给出与上次不同角度但仍然忠实的翻译。配合 temperature 上浮使用。
+const BOOST_PREFIX = (lang: string) => `【重译请求】用户对上一次译文不满意，请用更精准、地道的${lang}重新翻译。
+1. 保持原文语义完整，不得删减或合并句子。
+2. 避免机械直译；遇到固定搭配 / 专有说法，优先采用目标语自然的表达。
+3. 若上下文已明确，允许在保留原意的前提下换用不同措辞，避免与上一版雷同。
+
+`;
+
+/** 根据 profile + 是否批量 + 是否严格模式 + 是否字典融合 / 重译加强，组装最终的 system prompt */
 export function composeSystemPrompt(
   profile: ProviderProfile,
   lang: string,
-  opts: { batch: boolean; strict: boolean; smartDict?: boolean },
+  opts: { batch: boolean; strict: boolean; smartDict?: boolean; retranslateBoost?: boolean },
 ): string {
   const base = opts.batch ? profile.systemPromptBatch(lang) : profile.systemPromptSingle(lang);
   const dictSuffix = opts.batch && opts.smartDict ? BATCH_DICT_SUFFIX(lang) : '';
-  return (opts.strict ? STRICT_PREFIX(lang) : '') + base + dictSuffix;
+  const boostPrefix = opts.retranslateBoost ? BOOST_PREFIX(lang) : '';
+  const strictPrefix = opts.strict ? STRICT_PREFIX(lang) : '';
+  return boostPrefix + strictPrefix + base + dictSuffix;
 }
 
 import type { DictionaryEntry } from '../shared/types';

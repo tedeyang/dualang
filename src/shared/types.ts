@@ -66,6 +66,12 @@ export interface TranslateBatchPayload {
    * ---DICT--- 段落。content 已经做过语种识别，避免 background 重做。
    */
   englishFlags?: boolean[];
+  /**
+   * "试试手气"重译：用户对当前译文不满意，手动点击 logo 触发。
+   * background 侧会上浮 temperature（+0.3，最高 0.9）并在 system prompt 前追加
+   * "请更准确翻译"的强化提示；同时 skipCache + strictMode 均已为 true。
+   */
+  retranslateBoost?: boolean;
 }
 
 export interface TranslateSinglePayload {

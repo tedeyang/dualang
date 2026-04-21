@@ -122,4 +122,49 @@ describe('linkifyText', () => {
     expect(links[0].getAttribute('href')).toBe('https://a.com/x');
     expect(links[1].getAttribute('href')).toBe('https://b.io/y');
   });
+
+  it('bare 短链（无协议）也识别并加 https:// 前缀', () => {
+    const frag = linkifyText('See reut.rs/3Qp4Eui for details');
+    const box = document.createElement('div');
+    box.appendChild(frag);
+    const a = box.querySelector('a')!;
+    expect(a).not.toBeNull();
+    expect(a.getAttribute('href')).toBe('https://reut.rs/3Qp4Eui');
+    expect(a.textContent).toBe('reut.rs/3Qp4Eui');
+  });
+
+  it('@mention 识别为 x.com/user 链接', () => {
+    const frag = linkifyText('由 @iuliaferoli 发布');
+    const box = document.createElement('div');
+    box.appendChild(frag);
+    const a = box.querySelector('a')!;
+    expect(a).not.toBeNull();
+    expect(a.getAttribute('href')).toBe('https://x.com/iuliaferoli');
+    expect(a.textContent).toBe('@iuliaferoli');
+  });
+
+  it('#hashtag 识别为 x.com/hashtag 链接', () => {
+    const frag = linkifyText('Loving #HuggingFace today');
+    const box = document.createElement('div');
+    box.appendChild(frag);
+    const a = box.querySelector('a')!;
+    expect(a.getAttribute('href')).toBe('https://x.com/hashtag/HuggingFace');
+    expect(a.textContent).toBe('#HuggingFace');
+  });
+
+  it('email 不被误识别为 @mention', () => {
+    const frag = linkifyText('Contact foo@bar.com please');
+    const box = document.createElement('div');
+    box.appendChild(frag);
+    expect(box.querySelector('a')).toBeNull();
+  });
+
+  it('完整 URL 优先，不被 bare host 或 @ 误切', () => {
+    const frag = linkifyText('go https://a.com/@foo/bar end');
+    const box = document.createElement('div');
+    box.appendChild(frag);
+    const links = box.querySelectorAll('a');
+    expect(links).toHaveLength(1);
+    expect(links[0].getAttribute('href')).toBe('https://a.com/@foo/bar');
+  });
 });

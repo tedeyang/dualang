@@ -248,9 +248,19 @@ async function handleTranslate(payload: any) {
   console.log('[Dualang] translate config baseUrl=', settings.baseUrl, 'model=', settings.model, 'priority=', payload.priority);
 
   if (payload.texts && Array.isArray(payload.texts)) {
+    // 试试手气重译：temperature 上浮 + prompt 加强。复制 settings 到本次调用，
+    // 不污染全局 settingsCache。
+    let callSettings = settings;
+    if (payload.retranslateBoost) {
+      callSettings = {
+        ...settings,
+        temperatureBoost: 0.3,
+        retranslateBoost: true,
+      } as typeof settings;
+    }
     return handleTranslateBatch(
       payload.texts,
-      settings,
+      callSettings,
       payload.priority || 0,
       !!payload.skipCache,
       !!payload.strictMode,
@@ -287,7 +297,10 @@ async function handleTranslate(payload: any) {
 
 async function handleTranslateStream(payload: any, port: chrome.runtime.Port) {
   try {
-    const settings = await getSettings();
+    const baseSettings = await getSettings();
+    const settings = payload.retranslateBoost
+      ? ({ ...baseSettings, temperatureBoost: 0.3, retranslateBoost: true } as typeof baseSettings)
+      : baseSettings;
     const texts: string[] = payload.texts;
     if (!texts || !Array.isArray(texts) || texts.length === 0) {
       port.postMessage({ action: 'done', translations: [] });

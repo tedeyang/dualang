@@ -182,14 +182,17 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
   // 保证 activeRequests 递增/递减始终配对，释放槽位时自动 drain 队列
   function withSlot<T>(fn: () => Promise<T>): Promise<T> {
     activeRequests++;
+    bubble.setTranslationActivity(activeRequests);
     return fn().then(
       (result) => {
         activeRequests--;
+        bubble.setTranslationActivity(activeRequests);
         scheduler.request();  // 槽位释放，自动尝试 drain
         return result;
       },
       (err) => {
         activeRequests--;
+        bubble.setTranslationActivity(activeRequests);
         scheduler.request();
         throw err;
       }
@@ -211,11 +214,14 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     priority: number,
     skipCache = false,
     strictMode = false,
+    extras?: { retranslateBoost?: boolean },
   ): Promise<ResponseData> {
     // 长文（单条 4k+ 字符 + 6+ 段落）自动切段：小模型在整包 20k 字符输入下
     // 会把 N 段输出压成 2 段，切成 5-段一组的独立 sub-batch 各自翻译能保证段落数对齐。
     if (texts.length === 1 && isLongText(texts[0])) {
-      return requestTranslationChunked(texts[0], priority, skipCache, strictMode);
+      return requestTranslationChunked(texts[0], priority, skipCache, strictMode, {
+        retranslateBoost: !!extras?.retranslateBoost,
+      });
     }
     // Combined call：字典开关开且非 translation-only 时，对每条英文文本请求字典融合。
     // 非英文条目置 false，background 在 prompt 里就不标 "(dict)" —— 模型不会白算字典。
@@ -229,6 +235,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
           texts, priority, skipCache, strictMode,
           smartDict: !!englishFlags && englishFlags.some(Boolean),
           englishFlags,
+          retranslateBoost: !!extras?.retranslateBoost,
         },
       }),
       new Promise((_, reject) => setTimeout(() => reject(new Error(`翻译请求超时 (${REQUEST_TIMEOUT_MS / 1000}s)`)), REQUEST_TIMEOUT_MS)),
@@ -1244,6 +1251,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     const apiT0 = performance.now();
 
     activeRequests++;
+    bubble.setTranslationActivity(activeRequests);
     // 恰好一次释放 slot。done/error/timeout/onDisconnect 均可到达，
     // 但 activeRequests-- 与 scheduler.request() 只能执行一次。
     let slotReleased = false;
@@ -1251,6 +1259,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       if (slotReleased) return;
       slotReleased = true;
       activeRequests--;
+      bubble.setTranslationActivity(activeRequests);
       scheduler.request();
     };
 
@@ -1431,6 +1440,11 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     ensureState(article).lastText = tweetTextEl.textContent || '';
     showStatus(article, 'loading');
     const apiT0 = performance.now();
+    // 立即通道不走 withSlot（priority 2 绕限流）但仍要让浮球转起来
+    activeRequests++;
+    bubble.setTranslationActivity(activeRequests);
+    let released = false;
+    const releaseActivity = () => { if (released) return; released = true; activeRequests--; bubble.setTranslationActivity(activeRequests); };
     try {
       // priority 2 = 最高；isQualityRetry=true 同时触发 skipCache + strictMode
       // 严格 prompt 会明确要求模型"不要总结、保留段落"，破解上一次被压缩成短译文的怪圈
@@ -1530,6 +1544,8 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       hideStatus(article, true);
       // 已知当前正在使用的 model/baseUrl（来自设置缓存不可得，fail 路径仅记录错误）
       showFail(article, err.message);
+    } finally {
+      releaseActivity();
     }
   }
 
@@ -1616,10 +1632,17 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
 
     let status = article.querySelector('.dualang-status') as HTMLElement | null;
     const tweetTextEl = findTweetTextEl(article);
+    // status 必须出现在翻译 card 之后（视觉右下角）。translation-only / inline /
+    // line-fusion 模式下 tweetText 被 CSS 隐藏，若 status 仍落在 tweetText 紧邻处，
+    // 会视觉漂到 card 的右上角。统一 anchor 到 card.nextSibling。
+    const card = article.querySelector('.dualang-translation') as HTMLElement | null;
     if (!status) {
-      if (!tweetTextEl) return;
+      const anchor = card || tweetTextEl;
+      if (!anchor) return;
       status = document.createElement('div');
-      tweetTextEl.parentNode!.insertBefore(status, tweetTextEl.nextSibling);
+      anchor.parentNode!.insertBefore(status, anchor.nextSibling);
+    } else if (card && status.previousElementSibling !== card) {
+      card.parentNode!.insertBefore(status, card.nextSibling);
     }
     status.className = 'dualang-status dualang-status--success';
     status.dataset.type = 'success';
@@ -1638,13 +1661,65 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       : typeof meta.tokens === 'number'
         ? `本次消耗 ${meta.tokens} tokens`
         : '';
-    status.title = [m.modelName, m.modelDescription, tokenLine, '点击访问官网'].filter(Boolean).join('\n');
+    status.title = [
+      `当前模型：${m.modelName}`,
+      m.modelDescription,
+      tokenLine,
+      '点击重新翻译，试试手气（绕过缓存，更强提示）',
+    ].filter(Boolean).join('\n');
 
-    // 用 onclick 覆盖式赋值，避免重复绑定（status 元素可能被 loading→success 复用）
+    // 用 onclick 覆盖式赋值，避免重复绑定（status 元素可能被 loading→success 复用）。
+    // 点击 = 不满意当前译文 → 重新翻译：skipCache + strictMode + retranslateBoost
+    // （后端会上浮温度 + 追加"精准翻译"提示），同时把 logo 换成旋转状态。
     status.onclick = (e) => {
       e.stopPropagation();
-      try { window.open(m.apiDeployUrl, '_blank', 'noopener,noreferrer'); } catch (_) {}
+      const currentEl = findTweetTextEl(article);
+      if (!currentEl) return;
+      // 清掉现有译文 + 标记位，让 translateImmediate 按全新流程走
+      article.querySelector('.dualang-translation')?.remove();
+      article.removeAttribute('data-dualang-mode');
+      article.removeAttribute('data-dualang-line-fusion');
+      delete ensureState(article).qualityRetried;
+      // 当前 status 元素进入"品牌图标旋转中"状态；translateImmediate 成功后
+      // 会再次调用 showSuccess，替换为新的 status
+      status!.classList.add('dualang-status--retranslating');
+      status!.dataset.type = 'retranslating';
+      translateImmediateBoost(article, currentEl);
     };
+  }
+
+  /**
+   * 重新翻译（用户点击 logo 或 fail 图标触发）。封装 translateImmediate + boost flag：
+   *   skipCache: 避开已缓存的坏翻译
+   *   strictMode: STRICT_PREFIX 明确要求不压缩、保留段落
+   *   retranslateBoost: 后端上调温度 + 追加"请更准确翻译"提示 —— 用户点击就是对
+   *     当前译文不满意，需要模型给出不同角度的结果
+   */
+  async function translateImmediateBoost(article: Element, tweetTextEl: Element): Promise<void> {
+    const text = extractText(tweetTextEl);
+    if (!text) return;
+    const originalContentId = getContentId(article);
+    activeRequests++;
+    bubble.setTranslationActivity(activeRequests);
+    try {
+      const data = await requestTranslation([text], 2, true, true, { retranslateBoost: true });
+      const translated = data.translations?.[0];
+      if (!translated) { hideStatus(article); return; }
+      const freshTextEl = findTweetTextEl(article) || tweetTextEl;
+      renderTranslationLocal(article, freshTextEl, translated, text);
+      ensureState(article as TweetArticle).lastText = freshTextEl.textContent || '';
+      if (originalContentId) {
+        translationCache.set(originalContentId, {
+          translated, original: text, model: data.model, baseUrl: data.baseUrl,
+        });
+      }
+      showSuccess(article, { model: data.model, baseUrl: data.baseUrl, tokens: data.usage?.total_tokens });
+    } catch (err) {
+      showFail(article, (err as Error)?.message);
+    } finally {
+      activeRequests--;
+      bubble.setTranslationActivity(activeRequests);
+    }
   }
 
   // ========== 手动翻译按钮 ==========

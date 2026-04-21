@@ -2,10 +2,12 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { initBubble, setLongArticle, setBubbleState, disposeBubble, bindSuperFineArticle } from './super-fine-bubble';
+import { initBubble, setLongArticle, setBubbleState, disposeBubble, bindSuperFineArticle, setTranslationActivity } from './super-fine-bubble';
 
 // chrome API mock：浮球初始化会调 storage.sync.get / onChanged / sendMessage
+let storageListeners: Array<(changes: any, area: string) => void>;
 beforeEach(() => {
+  storageListeners = [];
   (globalThis as any).chrome = {
     runtime: {
       sendMessage: vi.fn().mockResolvedValue({ success: true, data: {} }),
@@ -22,7 +24,10 @@ beforeEach(() => {
         }),
         set: vi.fn().mockResolvedValue(undefined),
       },
-      onChanged: { addListener: vi.fn() },
+      local: {
+        get: vi.fn().mockResolvedValue({}),
+      },
+      onChanged: { addListener: (fn: any) => { storageListeners.push(fn); } },
     },
   };
   document.body.innerHTML = '';
@@ -134,6 +139,55 @@ describe('hover panel', () => {
     const panel = document.querySelector('.dualang-bubble-panel')!;
     bubble.dispatchEvent(new PointerEvent('pointerenter'));
     expect(panel.classList.contains('dualang-bubble-panel--visible')).toBe(true);
+  });
+});
+
+describe('bubble translation activity states', () => {
+  it('setTranslationActivity(n>0) → bubble 加 --busy class', () => {
+    initBubble();
+    const bubble = document.querySelector('.dualang-bubble') as HTMLElement;
+    setTranslationActivity(2);
+    expect(bubble.classList.contains('dualang-bubble--busy')).toBe(true);
+    setTranslationActivity(0);
+    expect(bubble.classList.contains('dualang-bubble--busy')).toBe(false);
+  });
+
+  it('点击 bubble 切换 enabled → chrome.storage.sync.set 被调用，enabled 翻转', async () => {
+    initBubble();
+    await new Promise((r) => setTimeout(r, 20));  // loadSettingsFromStorage
+    const bubble = document.querySelector('.dualang-bubble') as HTMLElement;
+    const setMock = (globalThis as any).chrome.storage.sync.set;
+    setMock.mockClear();
+    bubble.click();
+    expect(setMock).toHaveBeenCalledWith(expect.objectContaining({ enabled: false }));
+  });
+
+  it('storage.local.dualang_error_v1 变化 → bubble 加/去 --has-error class', async () => {
+    initBubble();
+    await new Promise((r) => setTimeout(r, 20));
+    const bubble = document.querySelector('.dualang-bubble') as HTMLElement;
+    expect(bubble.classList.contains('dualang-bubble--has-error')).toBe(false);
+    // 模拟 background.reportFatalError 写入
+    for (const fn of storageListeners) {
+      fn({ dualang_error_v1: { newValue: { message: 'quota exceeded' }, oldValue: null } }, 'local');
+    }
+    expect(bubble.classList.contains('dualang-bubble--has-error')).toBe(true);
+    // 模拟 clearErrorState
+    for (const fn of storageListeners) {
+      fn({ dualang_error_v1: { newValue: undefined, oldValue: { message: 'quota exceeded' } } }, 'local');
+    }
+    expect(bubble.classList.contains('dualang-bubble--has-error')).toBe(false);
+  });
+
+  it('有 fatal error 时不显示 --idle-ok 绿勾（红叉独占右下角）', async () => {
+    initBubble();
+    await new Promise((r) => setTimeout(r, 20));
+    const bubble = document.querySelector('.dualang-bubble') as HTMLElement;
+    for (const fn of storageListeners) {
+      fn({ dualang_error_v1: { newValue: { message: 'err' }, oldValue: null } }, 'local');
+    }
+    expect(bubble.classList.contains('dualang-bubble--has-error')).toBe(true);
+    expect(bubble.classList.contains('dualang-bubble--idle-ok')).toBe(false);
   });
 });
 

@@ -42,8 +42,13 @@ interface BubbleCtx {
   currentLongArticle: Element | null;
   /** 正在精翻的 article（与 currentLongArticle 可能不同）*/
   superFineArticle: Element | null;
+  /** 普通翻译正在进行中的计数（>0 → ring 动起来）*/
+  activeTranslations: number;
+  /** 阻碍型错误（额度不足 / 401/403 / 批量失败 等）。由 background 的 reportFatalError
+   *  写 chrome.storage.local['dualang_error_v1'] 驱动；个别单条翻译失败不进这个状态。 */
+  hasFatalError: boolean;
   callbacks: BubbleCallbacks;
-  docHandlers: { move: (e: PointerEvent) => void; up: () => void };
+  docHandlers: { move: (e: PointerEvent) => void; up: () => void; hoverMove?: (e: PointerEvent) => void };
   rttPollTimer: ReturnType<typeof setInterval> | null;
   rttByModel: Record<string, { avgMs: number; samples: number }>;
 }
@@ -81,10 +86,16 @@ export function initBubble(callbacks: BubbleCallbacks = {}): void {
   panel.innerHTML = renderPanelTemplate();
   if (!isNaN(savedTop)) panel.style.top = `${savedTop}px`;
 
-  root.addEventListener('click', () => {
+  root.addEventListener('click', async () => {
     if (moved) { moved = false; return; }
-    // 点击浮球自身切换 panel 显隐（hover 也显示，点击可粘住）
-    panel.classList.toggle('dualang-bubble-panel--pinned');
+    // 点击 = 切换翻译开关；面板显隐由 hover 管理，不再用 pinned
+    if (!ctx) return;
+    const next = !ctx.settings.enabled;
+    await writeSettings({ enabled: next });
+    // writeSettings 触发的 onChanged 会走 refreshPanel；我们先手动同步一次
+    // 以便下一行的 refreshBubbleVisual 用新值渲染。
+    ctx.settings.enabled = next;
+    refreshBubbleVisual();
   });
 
   root.addEventListener('pointerdown', (e) => {
@@ -140,47 +151,125 @@ export function initBubble(callbacks: BubbleCallbacks = {}): void {
     },
     currentLongArticle: null,
     superFineArticle: null,
+    activeTranslations: 0,
+    hasFatalError: false,
     callbacks,
     docHandlers: { move: onPointerMove, up: onPointerUp },
     rttPollTimer: null,
     rttByModel: {},
   };
 
-  // hover 悬停展示面板；点击可粘住（加 --pinned class）
+  // hover 悬停展示面板。旧实现用 pointerenter/leave，DOM 频繁更新时偶尔会漏掉
+  // pointerleave 事件（元素被替换或快速移出区域），面板挂住不消失。改为 document
+  // 级 pointermove 做实时命中测试：鼠标在 root 或 panel 包围盒（含 12px 回廊）内
+  // → show；否则启动 hideTimer。不再有 pinned 状态，点击现在切换 enabled。
   let hideTimer: ReturnType<typeof setTimeout> | null = null;
+  const HOVER_GAP = 16;
+  const isInsideHoverZone = (x: number, y: number): boolean => {
+    const rr = root.getBoundingClientRect();
+    if (x >= rr.left - HOVER_GAP && x <= rr.right + HOVER_GAP
+        && y >= rr.top - HOVER_GAP && y <= rr.bottom + HOVER_GAP) return true;
+    if (panel.classList.contains('dualang-bubble-panel--visible')) {
+      const pr = panel.getBoundingClientRect();
+      if (x >= pr.left - HOVER_GAP && x <= pr.right + HOVER_GAP
+          && y >= pr.top - HOVER_GAP && y <= pr.bottom + HOVER_GAP) return true;
+    }
+    return false;
+  };
   const showPanel = () => {
     if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
     refreshPanel();
     panel.classList.add('dualang-bubble-panel--visible');
   };
-  const hidePanel = () => {
+  const schedulePanelHide = () => {
+    if (hideTimer) return;
     hideTimer = setTimeout(() => {
-      if (!panel.classList.contains('dualang-bubble-panel--pinned')) {
-        panel.classList.remove('dualang-bubble-panel--visible');
-      }
-    }, 120);
+      hideTimer = null;
+      panel.classList.remove('dualang-bubble-panel--visible');
+    }, 180);
   };
+  // 主路径：pointerenter/leave 响应及时；document 级 pointermove 是兜底 watchdog，
+  // 当 pointerleave 被 DOM 替换 / 布局抖动吞掉时，watchdog 会按鼠标坐标判断并收起。
   root.addEventListener('pointerenter', showPanel);
-  root.addEventListener('pointerleave', hidePanel);
+  root.addEventListener('pointerleave', schedulePanelHide);
   panel.addEventListener('pointerenter', showPanel);
-  panel.addEventListener('pointerleave', hidePanel);
+  panel.addEventListener('pointerleave', schedulePanelHide);
+  const onHoverMove = (e: PointerEvent) => {
+    if (!panel.classList.contains('dualang-bubble-panel--visible')) return;
+    if (!isInsideHoverZone(e.clientX, e.clientY)) schedulePanelHide();
+  };
+  document.addEventListener('pointermove', onHoverMove);
+  // tab 切换 / window blur 时强制收起，避免面板挂住
+  window.addEventListener('blur', () => schedulePanelHide());
+  ctx.docHandlers.hoverMove = onHoverMove;
 
   wirePanelControls();
-  loadSettingsFromStorage().then(() => refreshPanel());
+  loadSettingsFromStorage().then(() => { refreshPanel(); refreshBubbleVisual(); });
   startRttPoll();
 
   // storage 变更（popup 里改设置）同步到 panel 选中态
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== 'sync' || !ctx) return;
-    let dirty = false;
-    if (changes.enabled)   { ctx.settings.enabled = changes.enabled.newValue !== false; dirty = true; }
-    if (changes.displayMode) { ctx.settings.displayMode = normalizeDisplayMode(changes.displayMode.newValue); dirty = true; }
-    if (changes.lineFusionEnabled) { ctx.settings.lineFusionEnabled = !!changes.lineFusionEnabled.newValue; dirty = true; }
-    if (changes.smartDictEnabled) { ctx.settings.smartDictEnabled = !!changes.smartDictEnabled.newValue; dirty = true; }
-    if (changes.baseUrl)   { ctx.settings.baseUrl = changes.baseUrl.newValue || ''; dirty = true; }
-    if (changes.model)     { ctx.settings.model = changes.model.newValue || ''; dirty = true; }
-    if (dirty) refreshPanel();
+    if (!ctx) return;
+    if (area === 'sync') {
+      let dirty = false;
+      let enabledChanged = false;
+      if (changes.enabled)   { ctx.settings.enabled = changes.enabled.newValue !== false; dirty = true; enabledChanged = true; }
+      if (changes.displayMode) { ctx.settings.displayMode = normalizeDisplayMode(changes.displayMode.newValue); dirty = true; }
+      if (changes.lineFusionEnabled) { ctx.settings.lineFusionEnabled = !!changes.lineFusionEnabled.newValue; dirty = true; }
+      if (changes.smartDictEnabled) { ctx.settings.smartDictEnabled = !!changes.smartDictEnabled.newValue; dirty = true; }
+      if (changes.baseUrl)   { ctx.settings.baseUrl = changes.baseUrl.newValue || ''; dirty = true; }
+      if (changes.model)     { ctx.settings.model = changes.model.newValue || ''; dirty = true; }
+      if (dirty) refreshPanel();
+      if (enabledChanged) refreshBubbleVisual();
+    } else if (area === 'local' && changes.dualang_error_v1) {
+      // background reportFatalError / clearErrorState 写这个 key；有值 → 红叉亮起
+      const next = !!changes.dualang_error_v1.newValue;
+      if (ctx.hasFatalError !== next) {
+        ctx.hasFatalError = next;
+        refreshBubbleVisual();
+      }
+    }
   });
+  // 初始化：读一次已有的 fatal 状态（上一次会话留下的）
+  chrome.storage.local.get('dualang_error_v1').then((obj) => {
+    if (!ctx) return;
+    const has = !!obj?.dualang_error_v1;
+    if (ctx.hasFatalError !== has) {
+      ctx.hasFatalError = has;
+      refreshBubbleVisual();
+    }
+  }).catch(() => {});
+}
+
+/**
+ * 根据 settings.enabled + activeTranslations + state（super-fine）+ hasFatalError 组合出 bubble
+ * 外观状态 class。off / busy / idle-ok 互斥；has-error 独立叠加（阻碍型错误徽章）。
+ */
+function refreshBubbleVisual(): void {
+  if (!ctx) return;
+  const cls = ctx.root.classList;
+  cls.remove('dualang-bubble--off', 'dualang-bubble--busy', 'dualang-bubble--idle-ok', 'dualang-bubble--has-error');
+  if (!ctx.settings.enabled) {
+    cls.add('dualang-bubble--off');
+    cls.remove('dualang-bubble--translating', 'dualang-bubble--done', 'dualang-bubble--failed');
+    return;
+  }
+  // 阻碍型错误优先显示红叉 —— 即使正在忙，红叉仍需可见让用户感知问题。
+  if (ctx.hasFatalError) cls.add('dualang-bubble--has-error');
+  if (ctx.activeTranslations > 0 || ctx.state === 'translating') {
+    cls.add('dualang-bubble--busy');
+  } else if (ctx.state === 'idle' && !ctx.hasFatalError) {
+    cls.add('dualang-bubble--idle-ok');  // 右下角绿色勾；有错误时让位给红叉
+  }
+}
+
+/** 内容脚本在有翻译请求进行中时调用。count=0 → busy 消失。 */
+export function setTranslationActivity(count: number): void {
+  if (!ctx) return;
+  const n = Math.max(0, count | 0);
+  if (ctx.activeTranslations === n) return;
+  ctx.activeTranslations = n;
+  refreshBubbleVisual();
 }
 
 /**
@@ -216,6 +305,7 @@ export function setBubbleState(
   } else {
     ctx.root.style.setProperty('--progress', state === 'done' ? '1' : '0');
   }
+  refreshBubbleVisual();
   if (ctx.panel.classList.contains('dualang-bubble-panel--visible')) refreshPanel();
 }
 
@@ -229,6 +319,7 @@ export function disposeBubble(): void {
   if (!ctx) return;
   document.removeEventListener('pointermove', ctx.docHandlers.move);
   document.removeEventListener('pointerup', ctx.docHandlers.up);
+  if (ctx.docHandlers.hoverMove) document.removeEventListener('pointermove', ctx.docHandlers.hoverMove);
   if (ctx.rttPollTimer) clearInterval(ctx.rttPollTimer);
   ctx.root.remove();
   ctx.panel.remove();
@@ -351,7 +442,12 @@ function refreshPanel(): void {
   const lineFusionEl = panel.querySelector<HTMLInputElement>('[data-field="lineFusionEnabled"]');
   if (lineFusionEl) lineFusionEl.checked = !!s.lineFusionEnabled;
   const smartDictEl = panel.querySelector<HTMLInputElement>('[data-field="smartDictEnabled"]');
-  if (smartDictEl) smartDictEl.checked = !!s.smartDictEnabled;
+  if (smartDictEl) {
+    smartDictEl.checked = s.enabled && !!s.smartDictEnabled;
+    smartDictEl.disabled = !s.enabled;
+  }
+  const smartDictLabel = panel.querySelector<HTMLElement>('[data-section="smart-dict"]');
+  if (smartDictLabel) smartDictLabel.classList.toggle('dualang-bubble-panel-section--muted', !s.enabled);
 
   // 显示模式 segment 选中态
   panel.querySelectorAll<HTMLButtonElement>('[data-display]').forEach((b) => {

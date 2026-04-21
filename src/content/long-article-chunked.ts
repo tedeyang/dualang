@@ -24,6 +24,7 @@ export interface LongChunkedResult {
 
 export async function requestTranslationChunked(
   text: string, priority: number, skipCache: boolean, strictMode: boolean,
+  opts: { retranslateBoost?: boolean } = {},
 ): Promise<LongChunkedResult> {
   const paragraphs = splitIntoParagraphs(text);
   const translations: string[] = new Array(paragraphs.length).fill('');
@@ -33,7 +34,7 @@ export async function requestTranslationChunked(
 
   for (let i = 0; i < paragraphs.length; i += chunkSize) {
     const chunkTexts = paragraphs.slice(i, i + chunkSize);
-    const chunkResult = await requestChunkViaPort(chunkTexts, priority, i, skipCache, strictMode);
+    const chunkResult = await requestChunkViaPort(chunkTexts, priority, i, skipCache, strictMode, opts.retranslateBoost);
     for (let k = 0; k < chunkResult.translations.length; k++) {
       translations[i + k] = chunkResult.translations[k];
     }
@@ -58,7 +59,7 @@ interface ChunkResult {
 
 function requestChunkViaPort(
   chunkTexts: string[], priority: number, chunkOffset: number,
-  skipCache: boolean, strictMode: boolean,
+  skipCache: boolean, strictMode: boolean, retranslateBoost = false,
 ): Promise<ChunkResult> {
   return new Promise<ChunkResult>((resolve, reject) => {
     const port = chrome.runtime.connect(undefined, { name: 'translate-stream' });
@@ -115,7 +116,7 @@ function requestChunkViaPort(
 
     port.postMessage({
       action: 'translate',
-      payload: { texts: chunkTexts, priority, skipCache, strictMode },
+      payload: { texts: chunkTexts, priority, skipCache, strictMode, retranslateBoost },
     });
   });
 }

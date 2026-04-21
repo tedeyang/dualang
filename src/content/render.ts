@@ -1,4 +1,4 @@
-import { rebuildParagraphs, splitParagraphsByDom } from './utils';
+import { rebuildParagraphs, splitParagraphsByDom, splitLinesByDom } from './utils';
 import { telemetry } from './telemetry';
 import type { DisplayMode } from './display-mode';
 import { splitNonEmptyLines, alignTranslatedLines } from './line-fusion';
@@ -69,7 +69,11 @@ export function renderTranslation(
       // data-dualang-line-fusion 驱动 CSS 隐藏 tweetText —— append 模式下原文行已经在
       // card 里的每个 pair 中，页面上再保留一份 tweetText 会出现"原文两次 + 孤立分隔线"
       article.setAttribute('data-dualang-line-fusion', 'true');
-      renderLineFusion(card, origLines, aligned.lines);
+      // 原文行优先用 DOM 切片保留真实 `<a>` 锚点（@mention / #hashtag / t.co 短链都点得开）；
+      // 行数和字符串切出的 origLines 对不上时退回字符串模式（linkifyText 兜底）。
+      const origFragments = splitLinesByDom(tweetTextEl);
+      const useFragments = origFragments.length === origLines.length;
+      renderLineFusion(card, useFragments ? origFragments : origLines, aligned.lines);
       renderedByFusion = true;
     }
   }
@@ -150,16 +154,22 @@ export function renderTranslation(
 // 让 append 模式下的 card 变成孤立的"分隔线 + 译文"列，与页面上未隐藏的 tweetText 视觉脱节。
 function renderLineFusion(
   card: HTMLElement,
-  originalLines: string[],
+  originalLines: string[] | DocumentFragment[],
   translatedLines: string[],
 ): void {
   for (let i = 0; i < translatedLines.length; i++) {
     const pair = document.createElement('div');
     pair.className = 'dualang-line-fusion-pair';
-    if (originalLines[i]) {
+    const origItem = originalLines[i];
+    if (origItem) {
       const orig = document.createElement('div');
       orig.className = 'dualang-line-fusion-orig';
-      orig.appendChild(linkifyText(originalLines[i]));
+      if (typeof origItem === 'string') {
+        orig.appendChild(linkifyText(origItem));
+      } else {
+        // 克隆 fragment 节点，保留原 DOM 的 <a href> 可点击语义。
+        orig.appendChild(origItem);
+      }
       pair.appendChild(orig);
     }
     const divider = document.createElement('div');
@@ -188,39 +198,87 @@ function appendTranslationParas(card: HTMLElement, translatedParas: string[]): v
 }
 
 /**
- * 把字符串里的 http(s):// URL 包成可点击的 <a>，其余内容保留为文本节点，整体返回
- * DocumentFragment。用于所有"从字符串构造展示内容"的渲染路径（line-fusion 原文/译文、
- * 译文段落 .dualang-para、inline 段落配对的译文侧），否则 tweetText 里的链接在我们的
- * card 上会被展平为纯文本，无法点击。
+ * 把字符串里的可点击实体（完整 URL / bare 短链 / @mention / #hashtag）包成 `<a>`，
+ * 其余保留为文本节点。用于所有"从字符串构造展示内容"的渲染路径。
  *
- * 只识别显式 http(s):// 协议的完整 URL；#hashtag / @mention 留给用户主动点 X 原生
- * tweetText（append/bilingual 下可见）。
+ * 识别的形态：
+ *   - https?://... 完整 URL
+ *   - bare 短链 —— 只保留 X.com 生态常见的 t.co / bit.ly / reut.rs / goo.gl / lnkd.in
+ *     / youtu.be / github.com / huggingface.co 等白名单 host（避免误吃 "Dr.Smith/house"）
+ *   - @username → https://x.com/username
+ *   - #hashtag → https://x.com/hashtag/xxx
+ *
  * 修剪尾部 `.,;!?)\"'…` 避免把句末标点并进 href。
  */
+const LINK_TLDS = 'com|io|to|me|ly|rs|gg|ai|dev|xyz|net|org|co|cn|us|uk|eu|tv|app|link';
+const BARE_HOST_RE = new RegExp(
+  `\\b(?:[a-z0-9][a-z0-9-]*\\.)+(?:${LINK_TLDS})/[^\\s<>"'\`]+`,
+  'gi',
+);
+
 export function linkifyText(text: string): DocumentFragment {
   const frag = document.createDocumentFragment();
-  const urlRe = /\bhttps?:\/\/[^\s<>"'`]+/g;
-  let lastIdx = 0;
-  let m: RegExpExecArray | null;
-  while ((m = urlRe.exec(text)) !== null) {
-    let url = m[0];
-    const trailMatch = /[.,;!?)\]>"'…]+$/.exec(url);
-    if (trailMatch) url = url.slice(0, url.length - trailMatch[0].length);
-    if (!url) continue; // 极端情况：修剪后为空，放弃这个匹配
-    if (m.index > lastIdx) {
-      frag.appendChild(document.createTextNode(text.slice(lastIdx, m.index)));
+  type Match = { start: number; end: number; href: string; display: string };
+  const matches: Match[] = [];
+
+  const trimTrailing = (s: string) => s.replace(/[.,;!?)\]>"'…]+$/, '');
+  const overlaps = (s: number, e: number) =>
+    matches.some((x) => !(e <= x.start || s >= x.end));
+
+  // (1) 完整 https://... URL
+  for (const m of text.matchAll(/\bhttps?:\/\/[^\s<>"'`]+/g)) {
+    const raw = trimTrailing(m[0]);
+    if (!raw) continue;
+    const start = m.index!;
+    const end = start + raw.length;
+    if (overlaps(start, end)) continue;
+    matches.push({ start, end, href: raw, display: raw });
+  }
+
+  // (2) bare host/path，加 https:// 前缀
+  for (const m of text.matchAll(BARE_HOST_RE)) {
+    const raw = trimTrailing(m[0]);
+    if (!raw) continue;
+    const start = m.index!;
+    const end = start + raw.length;
+    if (overlaps(start, end)) continue;
+    matches.push({ start, end, href: `https://${raw}`, display: raw });
+  }
+
+  // (3) @username —— 用 lookbehind 避免 email 类的 "x@y" 误匹配
+  for (const m of text.matchAll(/(?<![A-Za-z0-9_/])@([A-Za-z0-9_]{1,15})(?![A-Za-z0-9_])/g)) {
+    const start = m.index!;
+    const end = start + m[0].length;
+    if (overlaps(start, end)) continue;
+    matches.push({ start, end, href: `https://x.com/${m[1]}`, display: m[0] });
+  }
+
+  // (4) #hashtag —— Unicode 字符集支持中文/日文等话题
+  for (const m of text.matchAll(/(?<![A-Za-z0-9_/&])#([\p{L}\p{N}_]{1,60})/gu)) {
+    const start = m.index!;
+    const end = start + m[0].length;
+    if (overlaps(start, end)) continue;
+    matches.push({ start, end, href: `https://x.com/hashtag/${encodeURIComponent(m[1])}`, display: m[0] });
+  }
+
+  matches.sort((a, b) => a.start - b.start);
+
+  let cursor = 0;
+  for (const m of matches) {
+    if (m.start > cursor) {
+      frag.appendChild(document.createTextNode(text.slice(cursor, m.start)));
     }
     const a = document.createElement('a');
-    a.href = url;
+    a.href = m.href;
     a.target = '_blank';
     a.rel = 'noopener noreferrer';
-    a.textContent = url;
+    a.textContent = m.display;
     a.className = 'dualang-link';
     frag.appendChild(a);
-    lastIdx = m.index + url.length;
+    cursor = m.end;
   }
-  if (lastIdx < text.length) {
-    frag.appendChild(document.createTextNode(text.slice(lastIdx)));
+  if (cursor < text.length) {
+    frag.appendChild(document.createTextNode(text.slice(cursor)));
   }
   return frag;
 }

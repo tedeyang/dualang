@@ -20,6 +20,15 @@ import type { Settings, TokenUsage, DictionaryEntry } from '../shared/types';
 //   - 'enable-thinking-false':     body.enable_thinking = false（Qwen 系列）
 //   - 'thinking-disabled':         body.thinking = { type: 'disabled' }（GLM-4.6+）
 // 具体哪个模型用哪条策略由 src/background/profiles.ts 登记。
+// 试试手气重译时的温度调整：在 profile 基准温度上 +Δ，但夹在 [0, 0.9] 区间。
+// 小模型在 >0.9 时容易跑偏，所以上限保守。调用点不再直接 profile.temperature(settings)。
+function effectiveTemperature(profile: ProviderProfile, settings: Settings): number {
+  const base = profile.temperature(settings);
+  const boost = (settings as any).temperatureBoost || 0;
+  if (!boost) return base;
+  return Math.max(0, Math.min(0.9, base + boost));
+}
+
 export function applyThinkingMode(body: any, settings: Settings, profile?: ProviderProfile): void {
   const effort = settings.reasoningEffort;
   const wantThinking = !!effort && effort !== 'none';
@@ -163,7 +172,9 @@ export async function doTranslateSingle(text: string, settings: Settings, signal
   const endpoint = resolveEndpoint(profile, settings.baseUrl || 'https://api.moonshot.cn/v1');
   const targetLangDisplay = LANG_DISPLAY[settings.targetLang] || settings.targetLang;
 
-  const systemPrompt = composeSystemPrompt(profile, targetLangDisplay, { batch: false, strict: strictMode });
+  const systemPrompt = composeSystemPrompt(profile, targetLangDisplay, {
+    batch: false, strict: strictMode, retranslateBoost: !!(settings as any).retranslateBoost,
+  });
 
   const body: any = {
     model: settings.model || 'kimi-k2.5',
@@ -171,7 +182,7 @@ export async function doTranslateSingle(text: string, settings: Settings, signal
       { role: 'system', content: systemPrompt },
       { role: 'user', content: text }
     ],
-    temperature: profile.temperature(settings),
+    temperature: effectiveTemperature(profile, settings),
     stream: profile.supportsStreaming && !!settings.enableStreaming,
   };
 
@@ -290,6 +301,7 @@ export async function doTranslateBatchStream(
   const tagOffset = isSingle ? 0 : findSafeOffset(texts, texts.length);
   const systemPrompt = composeSystemPrompt(profile, targetLangDisplay, {
     batch: !isSingle, strict: strictMode,
+    retranslateBoost: !!(settings as any).retranslateBoost,
   });
   const userContent = isSingle
     ? texts[0]
@@ -301,7 +313,7 @@ export async function doTranslateBatchStream(
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userContent },
     ],
-    temperature: profile.temperature(settings),
+    temperature: effectiveTemperature(profile, settings),
     stream: true,
   };
 
@@ -440,6 +452,7 @@ export async function doTranslateBatchRequest(
   const tagOffset = useStructured ? findSafeOffset(texts, texts.length) : 0;
   const systemPrompt = composeSystemPrompt(profile, targetLangDisplay, {
     batch: useStructured, strict: strictMode, smartDict: !!dictIndices,
+    retranslateBoost: !!(settings as any).retranslateBoost,
   });
   const userContent = useStructured
     ? buildBatchUserContent(texts, dictIndices, options.perItemCandidates, tagOffset)
@@ -451,7 +464,7 @@ export async function doTranslateBatchRequest(
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userContent },
     ],
-    temperature: profile.temperature(settings),
+    temperature: effectiveTemperature(profile, settings),
     stream: false,
   };
 

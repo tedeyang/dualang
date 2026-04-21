@@ -2,8 +2,11 @@ import { normalizeText } from '../shared/types';
 
 /** chrome.storage.local 里缓存数据的顶层键 */
 const CACHE_KEY = 'dualang_cache_v1';
-/** L2（storage）缓存条目上限；触顶时按时间戳淘汰最旧的 20%。 */
-const CACHE_MAX_SIZE = 5000;
+/** L2（storage）缓存条目上限；触顶时按时间戳淘汰最旧的 20%。
+ * 注：chrome.storage.local 配额约 5MB，5000 条长译文容易超限。
+ * 500 条足以覆盖一次重度浏览 session，L1 内存另有 2000 条热缓存兜底。
+ */
+const CACHE_MAX_SIZE = 500;
 /** L1（内存）缓存条目上限；LRU 淘汰最久未访问项。 */
 const MEM_CACHE_MAX = 2000;
 const memCacheMap = new Map();
@@ -88,7 +91,19 @@ export async function setCache(hash: string, value: any) {
     for (let i = 0; i < toDelete; i++) delete cache[sorted[i].key];
   }
 
-  await chrome.storage.local.set({ [CACHE_KEY]: cache });
+  try {
+    await chrome.storage.local.set({ [CACHE_KEY]: cache });
+  } catch (err: any) {
+    // 配额超限：激进清理 50% 最旧数据后重试一次
+    if (err?.message?.includes('quota') || err?.name?.includes('Quota')) {
+      const sorted = keys.map(k => ({ key: k, ts: cache[k].ts || 0 })).sort((a, b) => a.ts - b.ts);
+      const toDelete = Math.ceil(keys.length * 0.5);
+      for (let i = 0; i < toDelete; i++) delete cache[sorted[i].key];
+      await chrome.storage.local.set({ [CACHE_KEY]: cache });
+    } else {
+      throw err;
+    }
+  }
 }
 
 /** djb2 字符串哈希；把任意长度文本映射到 32 位无符号整数。 */

@@ -317,6 +317,26 @@ article[data-dualang-mode="bilingual"] .dualang-translation {
   transition: opacity 0.15s ease, transform 0.15s ease;
 }
 
+/* 重译进行中：品牌 logo 旋转 + 淡淡脉动，提示正在"试试手气"重新翻译。
+ * 点击 .dualang-status--success → 切到这个状态；成功回流后 showSuccess 会把
+ * status 还原到静态 success 类（覆盖 className），动画自然消失。
+ */
+.dualang-status--retranslating {
+  cursor: progress;
+}
+.dualang-status--retranslating .dualang-status-icon--brand {
+  animation: dualang-brand-spin 1.1s linear infinite, dualang-brand-pulse 1.6s ease-in-out infinite;
+  opacity: 0.95;
+}
+@keyframes dualang-brand-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+@keyframes dualang-brand-pulse {
+  0%, 100% { filter: drop-shadow(0 0 0 rgba(29,155,240,0)); }
+  50%      { filter: drop-shadow(0 0 4px rgba(29,155,240,0.65)); }
+}
+
 .dualang-status--success:hover .dualang-status-icon--brand {
   opacity: 1;
   transform: scale(1.08);
@@ -394,6 +414,92 @@ article[data-dualang-mode="bilingual"] .dualang-translation {
 .dualang-bubble--done { background: #1d9bf0; border-color: #1d9bf0; }
 .dualang-bubble--failed { background: #f4212e; border-color: #f4212e; }
 
+/* ===== 翻译开关视觉状态（普通翻译）=====
+ * 三种互斥：off（关闭）/ busy（有请求进行中）/ idle-ok（启用空闲）。super-fine
+ * 的 translating/done/failed 走同一个 bubble，这里只管"开关 + 日常翻译活动"。
+ */
+/* 关闭状态：整体灰化 + 轻度去饱和 */
+.dualang-bubble--off {
+  background: #3a3f44;
+  border-color: #4a4f54;
+  filter: grayscale(0.9);
+  opacity: 0.72;
+}
+.dualang-bubble--off .dualang-bubble-logo { filter: grayscale(1) brightness(0.85); }
+.dualang-bubble--off .dualang-bubble-ring { stroke: transparent; }
+
+/* 启用空闲：右下角绿色勾徽章 */
+.dualang-bubble--idle-ok::after {
+  content: "";
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #00ba7c;
+  border: 2px solid var(--dl-bg-bubble, #15181c);
+  box-shadow: 0 2px 4px rgba(0, 186, 124, 0.35);
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'><path d='M2 5.2L4.2 7.4 8 3.2' stroke='white' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 10px 10px;
+  pointer-events: none;
+}
+
+/* 阻碍型错误（quota / 401 / 403 / provider 5xx / 批量失败）：右下角红色 × 徽章。
+ * 与绿色 ✓ 同一位置；refreshBubbleVisual 里 has-error 时不加 idle-ok，所以不会叠加。
+ * 有错误 + 仍在 busy 时：red X 仍可见（用户能感知"请求正被发出但上游已告失败"）。
+ */
+.dualang-bubble--has-error::after {
+  content: "";
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #f4212e;
+  border: 2px solid var(--dl-bg-bubble, #15181c);
+  box-shadow: 0 2px 4px rgba(244, 33, 46, 0.45);
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'><path d='M3 3L7 7M7 3L3 7' stroke='white' stroke-width='1.6' fill='none' stroke-linecap='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 10px 10px;
+  pointer-events: none;
+  animation: dualang-bubble-error-pop 0.28s cubic-bezier(.34,1.56,.64,1);
+}
+@keyframes dualang-bubble-error-pop {
+  from { transform: scale(0.2); opacity: 0; }
+  to   { transform: scale(1);    opacity: 1; }
+}
+
+/* 翻译进行中：外围渐变环旋转 + 呼吸 + 轻度发光；配合现有 --translating 呼吸动效。
+ * 利用 SVG ring 的 stroke-dasharray 做弧段，再让整个 SVG 旋转 —— 比纯 stroke-dashoffset
+ * 动效更有"正在干活"的观感。
+ */
+.dualang-bubble--busy .dualang-bubble-ring-svg {
+  animation: dualang-bubble-ring-spin 1.2s linear infinite;
+}
+.dualang-bubble--busy .dualang-bubble-ring {
+  stroke: #1d9bf0;
+  stroke-dasharray: 40 70;  /* 约 37% 弧段 + 间隙；转起来像扫描 */
+  stroke-dashoffset: 0;
+  filter: drop-shadow(0 0 3px rgba(29, 155, 240, 0.75));
+}
+.dualang-bubble--busy {
+  animation: dualang-bubble-pulse 1.6s ease-in-out infinite;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.35), 0 0 12px rgba(29, 155, 240, 0.35);
+}
+@keyframes dualang-bubble-ring-spin {
+  from { transform: rotate(-90deg); }
+  to   { transform: rotate(270deg); }
+}
+@keyframes dualang-bubble-pulse {
+  0%, 100% { transform: translateY(-50%) scale(1); }
+  50%      { transform: translateY(-50%) scale(1.05); }
+}
+
 /* ===== 浮球快捷设置面板 =====
  * 承担：开启/关闭翻译、显示模式、对照风格、模型切换、长文精翻入口。
  * hover 显示、离开延迟隐藏；点击浮球自身可"粘住"不随 hover 离开而消失。
@@ -417,8 +523,7 @@ article[data-dualang-mode="bilingual"] .dualang-translation {
   pointer-events: none;
   transition: opacity 0.18s ease, transform 0.18s ease;
 }
-.dualang-bubble-panel--visible,
-.dualang-bubble-panel--pinned {
+.dualang-bubble-panel--visible {
   opacity: 1;
   pointer-events: auto;
   transform: translateY(-50%) translateX(0);

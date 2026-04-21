@@ -272,10 +272,67 @@ export function extractText(el: Element): string {
     } catch (_) { /* 极端情况编译失败直接放弃，保证主路径不抛 */ }
   }
 
-  return raw
+  return reflowStrandedTokens(raw
     .replace(/[^\S\n]+/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
-    .trim();
+    .trim());
+}
+
+/**
+ * X.com 的 @mention / #hashtag / t.co 短链 `<a>` 常被 CSS 渲染成独立视觉行，
+ * innerText 随即在它们前后插入 `\n`，得到这样的提取结果：
+ *     My project uses
+ *     @TensorFlow
+ *     ,
+ *     @opencvlibrary
+ *     , and
+ *     @pycharm
+ *
+ * 这种"单 token 独占一行"的换行是 CSS 产物，语义上并无段落意图；直接送模型翻译
+ * 时译文会忠实复现这些换行，导致灾难性渲染。
+ *
+ * 规则：把"段内"（非 \n\n 真段落边界）的单 \n 处理掉，当 \n 某一侧整行只包含
+ *   - @mention / #hashtag / http(s)://短链 / 纯短标点 ("," "/" "、" 等)
+ * 时，与相邻行合并为空格分隔的同一行。重复一次把"中 ,和 + @pycharm"这类连环
+ * 打断修复到底。段落级 `\n\n` 永远保留。
+ */
+function reflowStrandedTokens(text: string): string {
+  // 行边界两侧若至少一端命中 strand，则该 \n 视为 CSS 假换行，消成空格。
+  // strand 识别三种形态：
+  //   (a) 整行都是 strand（mention / hashtag / 短链 / 纯标点）
+  //   (b) 上一行结尾紧跟 strand token（X.com 常见："... and @opencvlibrary"）
+  //   (c) 当前行开头是 strand token（CSS 把 @foo 单独顶到下一行的场景）
+  // 段落级 \n\n 在 split 之前就被剥离，永远保留。
+  // 链接长度不设上限：X.com 常把完整 URL 作为单独 `<a>` 渲染成独占行（短/长都出现过）。
+  // URL 不能含空白，匹配边界是 \S+；前后的 STRAND_TRAIL/LEAD 已锚定在行尾/行首，
+  // 不会误吃相邻普通词。
+  const TOKEN = '(?:@[A-Za-z0-9_]+|#[\\p{L}\\p{N}_]+|https?:\\/\\/\\S+|[,，.、/·&|\\\\\\-]+)';
+  const STRAND_LINE = new RegExp(`^${TOKEN}$`, 'u');
+  const STRAND_TRAIL = new RegExp(`(?:^|\\s)${TOKEN}\\s*$`, 'u');
+  const STRAND_LEAD = new RegExp(`^\\s*${TOKEN}(?:\\s|$)`, 'u');
+
+  return text.split(/\n\n+/).map((para) => {
+    const lines = para.split('\n');
+    const merged: string[] = [];
+    for (const raw of lines) {
+      if (merged.length === 0) { merged.push(raw); continue; }
+      const prev = merged[merged.length - 1];
+      const prevTrim = prev.trim();
+      const curr = raw.trim();
+      if (curr.length === 0) { merged.push(raw); continue; }
+      const strand =
+        STRAND_LINE.test(curr) ||
+        STRAND_LINE.test(prevTrim) ||
+        STRAND_TRAIL.test(prev) ||
+        STRAND_LEAD.test(raw);
+      if (strand) {
+        merged[merged.length - 1] = `${prev.trimEnd()} ${curr}`;
+      } else {
+        merged.push(raw);
+      }
+    }
+    return merged.join('\n');
+  }).join('\n\n');
 }
 
 // 按段落切分 extractText 的输出。X Articles 在 innerText 里常用单 \n 分隔段落
@@ -333,6 +390,59 @@ export function extractAnchoredBlocks(el: Element): AnchoredBlock[] {
 // 保留旧签名以免其他调用方断裂
 export function extractParagraphsByBlock(el: Element): string[] {
   return extractAnchoredBlocks(el).map((b) => b.text);
+}
+
+/**
+ * 类似 splitParagraphsByDom，但按单 `\n` 切分（line-fusion 用）。保留所有原 DOM 结构
+ * —— 尤其 `<a>` 的 href / target / rel —— 使每行内的 X.com 链接 / @mention / #hashtag
+ * 在 card 内渲染后仍然可点击。
+ *
+ * 空行自动过滤。调用方通常再对行数做对齐（见 line-fusion.alignTranslatedLines）。
+ */
+export function splitLinesByDom(el: Element): DocumentFragment[] {
+  const doc = el.ownerDocument || document;
+  const clone = el.cloneNode(true) as Element;
+  const brs = Array.from(clone.querySelectorAll('br'));
+  for (const br of brs) br.parentNode?.replaceChild(doc.createTextNode('\n'), br);
+  (clone as Element & { normalize(): void }).normalize();
+
+  type Break = { node: Text; start: number; end: number };
+  const breaks: Break[] = [];
+  const walker = doc.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
+  let n: Node | null = walker.nextNode();
+  while (n) {
+    const text = (n as Text).data;
+    const re = /\n/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      breaks.push({ node: n as Text, start: m.index, end: m.index + 1 });
+    }
+    n = walker.nextNode();
+  }
+
+  const result: DocumentFragment[] = [];
+  const pushRange = (sn: Node, so: number, en: Node, eo: number) => {
+    const r = doc.createRange();
+    r.setStart(sn, so); r.setEnd(en, eo);
+    const frag = r.cloneContents();
+    if ((frag.textContent || '').trim().length > 0) result.push(frag);
+  };
+
+  if (breaks.length === 0) {
+    const r = doc.createRange();
+    r.selectNodeContents(clone);
+    const frag = r.cloneContents();
+    if ((frag.textContent || '').trim().length > 0) result.push(frag);
+    return result;
+  }
+
+  pushRange(clone, 0, breaks[0].node, breaks[0].start);
+  for (let i = 0; i < breaks.length - 1; i++) {
+    pushRange(breaks[i].node, breaks[i].end, breaks[i + 1].node, breaks[i + 1].start);
+  }
+  const last = breaks[breaks.length - 1];
+  pushRange(last.node, last.end, clone, clone.childNodes.length);
+  return result;
 }
 
 // ===================== 长文判定 =====================

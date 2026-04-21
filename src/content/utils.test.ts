@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect } from 'vitest';
-import { isAlreadyTargetLanguage, shouldSkipContent, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, isVerbatimReturn, rebuildParagraphs, splitParagraphsByDom, extractAnchoredBlocks, extractText } from './utils';
+import { isAlreadyTargetLanguage, shouldSkipContent, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, isVerbatimReturn, rebuildParagraphs, splitParagraphsByDom, splitLinesByDom, extractAnchoredBlocks, extractText } from './utils';
 
 // ========== isAlreadyTargetLanguage ==========
 
@@ -567,6 +567,21 @@ describe('extractAnchoredBlocks', () => {
 
 // ========== extractText ==========
 
+describe('splitLinesByDom', () => {
+  it('按单 \\n 切行并保留 <a> 锚点可点击', () => {
+    document.body.innerHTML =
+      '<div id="t">Line1 <a href="/foo">@foo</a>\nLine2 <a href="https://t.co/xyz">reut.rs/xyz</a>\nLine3</div>';
+    const frags = splitLinesByDom(document.getElementById('t')!);
+    expect(frags.length).toBe(3);
+    const box = document.createElement('div');
+    for (const f of frags) box.appendChild(f);
+    const links = box.querySelectorAll('a');
+    expect(links).toHaveLength(2);
+    expect(links[0].getAttribute('href')).toBe('/foo');
+    expect(links[1].getAttribute('href')).toBe('https://t.co/xyz');
+  });
+});
+
 describe('extractText', () => {
   it('普通文本：innerText/textContent 直接返回', () => {
     document.body.innerHTML = '<div id="t">Hello world</div>';
@@ -620,6 +635,50 @@ describe('extractText', () => {
       configurable: true,
     });
     expect(extractText(el)).toBe('A https://example.com/abcdef B https://other.io/xyz');
+  });
+
+  it('孤立 @mention 行应合回段内（CSS 布局换行修复）', () => {
+    document.body.innerHTML = '<div id="t"></div>';
+    const el = document.getElementById('t')!;
+    Object.defineProperty(el, 'innerText', {
+      value: 'My object detection project uses\n@TensorFlow\n,\n@opencvlibrary\n, and\n@pycharm\nwas released.',
+      configurable: true,
+    });
+    expect(extractText(el)).toBe(
+      'My object detection project uses @TensorFlow , @opencvlibrary , and @pycharm was released.',
+    );
+  });
+
+  it('孤立长 URL 行也合回段内（不设长度上限）', () => {
+    document.body.innerHTML = '<div id="t"></div>';
+    const el = document.getElementById('t')!;
+    Object.defineProperty(el, 'innerText', {
+      value: 'See\nhttps://github.com/Tencent/MegaStyle/tree/main/docs/very-long-path-that-exceeds-forty-chars\nfor details.',
+      configurable: true,
+    });
+    expect(extractText(el)).toBe(
+      'See https://github.com/Tencent/MegaStyle/tree/main/docs/very-long-path-that-exceeds-forty-chars for details.',
+    );
+  });
+
+  it('孤立 #hashtag 与纯标点行都合回段内', () => {
+    document.body.innerHTML = '<div id="t"></div>';
+    const el = document.getElementById('t')!;
+    Object.defineProperty(el, 'innerText', {
+      value: 'Launch at\n#HuggingFace\n/\n#PollenRobotics\nhub.',
+      configurable: true,
+    });
+    expect(extractText(el)).toBe('Launch at #HuggingFace / #PollenRobotics hub.');
+  });
+
+  it('真正的段落边界 \\n\\n 不被合并', () => {
+    document.body.innerHTML = '<div id="t"></div>';
+    const el = document.getElementById('t')!;
+    Object.defineProperty(el, 'innerText', {
+      value: 'First paragraph with\n@user\ninline.\n\nSecond paragraph here.',
+      configurable: true,
+    });
+    expect(extractText(el)).toBe('First paragraph with @user inline.\n\nSecond paragraph here.');
   });
 
   it('URL 未被换行打断时不改动 raw（raw.includes(clean) 早退）', () => {

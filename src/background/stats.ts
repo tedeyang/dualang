@@ -90,7 +90,17 @@ function schedulePersist() {
   if (persistTimer) return;
   persistTimer = setTimeout(async () => {
     persistTimer = null;
-    await chrome.storage.local.set({ [STATS_KEY]: memStats });
+    try {
+      await chrome.storage.local.set({ [STATS_KEY]: memStats });
+    } catch (err: any) {
+      // 配额超限：丢弃 errors 数组兜底（统计数字比错误记录更重要）
+      if (err?.message?.includes('quota') || err?.name?.includes('Quota')) {
+        const trimmed = { ...memStats, errors: memStats.errors.slice(0, 5) };
+        await chrome.storage.local.set({ [STATS_KEY]: trimmed });
+      } else {
+        throw err;
+      }
+    }
   }, PERSIST_DEBOUNCE_MS);
 }
 
