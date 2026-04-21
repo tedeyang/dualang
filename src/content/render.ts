@@ -108,7 +108,7 @@ export function renderTranslation(
         if (translatedParas[i]) {
           const trans = document.createElement('div');
           trans.className = 'dualang-para';
-          trans.textContent = translatedParas[i];
+          trans.appendChild(linkifyText(translatedParas[i]));
           pair.appendChild(trans);
         }
         card.appendChild(pair);
@@ -117,23 +117,23 @@ export function renderTranslation(
       for (let i = originalParas.length; i < translatedParas.length; i++) {
         const trans = document.createElement('div');
         trans.className = 'dualang-para';
-        trans.textContent = translatedParas[i];
+        trans.appendChild(linkifyText(translatedParas[i]));
         card.appendChild(trans);
       }
     }
-  } else if (!renderedByFusion && displayMode === 'bilingual') {
-    // 整体对照：克隆整段原文 HTML（保留链接/emoji/@/#）+ 整段译文
-    card.classList.add('dualang-bilingual');
-    const origBlock = document.createElement('div');
-    origBlock.className = 'dualang-original-html';
-    for (const child of Array.from(tweetTextEl.childNodes) as Node[]) {
-      origBlock.appendChild(child.cloneNode(true));
-    }
-    card.appendChild(origBlock);
-    appendTranslationParas(card, translatedParas);
   } else if (!renderedByFusion) {
-    // 'append' 和 'translation-only' 共享译文-only 的 card 结构；
-    // 区别只在 CSS 是否隐藏 tweetTextEl（由 data-dualang-mode 控制）
+    // append / bilingual / translation-only 共享同一套 card 结构 —— 只追加译文。
+    // bilingual 不再克隆原文到 card 内：
+    //   - 过去方案（隐藏原生 tweetText + 克隆 .dualang-original-html）会让 card 高度
+    //     比 append 多 5-10px（clone 的 line-height 和 X 原生不一致 + 额外的
+    //     border-bottom/padding-bottom 分隔间距），切换 append↔bilingual 时页面跳动
+    //   - 新方案：保持原生 tweetText 可见，仅通过 CSS 把它的 color 改暗（见 styles.css
+    //     "对照模式下的强调权重"段），card 结构和 append 完全一致 → 切换零跳动
+    // 三种模式的区别只在 CSS：
+    //   - append: tweetText 原生色 + card.dualang-para 暗色
+    //   - bilingual: tweetText 改暗色 + card.dualang-para 原生色
+    //   - translation-only: tweetText display:none + card.dualang-para 原生色
+    if (displayMode === 'bilingual') card.classList.add('dualang-bilingual');
     appendTranslationParas(card, translatedParas);
   }
 
@@ -159,7 +159,7 @@ function renderLineFusion(
     if (originalLines[i]) {
       const orig = document.createElement('div');
       orig.className = 'dualang-line-fusion-orig';
-      orig.textContent = originalLines[i];
+      orig.appendChild(linkifyText(originalLines[i]));
       pair.appendChild(orig);
     }
     const divider = document.createElement('div');
@@ -168,7 +168,7 @@ function renderLineFusion(
 
     const trans = document.createElement('div');
     trans.className = 'dualang-line-fusion-trans';
-    trans.textContent = translatedLines[i];
+    trans.appendChild(linkifyText(translatedLines[i]));
     pair.appendChild(trans);
     card.appendChild(pair);
   }
@@ -183,6 +183,44 @@ function appendTranslationParas(card: HTMLElement, translatedParas: string[]): v
   if (translatedParas.length === 0) return;
   const p = document.createElement('div');
   p.className = 'dualang-para';
-  p.textContent = translatedParas.join('\n\n');
+  p.appendChild(linkifyText(translatedParas.join('\n\n')));
   card.appendChild(p);
+}
+
+/**
+ * 把字符串里的 http(s):// URL 包成可点击的 <a>，其余内容保留为文本节点，整体返回
+ * DocumentFragment。用于所有"从字符串构造展示内容"的渲染路径（line-fusion 原文/译文、
+ * 译文段落 .dualang-para、inline 段落配对的译文侧），否则 tweetText 里的链接在我们的
+ * card 上会被展平为纯文本，无法点击。
+ *
+ * 只识别显式 http(s):// 协议的完整 URL；#hashtag / @mention 留给用户主动点 X 原生
+ * tweetText（append/bilingual 下可见）。
+ * 修剪尾部 `.,;!?)\"'…` 避免把句末标点并进 href。
+ */
+export function linkifyText(text: string): DocumentFragment {
+  const frag = document.createDocumentFragment();
+  const urlRe = /\bhttps?:\/\/[^\s<>"'`]+/g;
+  let lastIdx = 0;
+  let m: RegExpExecArray | null;
+  while ((m = urlRe.exec(text)) !== null) {
+    let url = m[0];
+    const trailMatch = /[.,;!?)\]>"'…]+$/.exec(url);
+    if (trailMatch) url = url.slice(0, url.length - trailMatch[0].length);
+    if (!url) continue; // 极端情况：修剪后为空，放弃这个匹配
+    if (m.index > lastIdx) {
+      frag.appendChild(document.createTextNode(text.slice(lastIdx, m.index)));
+    }
+    const a = document.createElement('a');
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.textContent = url;
+    a.className = 'dualang-link';
+    frag.appendChild(a);
+    lastIdx = m.index + url.length;
+  }
+  if (lastIdx < text.length) {
+    frag.appendChild(document.createTextNode(text.slice(lastIdx)));
+  }
+  return frag;
 }

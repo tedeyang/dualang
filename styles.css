@@ -1,3 +1,44 @@
+/* ===== 主题变量 =====
+ * 暗色为默认（X.com 夜间模式背景为黑色/深色）。
+ * content.js 检测 body 背景亮度后在 <html> 上写 data-dualang-theme="light"，
+ * 触发下方 light 覆盖，使强调色、分割线、面板色全部翻转到亮色方案。
+ */
+:root {
+  --dl-text-main:      #e7e9ea;   /* X 暗色主文字 */
+  --dl-text-dim:       #8899a6;   /* 弱化/次要侧 */
+  --dl-text-secondary: #c5ccd3;   /* 译文默认色 */
+  --dl-text-muted:     #71767b;   /* 按钮、标签 */
+  --dl-text-tertiary:  #a9b0b8;   /* 面板次级标签 */
+  --dl-border:         #2f3336;   /* X 分割线 */
+  --dl-border-subtle:  #3a3f44;   /* loading 圆圈轨道 */
+  --dl-border-hover:   #3a4049;   /* hover 边框 */
+  --dl-bg-bubble:      #16181c;   /* 浮球背景 */
+  --dl-bg-panel:       linear-gradient(180deg, #1a1d22 0%, #15171b 100%);
+  --dl-bg-inset:       #0b0d10;   /* 下沉区块（模型列表行、segment 容器） */
+  --dl-bg-hover:       #1c1f23;   /* 模型行 hover */
+  --dl-dict-def:       #e8c77a;   /* 字典释义色 */
+  --dl-panel-shadow:   0 12px 32px rgba(0,0,0,0.55), 0 2px 6px rgba(0,0,0,0.35), 0 0 0 1px rgba(255,255,255,0.02) inset;
+  --dl-btn-hover-bg:   rgba(255,255,255,0.04);   /* segment 按钮 hover 遮罩 */
+}
+
+html[data-dualang-theme="light"] {
+  --dl-text-main:      #0f1419;
+  --dl-text-dim:       #536471;
+  --dl-text-secondary: #3d4954;
+  --dl-text-muted:     #536471;
+  --dl-text-tertiary:  #6e7980;
+  --dl-border:         #cfd9de;
+  --dl-border-subtle:  #cbd3dc;
+  --dl-border-hover:   #b4bfc9;
+  --dl-bg-bubble:      #ffffff;
+  --dl-bg-panel:       linear-gradient(180deg, #ffffff 0%, #f7f9f9 100%);
+  --dl-bg-inset:       #eff3f4;
+  --dl-bg-hover:       #e5eaed;
+  --dl-dict-def:       #a06000;
+  --dl-panel-shadow:   0 8px 24px rgba(0,0,0,0.12), 0 2px 6px rgba(0,0,0,0.08), 0 0 0 1px rgba(0,0,0,0.05) inset;
+  --dl-btn-hover-bg:   rgba(0,0,0,0.04);
+}
+
 /* ===== 翻译结果容器 ===== */
 .dualang-translation {
   margin-top: 8px;
@@ -23,14 +64,14 @@
   font-size: 15px;
 }
 
-/* translation-only / inline / bilingual 模式下隐藏原 tweetText；
- * append 模式（data-dualang-mode="append" 或未设置）保持可见。
+/* translation-only / inline 模式下隐藏原 tweetText。
+ * append / bilingual 都让原生 tweetText 保留可见；bilingual 通过 CSS 颜色变暗
+ * （见下方"强调权重"段），避免切换时因克隆原文替换原生元素导致高度跳动。
  * 逐行融合激活时（data-dualang-line-fusion="true"），原文行已经克隆进每个 pair，
  * tweetText 也必须隐藏 —— 否则会出现原文两份 + 孤立分隔线的视觉。
  */
 article[data-dualang-mode="translation-only"] [data-testid="tweetText"],
 article[data-dualang-mode="inline"] [data-testid="tweetText"],
-article[data-dualang-mode="bilingual"] [data-testid="tweetText"],
 article[data-dualang-line-fusion="true"] [data-testid="tweetText"],
 article[data-dualang-line-fusion="true"] [data-dualang-text="true"],
 article[data-dualang-line-fusion="true"] [data-testid="twitterArticleRichTextView"] {
@@ -38,31 +79,37 @@ article[data-dualang-line-fusion="true"] [data-testid="twitterArticleRichTextVie
 }
 
 /* ===== 对照模式下的强调权重 =====
- * 对照有两种风格：
- *   - append（强调原文）：原文 X 原生白，译文稍暗降低权重
- *   - bilingual（强调译文）：原文稍暗降低权重，译文 X 原生白
+ * 对照有两种风格，强调只是颜色翻转，不改变 DOM 结构 —— 避免切换时页面高度跳动：
+ *   - append（强调原文）：tweetText X 原生色，card 译文变暗
+ *   - bilingual（强调译文）：tweetText 变暗（CSS 改色，不隐藏也不克隆），card 译文用原生色
  * inline（段落对照）不在"强调"体系内：两者都保留次要色，段落对应就是主视觉信号。
  *
- * 色阶：主 #e7e9ea（X 原生白）/ 次 #8899a6（中灰，luminance ~60%）。
- * 之前 bilingual 用 #c5ccd3 相对原文只有一档差异，现在改成两档分明的"强调 vs 非强调"。
+ * 色阶由 CSS 变量驱动，暗主题：主 #e7e9ea / 次 #8899a6；亮主题自动翻转。
  */
 
 /* inline 段落对照：两行都保留次要色（不分强调）*/
 .dualang-inline .dualang-inline-pair .dualang-para {
-  color: #c5ccd3;
+  color: var(--dl-text-secondary);
 }
 
 /* append 强调原文：译文变暗 */
 article[data-dualang-mode="append"] .dualang-translation .dualang-para {
-  color: #8899a6;
+  color: var(--dl-text-dim);
 }
 
-/* bilingual 强调译文：原文变暗、译文保持原生白 */
-.dualang-bilingual .dualang-original-html {
-  color: #8899a6;
+/* bilingual 强调译文：tweetText 原生元素变暗、card 译文更亮更粗。
+ * X 会给 tweetText 的子 span 设自己的 color（链接蓝 / mention 蓝等），单改顶层 color
+ * 会被子 span 覆盖 —— 实测原文不变色就是这个原因。用通配符 + !important 穿透所有
+ * 内联子元素，包括 @mention / #hashtag / 链接；牺牲彩色 token 换整体"原文 = 弱"语义。
+ * 译文追加 font-weight: 600 再加一档分量，强化"译文 = 焦点"。
+ */
+article[data-dualang-mode="bilingual"] [data-testid="tweetText"],
+article[data-dualang-mode="bilingual"] [data-testid="tweetText"] * {
+  color: var(--dl-text-dim) !important;
 }
-.dualang-bilingual .dualang-para {
-  color: #e7e9ea;
+article[data-dualang-mode="bilingual"] .dualang-translation .dualang-para {
+  color: var(--dl-text-main);
+  font-weight: 600;
 }
 
 /* ===== 段落对照模式（inline）===== */
@@ -90,59 +137,74 @@ article[data-dualang-mode="append"] .dualang-translation .dualang-para {
 }
 .dualang-line-fusion-divider {
   height: 1px;
-  background: #2f3336;
+  background: var(--dl-border);
   margin: 5px 0;
 }
-/* bilingual（强调译文）：原文暗、译文亮（默认） */
-.dualang-line-fusion-orig { color: #8899a6; }
-.dualang-line-fusion-trans { color: #e7e9ea; }
-/* append（强调原文）：原文亮、译文暗 —— 翻转 bilingual 默认 */
+/* bilingual（强调译文）：原文暗、译文亮 + 半粗体（默认） */
+.dualang-line-fusion-orig { color: var(--dl-text-dim); }
+.dualang-line-fusion-trans { color: var(--dl-text-main); font-weight: 600; }
+/* append（强调原文）：原文亮、译文暗、字重还原 —— 翻转 bilingual 默认 */
 article[data-dualang-mode="append"][data-dualang-line-fusion="true"] .dualang-line-fusion-orig {
-  color: #e7e9ea;
+  color: var(--dl-text-main);
 }
 article[data-dualang-mode="append"][data-dualang-line-fusion="true"] .dualang-line-fusion-trans {
-  color: #8899a6;
+  color: var(--dl-text-dim);
+  font-weight: 400;
 }
-/* fusion 下 card 顶部不再需要分隔线（原文在 card 内部） */
+/* fusion 下 card 顶部不再需要分隔线（原文在 card 内部每个 pair 里已有 divider），
+ * append + fusion / bilingual + fusion 都要抬高特异性 —— 否则后面 append/bilingual
+ * 的 border-top 规则与本规则平级时，按 CSS 源序后者胜出，fusion 激活仍会出现顶部线。
+ */
+article[data-dualang-mode="append"][data-dualang-line-fusion="true"] .dualang-translation,
+article[data-dualang-mode="bilingual"][data-dualang-line-fusion="true"] .dualang-translation,
 article[data-dualang-line-fusion="true"] .dualang-translation {
   border-top: none;
   padding-top: 0;
 }
 
+/* ===== 译文 / 原文里的 URL 链接 =====
+ * linkifyText 把字符串里的 http(s):// URL 包进 <a.dualang-link>，无论在 .dualang-para
+ * 还是 .dualang-line-fusion-* 里都强制用 X 的 accent 蓝 —— 否则 bilingual !important
+ * 规则会把 tweetText 内的所有子元素染成 dim，link 就看不出"可点击"语义。
+ * hover 加下划线提示，和 X 原生链接行为一致。
+ */
+.dualang-link,
+.dualang-link:visited {
+  color: #1d9bf0 !important;
+  text-decoration: none;
+  font-weight: inherit;
+}
+.dualang-link:hover {
+  text-decoration: underline;
+}
+
 /* ===== 智能字典注释 =====
  * 结构：<span.dualang-dict-term>WORD<span.dualang-dict-def data-level=...>【释义 /ipa/】</span></span>
  * 用真实 DOM 节点而不是 ::after 伪元素 —— 定义可被选中、复制、朗读。
- * data-level 持久化但不参与样式：模型级别判定偶有偏差，与其用颜色误导，不如统一淡黄。
+ * data-level 持久化但不参与样式：模型级别判定偶有偏差，与其用颜色误导，不如统一 dict-def 色。
  */
 .dualang-dict-term {
-  /* 和原文同色；定义独立着淡黄 */
+  /* 和原文同色；定义独立着 dict-def 色 */
 }
 .dualang-dict-def {
-  /* 淡黄 —— 在 X.com 黑底上有辨识度但不喧宾夺主，读者视线从原文滑过时能自然吸收 */
-  color: #e8c77a;
+  /* 暗主题淡黄、亮主题暗金 —— 在各自背景上有辨识度但不喧宾夺主 */
+  color: var(--dl-dict-def);
   font-size: 0.92em;
   margin-left: 2px;
   font-style: normal;
-  /* 细微 hint：字典定义可选择复制，但不要打断阅读流 */
 }
 
 /* ===== 原文和译文之间的分割线 =====
- * 两种强调模式都展示 —— 视觉上把原文和译文明确分成两块。
- *   - bilingual 模式：线在克隆原文块下边缘（card 内部）
- *   - append 模式：线在 .dualang-translation card 顶部（tweetTextEl 是 X 自己的元素，
- *     不碰它的 padding；用 card 的上边框达到同样的视觉效果）
- *
- * 颜色 #2f3336 与 X 自己的分割线一致。
+ * append / bilingual 都在 card 顶部画一条线（tweetText 和 card 之间）—— 视觉上把原文
+ * 和译文明确分成两块，两种模式下线位置完全一致，切换时不产生垂直位移。
+ * 之前 bilingual 专门在 .dualang-original-html 下方加 border + padding，切换时高度会抖动；
+ * 统一到 card.top 后，切换只换颜色不换结构。
  */
-.dualang-bilingual .dualang-original-html {
-  margin-bottom: 12px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid #2f3336;
-}
-article[data-dualang-mode="append"] .dualang-translation {
+article[data-dualang-mode="append"] .dualang-translation,
+article[data-dualang-mode="bilingual"] .dualang-translation {
   margin-top: 10px;
   padding-top: 10px;
-  border-top: 1px solid #2f3336;
+  border-top: 1px solid var(--dl-border);
 }
 
 /* ===== 手动翻译按钮 ===== */
@@ -150,10 +212,10 @@ article[data-dualang-mode="append"] .dualang-translation {
   display: inline-block;
   margin-top: 6px;
   padding: 2px 12px;
-  border: 1px solid #2f3336;
+  border: 1px solid var(--dl-border);
   border-radius: 9999px;
   background: transparent;
-  color: #71767b;
+  color: var(--dl-text-muted);
   font-size: 12px;
   font-family: inherit;
   cursor: pointer;
@@ -195,12 +257,12 @@ article[data-dualang-mode="append"] .dualang-translation {
 
 /* 排队中：空心圆圈 */
 .dualang-status--queued .dualang-status-icon {
-  border: 1.5px solid #3a3f44;
+  border: 1.5px solid var(--dl-border-subtle);
 }
 
 /* 翻译中：蓝色旋转圆圈 */
 .dualang-status--loading .dualang-status-icon {
-  border: 1.5px solid #3a3f44;
+  border: 1.5px solid var(--dl-border-subtle);
   border-top-color: #1d9bf0;
   animation: dualang-spin 0.7s linear infinite;
 }
@@ -210,7 +272,7 @@ article[data-dualang-mode="append"] .dualang-translation {
   width: 8px;
   height: 2px;
   border-radius: 1px;
-  background: #3a3f44;
+  background: var(--dl-border-subtle);
 }
 
 /* 失败：红色圆底 + 白色重试箭头（SVG via mask），点击重新翻译 */
@@ -284,8 +346,8 @@ article[data-dualang-mode="append"] .dualang-translation {
   width: 40px;
   height: 40px;
   border-radius: 50%;
-  background: #16181c;
-  border: 1px solid #2f3336;
+  background: var(--dl-bg-bubble);
+  border: 1px solid var(--dl-border);
   box-shadow: 0 4px 14px rgba(0,0,0,0.35);
   cursor: pointer;
   z-index: 10000;
@@ -305,7 +367,7 @@ article[data-dualang-mode="append"] .dualang-translation {
   height: 100%;
   transform: rotate(-90deg);
 }
-.dualang-bubble-ring-track { stroke: #2f3336; stroke-width: 2.5; }
+.dualang-bubble-ring-track { stroke: var(--dl-border); stroke-width: 2.5; }
 .dualang-bubble-ring {
   stroke: #1d9bf0;
   stroke-width: 2.5;
@@ -343,14 +405,11 @@ article[data-dualang-mode="append"] .dualang-translation {
   transform: translateY(-50%) translateX(4px);
   width: 260px;
   padding: 12px 14px;
-  background: linear-gradient(180deg, #1a1d22 0%, #15171b 100%);
-  border: 1px solid #2f3336;
+  background: var(--dl-bg-panel);
+  border: 1px solid var(--dl-border);
   border-radius: 14px;
-  box-shadow:
-    0 12px 32px rgba(0, 0, 0, 0.55),
-    0 2px 6px rgba(0, 0, 0, 0.35),
-    0 0 0 1px rgba(255, 255, 255, 0.02) inset;
-  color: #e7e9ea;
+  box-shadow: var(--dl-panel-shadow);
+  color: var(--dl-text-main);
   font-size: 13px;
   line-height: 1.4;
   z-index: 10000;
@@ -392,7 +451,7 @@ article[data-dualang-mode="append"] .dualang-translation {
 .dualang-bubble-group-label {
   font-size: 10px;
   font-weight: 700;
-  color: #71767b;
+  color: var(--dl-text-muted);
   text-transform: uppercase;
   letter-spacing: 0.14em;
   white-space: nowrap;
@@ -401,7 +460,7 @@ article[data-dualang-mode="append"] .dualang-translation {
 .dualang-bubble-group-line {
   flex: 1;
   height: 1px;
-  background: linear-gradient(90deg, #2f3336 0%, #2f3336 65%, transparent 100%);
+  background: linear-gradient(90deg, var(--dl-border) 0%, var(--dl-border) 65%, transparent 100%);
 }
 
 /* ----- 开启翻译：自定义 pill 开关 ----- */
@@ -412,7 +471,7 @@ article[data-dualang-mode="append"] .dualang-translation {
   cursor: pointer;
   font-weight: 700;
   font-size: 14px;
-  color: #e7e9ea;
+  color: var(--dl-text-main);
   padding: 2px 0;
   user-select: none;
 }
@@ -421,7 +480,7 @@ article[data-dualang-mode="append"] .dualang-translation {
   gap: 6px;
   font-size: 11px;
   font-weight: 600;
-  color: #a9b0b8;
+  color: var(--dl-text-tertiary);
   letter-spacing: 0.04em;
   padding: 0;
   flex-shrink: 0;
@@ -442,7 +501,7 @@ article[data-dualang-mode="append"] .dualang-translation {
   -webkit-appearance: none;
   width: 36px;
   height: 20px;
-  background: #2f3336;
+  background: var(--dl-border);
   border-radius: 9999px;
   position: relative;
   cursor: pointer;
@@ -472,8 +531,8 @@ article[data-dualang-mode="append"] .dualang-translation {
 .dualang-bubble-segment {
   display: flex;
   gap: 0;
-  background: #0b0d10;
-  border: 1px solid #2f3336;
+  background: var(--dl-bg-inset);
+  border: 1px solid var(--dl-border);
   border-radius: 8px;
   padding: 2px;
 }
@@ -481,7 +540,7 @@ article[data-dualang-mode="append"] .dualang-translation {
   flex: 1;
   padding: 6px 4px;
   background: transparent;
-  color: #a9b0b8;
+  color: var(--dl-text-tertiary);
   border: none;
   border-radius: 6px;
   font-size: 12px;
@@ -493,8 +552,8 @@ article[data-dualang-mode="append"] .dualang-translation {
   white-space: nowrap;
 }
 .dualang-bubble-segment button:hover:not(.dualang-bubble-segment-btn--active) {
-  color: #e7e9ea;
-  background: rgba(255, 255, 255, 0.04);
+  color: var(--dl-text-main);
+  background: var(--dl-btn-hover-bg);
 }
 .dualang-bubble-segment button:active { transform: scale(0.96); }
 .dualang-bubble-segment button.dualang-bubble-segment-btn--active {
@@ -518,19 +577,19 @@ article[data-dualang-mode="append"] .dualang-translation {
 .dualang-bubble-models::-webkit-scrollbar { width: 5px; }
 .dualang-bubble-models::-webkit-scrollbar-track { background: transparent; }
 .dualang-bubble-models::-webkit-scrollbar-thumb {
-  background: #2f3336;
+  background: var(--dl-border);
   border-radius: 3px;
 }
-.dualang-bubble-models::-webkit-scrollbar-thumb:hover { background: #3a4049; }
+.dualang-bubble-models::-webkit-scrollbar-thumb:hover { background: var(--dl-border-hover); }
 
 .dualang-bubble-model-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
   padding: 6px 10px;
-  background: #0b0d10;
-  color: #c5ccd3;
-  border: 1px solid #2f3336;
+  background: var(--dl-bg-inset);
+  color: var(--dl-text-secondary);
+  border: 1px solid var(--dl-border);
   border-radius: 7px;
   font-size: 12px;
   font-family: inherit;
@@ -540,8 +599,8 @@ article[data-dualang-mode="append"] .dualang-translation {
   position: relative;
 }
 .dualang-bubble-model-row:hover {
-  background: #1c1f23;
-  border-color: #3a4049;
+  background: var(--dl-bg-hover);
+  border-color: var(--dl-border-hover);
 }
 .dualang-bubble-model-row:active { transform: scale(0.985); }
 .dualang-bubble-model-row--active {
@@ -564,17 +623,17 @@ article[data-dualang-mode="append"] .dualang-translation {
   flex: 1;
 }
 .dualang-bubble-model-latency {
-  color: #71767b;
+  color: var(--dl-text-muted);
   font-variant-numeric: tabular-nums;
   font-size: 11px;
   padding: 2px 7px;
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--dl-btn-hover-bg);
   border-radius: 10px;
   flex-shrink: 0;
   margin-left: 8px;
 }
 .dualang-bubble-model-row--active .dualang-bubble-model-latency {
-  color: #e7e9ea;
+  color: var(--dl-text-main);
   background: rgba(29, 155, 240, 0.3);
 }
 
@@ -611,7 +670,7 @@ article[data-dualang-mode="append"] .dualang-translation {
   content: attr(data-progress);
   display: block;
   margin-top: 8px;
-  color: #71767b;
+  color: var(--dl-text-muted);
   font-size: 11px;
   text-align: center;
   letter-spacing: 0.08em;
@@ -620,7 +679,7 @@ article[data-dualang-mode="append"] .dualang-translation {
 
 /* ===== Inline 段落翻译 slot ===== */
 .dualang-inline-translation {
-  color: #c5ccd3;
+  color: var(--dl-text-secondary);
   margin: 6px 0 12px 0;
   white-space: pre-wrap;
   word-wrap: break-word;

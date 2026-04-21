@@ -1,7 +1,7 @@
 import { getModelMeta } from '../shared/model-meta';
 import { MODEL_PRESETS, detectPreset as detectPresetShared } from '../shared/model-presets';
 
-// popup DOM 是静态的；找不到就是 HTML/bundle 不对应，fail-fast 比到处 null 检查更清晰
+// popup DOM 是静态的；找不到就是 HTML/bundle 不对应，快速失败比到处 null 检查更清晰
 function byId<T extends HTMLElement>(id: string): T {
   const el = document.getElementById(id);
   if (!el) throw new Error(`popup: #${id} not found`);

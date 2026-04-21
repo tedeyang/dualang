@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect } from 'vitest';
-import { isAlreadyTargetLanguage, shouldSkipContent, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, isVerbatimReturn, rebuildParagraphs, splitParagraphsByDom, extractAnchoredBlocks } from './utils';
+import { isAlreadyTargetLanguage, shouldSkipContent, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, isVerbatimReturn, rebuildParagraphs, splitParagraphsByDom, extractAnchoredBlocks, extractText } from './utils';
 
 // ========== isAlreadyTargetLanguage ==========
 
@@ -562,5 +562,74 @@ describe('extractAnchoredBlocks', () => {
     const blocks = extractAnchoredBlocks(document.querySelector('article')!);
     expect(blocks).toHaveLength(1);
     expect(blocks[0].text).toBe('Only this one');
+  });
+});
+
+// ========== extractText ==========
+
+describe('extractText', () => {
+  it('普通文本：innerText/textContent 直接返回', () => {
+    document.body.innerHTML = '<div id="t">Hello world</div>';
+    expect(extractText(document.getElementById('t')!)).toBe('Hello world');
+  });
+
+  it('含 .dualang-dict-def 子节点：【释义 ipa】文本不应污染提取结果', () => {
+    document.body.innerHTML =
+      '<div id="t">Portugal confident its ' +
+      '<span class="dualang-dict-term">airports' +
+      '<span class="dualang-dict-def">【机场 ˈɛərpɔːts】</span>' +
+      '</span> will avoid shortages.</div>';
+    expect(extractText(document.getElementById('t')!))
+      .toBe('Portugal confident its airports will avoid shortages.');
+  });
+
+  it('提取后 dict-def 仍按原位存在（detach-extract-reattach 是瞬态操作）', () => {
+    document.body.innerHTML =
+      '<div id="t">x <span class="dualang-dict-term">word' +
+      '<span class="dualang-dict-def">【含义 w】</span></span> y</div>';
+    extractText(document.getElementById('t')!);
+    const def = document.querySelector('.dualang-dict-def');
+    expect(def).not.toBeNull();
+    expect(def!.textContent).toBe('【含义 w】');
+    // parent 仍是 dict-term，位置不变
+    expect(def!.parentElement!.className).toBe('dualang-dict-term');
+  });
+
+  it('URL 被视觉换行断开：用 <a>.textContent 反查 raw 里带 \\n 的变体合回', () => {
+    // jsdom 的 innerText 不完全模拟 X.com 视觉换行；我们直接让 innerText 产出带 \n 的形态，
+    // 并给 <a> 挂上干净的 textContent，验证反查-替换能把 raw 修复成干净 URL。
+    document.body.innerHTML =
+      '<div id="t">Code: <a href="https://github.com/Tencent/MegaStyle">https://github.com/Tencent/MegaStyle</a></div>';
+    const el = document.getElementById('t')!;
+    // 覆盖 innerText 为 X.com 视觉换行后的形态（任意位置被切开）
+    Object.defineProperty(el, 'innerText', {
+      value: 'Code: https://github.com/Tencent/MegaSt\nyle',
+      configurable: true,
+    });
+    expect(extractText(el)).toBe('Code: https://github.com/Tencent/MegaStyle');
+  });
+
+  it('多个 <a>：各自独立反查，彼此不受影响', () => {
+    document.body.innerHTML =
+      '<div id="t">' +
+      'A <a href="https://example.com/abcdef">https://example.com/abcdef</a> ' +
+      'B <a href="https://other.io/xyz">https://other.io/xyz</a></div>';
+    const el = document.getElementById('t')!;
+    Object.defineProperty(el, 'innerText', {
+      value: 'A https://example.com/abc\ndef B https://other.io/x\nyz',
+      configurable: true,
+    });
+    expect(extractText(el)).toBe('A https://example.com/abcdef B https://other.io/xyz');
+  });
+
+  it('URL 未被换行打断时不改动 raw（raw.includes(clean) 早退）', () => {
+    document.body.innerHTML =
+      '<div id="t">Code <a href="https://ok.com/ok">https://ok.com/ok</a> end</div>';
+    const el = document.getElementById('t')!;
+    Object.defineProperty(el, 'innerText', {
+      value: 'Code https://ok.com/ok end',
+      configurable: true,
+    });
+    expect(extractText(el)).toBe('Code https://ok.com/ok end');
   });
 });

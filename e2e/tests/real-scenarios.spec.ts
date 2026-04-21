@@ -10,9 +10,9 @@ function installApi(context: any) {
     seq++;
     const postData = JSON.parse(route.request().postData() || '{}');
     const content: string = postData.messages?.[1]?.content || '';
-    const hasDelimiter = /===\s*\d+\s*===|推文 \d+:/.test(content);
+    const hasDelimiter = /===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/.test(content);
     const tweetBlocks = hasDelimiter
-      ? content.split(/===\s*\d+\s*===|推文 \d+:/g).slice(1).map(s => s.trim())
+      ? content.split(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g).slice(1).map(s => s.trim())
       : [content.trim()];
     const count = tweetBlocks.length || 1;
     requests.push({ texts: tweetBlocks, seq, sizeChars: content.length });
@@ -129,7 +129,7 @@ test.describe('Realistic X.com DOM scenarios', () => {
       const postData = JSON.parse(route.request().postData() || '{}');
       const content: string = postData.messages?.[1]?.content || '';
       seenBodies.push(content);
-      const count = (content.match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = (content.match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       // 延迟 800ms，留出 recycle 窗口
       await new Promise(r => setTimeout(r, 800));
       const results = Array.from({ length: count }, (_, i) => ({
@@ -178,7 +178,7 @@ test.describe('Realistic X.com DOM scenarios', () => {
       call++;
       const postData = JSON.parse(route.request().postData() || '{}');
       const content: string = postData.messages?.[1]?.content || '';
-      const count = (content.match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = (content.match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       const translated = call === 1
         ? '行数被坍缩的单行译文'                           // 明显不够
         : '第一行\n第二行\n第三行\n第四行\n第五行';          // 合理
@@ -228,7 +228,7 @@ test.describe('Realistic X.com DOM scenarios', () => {
     await context.route('https://api.moonshot.cn/v1/chat/completions', async (route: any) => {
       call++;
       if (call === 1) {
-        const count = ((JSON.parse(route.request().postData() || '{}').messages?.[1]?.content || '').match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+        const count = ((JSON.parse(route.request().postData() || '{}').messages?.[1]?.content || '').match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
         const results = Array.from({ length: count }, (_, i) => ({ index: i, translated: `译${i}` }));
         await route.fulfill({
           status: 200, contentType: 'application/json',
@@ -287,7 +287,7 @@ test.describe('Realistic X.com DOM scenarios', () => {
       const postData = JSON.parse(route.request().postData() || '{}');
       const sysPrompt: string = postData.messages?.[0]?.content || '';
       prompts.push(sysPrompt);
-      const count = (postData.messages?.[1]?.content?.match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = (postData.messages?.[1]?.content?.match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       // 第一次返回过短译文（触发质量检查）；第二次返回合理译文
       const translated = call === 1
         ? '短译'  // 20字原文 → 2字译文，触发
@@ -335,7 +335,7 @@ test.describe('Realistic X.com DOM scenarios', () => {
     // API 两次都返回坍缩译文 — 重试后仍可疑 → 显示 fail
     await context.route('https://api.moonshot.cn/v1/chat/completions', async (route: any) => {
       const postData = JSON.parse(route.request().postData() || '{}');
-      const count = (postData.messages?.[1]?.content?.match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = (postData.messages?.[1]?.content?.match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       const results = Array.from({ length: count }, (_, i) => ({ index: i, translated: '永远只有一行' }));
       await route.fulfill({
         status: 200, contentType: 'application/json',
@@ -375,7 +375,7 @@ test.describe('Realistic X.com DOM scenarios', () => {
       call++;
       const postData = JSON.parse(route.request().postData() || '{}');
       const text: string = postData.messages?.[1]?.content || '';
-      const count = (text.match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = (text.match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       // 第一次翻译旧文本，第二次翻译编辑后的文本 — 翻译里带明显标识
       const marker = text.includes('grapes') ? '葡萄译文' : '苹果译文';
       const results = Array.from({ length: count }, (_, i) => ({ index: i, translated: marker }));
@@ -430,7 +430,7 @@ test.describe('Realistic X.com DOM scenarios', () => {
     await context.route('https://api.moonshot.cn/v1/chat/completions', async (route: any) => {
       call++;
       const postData = JSON.parse(route.request().postData() || '{}');
-      const count = (postData.messages?.[1]?.content?.match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = (postData.messages?.[1]?.content?.match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       const t = call === 1 ? '短译文' : '段一\n\n段二\n\n段三\n\n段四\n\n段五';
       const results = Array.from({ length: count }, (_, i) => ({ index: i, translated: t }));
       await route.fulfill({

@@ -6,6 +6,7 @@ import {
   parseDelimitedBatch,
   parseDelimitedBatchWithDict,
   buildBatchUserContent,
+  findSafeOffset,
   LANG_DISPLAY,
   type ProviderProfile,
 } from './profiles';
@@ -269,9 +270,10 @@ export async function doAnnotateDictionary(
 export type OnStreamResult = (index: number, translated: string) => void;
 
 /**
- * 流式批量翻译：SSE stream + 增量 ===N=== 分隔符提取。
- * 当检测到下一条的 "===M===" 开头时，把上一条 [N..M) 之间的内容作为第 N 条的完成译文推送。
- * 最后一条在流结束时由 buffer 尾部推送。
+ * 流式批量翻译：SSE stream + 增量 `<tN>...</tN>` 标签提取。
+ * 一旦累积缓冲区里出现 `</t{offset+i}>`，就把 [开始标签末尾, 闭合位置) 之间的内容作为
+ * 第 i 条的完成译文推送。对比老的 ===N=== 方案，闭合标签是明确的完成信号，不用"等下一个
+ * 分隔符出现才知道前一个完了"，最后一条也能在流结束前推出。
  */
 export async function doTranslateBatchStream(
   texts: string[],
@@ -285,12 +287,13 @@ export async function doTranslateBatchStream(
   const targetLangDisplay = LANG_DISPLAY[settings.targetLang] || settings.targetLang;
 
   const isSingle = texts.length === 1;
+  const tagOffset = isSingle ? 0 : findSafeOffset(texts, texts.length);
   const systemPrompt = composeSystemPrompt(profile, targetLangDisplay, {
     batch: !isSingle, strict: strictMode,
   });
   const userContent = isSingle
     ? texts[0]
-    : texts.map((t, i) => `===${i}===\n${t}`).join('\n\n');
+    : buildBatchUserContent(texts, undefined, undefined, tagOffset);
 
   const body: any = {
     model: settings.model || 'kimi-k2.5',
@@ -319,27 +322,29 @@ export async function doTranslateBatchStream(
   let accumulated = '';
   const emittedIndices = new Set<number>();
 
+  // 预编译 per-item 开闭标签匹配（避免每个 delta 都重建 regex）
+  // 开始标签可带 dict 属性（`<t0 dict="...">`），用 `(?=[\s>])` 保证 `<t1` 不误匹配 `<t10`
+  const openPatterns = texts.map((_, i) => new RegExp(`<t${tagOffset + i}(?=[\\s>])[^>]*>`));
+  const closeTags = texts.map((_, i) => `</t${tagOffset + i}>`);
+
   function tryEmitCompleted() {
     if (isSingle) return;  // 单条不做增量推送
-    // 找所有已出现的 "===N===" 分隔符位置；相邻分隔符之间的内容才算"完成"
-    const re = /^===\s*(\d+)\s*===\s*$/gm;
-    const positions: Array<{ idx: number; start: number; end: number }> = [];
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(accumulated)) !== null) {
-      const idx = parseInt(m[1], 10);
-      if (Number.isFinite(idx)) {
-        positions.push({ idx, start: m.index, end: m.index + m[0].length });
-      }
-    }
-    // 只有当下一个分隔符已出现时，才能确定前一个分隔符对应的内容已完成
-    for (let i = 0; i < positions.length - 1; i++) {
-      const cur = positions[i];
-      if (emittedIndices.has(cur.idx)) continue;
-      if (cur.idx < 0 || cur.idx >= texts.length) continue;
-      const content = accumulated.slice(cur.end, positions[i + 1].start).trim();
-      if (content) {
-        emittedIndices.add(cur.idx);
-        onResult(cur.idx, content);
+    for (let i = 0; i < texts.length; i++) {
+      if (emittedIndices.has(i)) continue;
+      const closePos = accumulated.indexOf(closeTags[i]);
+      if (closePos === -1) continue;
+      const openMatch = openPatterns[i].exec(accumulated);
+      if (!openMatch || openMatch.index >= closePos) continue;
+      const chunk = accumulated.slice(openMatch.index + openMatch[0].length, closePos);
+      // 剥离 ---DICT--- 段（流式默认不要字典但防御性保留）
+      const translation = chunk
+        .split(/\n\s*-{2,}\s*DICT\s*-{2,}/i)[0]
+        .replace(/^\n+/, '')
+        .replace(/\n{3,}$/, '')
+        .trim();
+      if (translation) {
+        emittedIndices.add(i);
+        onResult(i, translation);
       }
     }
   }
@@ -349,7 +354,7 @@ export async function doTranslateBatchStream(
     tryEmitCompleted();
   }
 
-  // 终局解析：单条纯文本 or 分隔符切分
+  // 终局解析：单条纯文本 or 标签/分隔符切分
   if (isSingle) {
     const content = stripMarkdownCode(accumulated.trim());
     if (!emittedIndices.has(0) && content) {
@@ -358,8 +363,8 @@ export async function doTranslateBatchStream(
     return { translations: [content] };
   }
 
-  const translations = parseDelimitedBatch(accumulated, texts.length);
-  // 补推流式未覆盖的条目（最后一条通常是流结束才完成）
+  const translations = parseDelimitedBatch(accumulated, texts.length, tagOffset);
+  // 补推流式未覆盖的条目（模型输出标签不闭合时由 parseDelimitedBatch 的 === fallback 兜底）
   for (let i = 0; i < translations.length; i++) {
     if (translations[i] && !emittedIndices.has(i)) {
       emittedIndices.add(i);
@@ -367,7 +372,7 @@ export async function doTranslateBatchStream(
     }
   }
   if (emittedIndices.size === 0) {
-    throw new Error(`流式批量翻译分隔符解析失败，原始内容: ${accumulated.slice(0, 200)}`);
+    throw new Error(`流式批量翻译解析失败（未找到 <tN> 标签或 ===N=== 分隔符），原始内容: ${accumulated.slice(0, 200)}`);
   }
   return { translations };
 }
@@ -431,11 +436,13 @@ export async function doTranslateBatchRequest(
     ? options.smartDictIndices
     : undefined;
   const useStructured = !isSingle || !!dictIndices;
+  // 避免原文里碰巧含 <tN> 字符串（如 AI 教学 / 代码推文）打断 parser
+  const tagOffset = useStructured ? findSafeOffset(texts, texts.length) : 0;
   const systemPrompt = composeSystemPrompt(profile, targetLangDisplay, {
     batch: useStructured, strict: strictMode, smartDict: !!dictIndices,
   });
   const userContent = useStructured
-    ? buildBatchUserContent(texts, dictIndices, options.perItemCandidates)
+    ? buildBatchUserContent(texts, dictIndices, options.perItemCandidates, tagOffset)
     : texts[0];
 
   const body: any = {
@@ -465,10 +472,10 @@ export async function doTranslateBatchRequest(
   const raw = data.choices?.[0]?.message?.content?.trim();
   if (!raw) throw new Error('API 返回结果为空');
 
-  // 单条无字典：纯文本解析，容错兼容模型忽略指令吐 JSON / 分隔符的情形
+  // 单条无字典：纯文本解析，容错兼容模型忽略指令吐 JSON / 标签 / 分隔符的情形
   if (!useStructured) {
     const cleaned = stripMarkdownCode(raw);
-    if (/^\s*[{[]/.test(cleaned) || /^===\s*\d+\s*===/m.test(cleaned)) {
+    if (/^\s*[{[]/.test(cleaned) || /<t\d+[^>]*>/.test(cleaned) || /^===\s*\d+\s*===/m.test(cleaned)) {
       const fallback = parseDelimitedBatch(cleaned, 1);
       if (fallback[0]) return { translations: fallback, usage: data.usage };
     }
@@ -477,15 +484,14 @@ export async function doTranslateBatchRequest(
 
   // 结构化路径：字典模式走带 ---DICT--- 的解析；否则用老的分隔符解析
   if (dictIndices) {
-    const { translations, dictEntries } = parseDelimitedBatchWithDict(raw, texts.length);
+    const { translations, dictEntries } = parseDelimitedBatchWithDict(raw, texts.length, tagOffset);
     const successCount = translations.filter((t) => t && t.length > 0).length;
     if (successCount > 0) {
       recordCombinedSuccess(settings.model);
       return { translations, dictEntries, usage: data.usage };
     }
-    // GLM-4-9B 等小模型偶尔被"===N=== (dict) + ---DICT---"的三层标记打懵 ——
-    // 输出退化为重复词 / 标记残缺（`===1 (dict)` 无结尾、`===D` 把 DICT 首字母当 index）。
-    // 重试一次但不带字典请求：丢字典，保住翻译主路径（比整批失败好）。
+    // 小模型偶尔被"<tN dict=...> + ---DICT---"的双层结构打懵 ——
+    // 输出退化为重复词 / 闭合标签丢失。重试一次但不带字典请求：丢字典，保住翻译主路径。
     recordCombinedFailure(settings.model);
     console.warn('[Dualang] combined call parse failed, retrying without smartDict', {
       model: settings.model,
@@ -497,10 +503,10 @@ export async function doTranslateBatchRequest(
     );
     return retried;
   }
-  const translations = parseDelimitedBatch(raw, texts.length);
+  const translations = parseDelimitedBatch(raw, texts.length, tagOffset);
   const successCount = translations.filter((t) => t && t.length > 0).length;
   if (successCount === 0) {
-    throw new Error(`批量翻译解析失败（未找到 ===N=== 分隔符）: ${raw.slice(0, 200)}`);
+    throw new Error(`批量翻译解析失败（未找到 <tN> 标签或 ===N=== 分隔符）: ${raw.slice(0, 200)}`);
   }
   return { translations, usage: data.usage };
 }

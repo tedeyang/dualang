@@ -256,6 +256,27 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     }
   }
 
+  // ========== 主题检测 ==========
+  // X.com 黑/白主题通过 body 背景亮度区分。检测结果写到 <html data-dualang-theme>，
+  // CSS 变量在该属性下自动切换到亮色方案。
+  function applyTheme() {
+    const bg = window.getComputedStyle(document.body).backgroundColor;
+    const m = bg.match(/\d+/g);
+    if (!m) return;
+    const [r, g, b] = m.map(Number);
+    const luminance = r * 0.299 + g * 0.587 + b * 0.114;
+    const theme = luminance > 128 ? 'light' : 'dark';
+    document.documentElement.dataset.dualangTheme = theme;
+  }
+
+  function watchTheme() {
+    applyTheme();
+    // X.com 切换主题时会更改 body 的 style（background-color），观察 style 属性变化即可。
+    new MutationObserver(applyTheme).observe(document.body, { attributes: true, attributeFilter: ['style', 'class'] });
+    // 兼容：部分情况下 html 上的 class 变化先于 body style，也一并观察。
+    new MutationObserver(applyTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['style', 'class'] });
+  }
+
   // ========== 初始化 ==========
   async function init() {
     const t0 = performance.now();
@@ -282,6 +303,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       initCostMs: (performance.now() - t0).toFixed(2)
     });
     ensureBgPort();
+    watchTheme();
     bubble.initBubble({
       onSuperFineTrigger: (article: Element) => translateArticleSuperFine(article),
       onSuperFineCancel: (article: Element) => {
@@ -398,11 +420,13 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
    */
   function dictTargetEls(article: Element, fallback: Element): Element[] {
     if (displayMode === 'translation-only') return [];
-    if (displayMode === 'append') return [fallback];
+    // append / bilingual 都直接注入到原生 tweetText（bilingual 现在不克隆原文，
+    // 仅靠 CSS 把 tweetText 变暗 —— 见 styles.css，高度稳定不跳动）。
+    if (displayMode === 'append' || displayMode === 'bilingual') return [fallback];
+    // inline 按段逐个克隆块注入；card 尚未渲染时退回到 fallback（稀有边界）
     const clones = Array.from(article.querySelectorAll<HTMLElement>(
       '.dualang-translation .dualang-original-html'
     ));
-    // card 尚未渲染时退回到 fallback（稀有边界：应用字典早于渲染）
     return clones.length > 0 ? clones : [fallback];
   }
 

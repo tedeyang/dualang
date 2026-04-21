@@ -233,10 +233,49 @@ export function extractText(el: Element): string {
   // 段落全部粘成一行）。我们注入的 .dualang-translation / .dualang-btn / .dualang-status
   // 都是 tweetTextEl 的兄弟节点（见 insertBefore 调用点），不在 tweetTextEl 内部，
   // 所以直接读 innerText 不会抓到我们自己的 UI 文字。
-  // 另外：X Articles 的段落边界在 innerText 里可能只有单个 \n（tight layout）而非 \n\n，
-  // 统一把 2+ 连续 \n 归一为 \n\n，保留单个 \n 作为行内换行供下游按需拆段。
-  const raw = ((el as HTMLElement).innerText || el.textContent || '').trim();
-  return raw.replace(/[^\S\n]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+  //
+  // 例外：智能字典会在 tweetTextEl 内部注入 `<span.dualang-dict-def>【释义 /ipa/】</span>`
+  // 子节点，innerText 会把这段 `【...】` 拼进来。如果这个脏文本被拿去做缓存比较
+  // 或作为 originalText 存入 translationCache，再次渲染时 line-fusion 会把 `【...】`
+  // 当正文显示；多次切字典还会叠加成 `【gloss ipa1】【gloss ipa2】`。所以先临时摘除
+  // dict-def（MutationObserver 的 handler 已对 dict-term/dict-def 的 mutation 豁免，
+  // detach 不会触发 show-more 误判），读完再按原位置回插。
+  const defs = Array.from(el.querySelectorAll<HTMLElement>('.dualang-dict-def'));
+  const defAnchors = defs.map((d) => ({ node: d, parent: d.parentNode, next: d.nextSibling }));
+  for (const a of defAnchors) a.parent?.removeChild(a.node);
+
+  let raw = ((el as HTMLElement).innerText || el.textContent || '').trim();
+
+  for (let i = defAnchors.length - 1; i >= 0; i--) {
+    defAnchors[i].parent?.insertBefore(defAnchors[i].node, defAnchors[i].next);
+  }
+
+  // 修复 <a> 里被 CSS 视觉换行打断的 URL：X.com 渲染长 URL 时，常用嵌套 <span>
+  // + CSS 在字符中间硬切，innerText 在视觉换行点插 \n，产生 `MegaSt\nyle`、
+  // `tence\nnt/MegaStyle-1.4M` 这类被断开的 URL。断点位置任意，单一正则难以覆盖。
+  // 解法：每个 <a> 的 textContent 是不受 CSS 影响的干净形态，用它在 raw 里反查带
+  // \n 的变体再替换回去。
+  const linkEls = Array.from(el.querySelectorAll<HTMLAnchorElement>('a'));
+  for (const a of linkEls) {
+    const clean = (a.textContent || '').trim();
+    if (clean.length < 3) continue;
+    if (raw.includes(clean)) continue;  // 未被换行打断，跳过
+    // 允许每个字符后插入 \n 的容错模式；逐字符展开虽然正则长，但 URL 长度有限。
+    // 必须先 split 再对每个字符做转义，否则 `\.` 会被 split('') 拆成 `\` 和 `.` 两个字符，
+    // 再 join `\n?` 会把转义关系打散造成正则语义错乱。
+    const pattern = clean
+      .split('')
+      .map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .join('\\n?');
+    try {
+      raw = raw.replace(new RegExp(pattern), clean);
+    } catch (_) { /* 极端情况编译失败直接放弃，保证主路径不抛 */ }
+  }
+
+  return raw
+    .replace(/[^\S\n]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 // 按段落切分 extractText 的输出。X Articles 在 innerText 里常用单 \n 分隔段落
@@ -253,7 +292,7 @@ export function splitIntoParagraphs(text: string): string[] {
 // 按 DOM block-level 结构提取段落，专为长文（X Articles）设计。
 // 遍历每个 leaf block（自身是 block 且内部没有更深的 block 子元素）取 textContent，
 // 合并为 "\n\n" 分隔的段落串。对 innerText 的 CSS tight-layout（全 \n）或
-// margin-separated（全 \n\n）都给出一致的按视觉段落数。
+// 无论 CSS 紧凑布局（全 \n）还是 margin 分隔（全 \n\n）都给出一致的按视觉段落数。
 const BLOCK_TAGS = new Set([
   'DIV', 'P', 'SECTION', 'ARTICLE', 'MAIN', 'ASIDE',
   'LI', 'UL', 'OL', 'DL', 'DD', 'DT',
@@ -273,7 +312,7 @@ export function extractAnchoredBlocks(el: Element): AnchoredBlock[] {
     const blockChildren = Array.from(node.children).filter((c) => BLOCK_TAGS.has(c.tagName));
     if (blockChildren.length === 0) {
       // 叶子 block：优先识别图片
-      // img[alt] CSS selector matches presence of attr; filter rejects alt=""
+      // img[alt] CSS 选择器仅匹配存在 alt 属性的 img；过滤掉 alt="" 的空值
       const imgs = Array.from(node.querySelectorAll('img[alt]'))
         .map((img) => (img.getAttribute('alt') || '').trim())
         .filter((alt) => alt.length > 0);

@@ -18,7 +18,7 @@ interface RunningTask {
 }
 
 interface RateLimitState {
-  requests: number[];                       // timestamps within last 60s
+  requests: number[];                       // 最近 60 秒内的请求时间戳
   tokensPerMin: Array<{ ts: number; count: number }>;
 }
 

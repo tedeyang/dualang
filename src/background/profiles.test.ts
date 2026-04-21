@@ -6,6 +6,7 @@ import {
   parseDelimitedBatchWithDict,
   buildBatchUserContent,
   composeSystemPrompt,
+  findSafeOffset,
 } from './profiles';
 
 describe('getProfile', () => {
@@ -128,8 +129,62 @@ describe('resolveEndpoint', () => {
   });
 });
 
+describe('findSafeOffset', () => {
+  it('原文无 <tN> 冲突 → 返回 0（默认路径）', () => {
+    expect(findSafeOffset(['Hello world', '你好'], 2)).toBe(0);
+  });
+
+  it('原文含 <t0> 字面串 → 偏移到 100', () => {
+    expect(findSafeOffset(['See <t0> in HTML example', 'normal'], 2)).toBe(100);
+  });
+
+  it('原文含 </t5> 闭合标签字面串 → 也算冲突', () => {
+    expect(findSafeOffset(['wrap with </t5>', 'ok'], 6)).toBe(100);
+  });
+
+  it('原文含 <t0 dict="x"> 带属性的开始标签 → 也算冲突', () => {
+    expect(findSafeOffset(['hi <t0 dict="foo"> here', 'ok'], 2)).toBe(100);
+  });
+
+  it('只冲突于 offset=0 范围外（如 <t50>）不影响 count<50 的请求', () => {
+    // count=2 时 offset=0 的范围是 0-1，<t50> 不冲突
+    expect(findSafeOffset(['mentions <t50> only', 'ok'], 2)).toBe(0);
+  });
+
+  it('100 也冲突时偏移到 1000', () => {
+    expect(findSafeOffset(['<t0> and <t100> both here', 'x'], 2)).toBe(1000);
+  });
+});
+
 describe('parseDelimitedBatch', () => {
-  it('标准格式：===0===/===1===', () => {
+  // 主路径：<tN>...</tN>（当前输出格式）
+  it('主路径：<t0>...</t0> / <t1>...</t1>', () => {
+    const raw = '<t0>\n译文A\n</t0>\n\n<t1>\n译文B\n</t1>';
+    expect(parseDelimitedBatch(raw, 2)).toEqual(['译文A', '译文B']);
+  });
+
+  it('主路径：开始标签带 dict 属性也能匹配', () => {
+    const raw = '<t0 dict="foo bar">\n译文A\n</t0>\n\n<t1>\n译文B\n</t1>';
+    expect(parseDelimitedBatch(raw, 2)).toEqual(['译文A', '译文B']);
+  });
+
+  it('主路径：tag 内有 ---DICT--- 段时只取译文部分（dict 信息丢掉）', () => {
+    const raw = '<t0>\n译文A\n---DICT---\nfoo|/fo/|示例|cet6\n</t0>';
+    expect(parseDelimitedBatch(raw, 1)).toEqual(['译文A']);
+  });
+
+  it('主路径：乱序 tag / 嵌入前后文本（非贪婪 + 反向引用确保闭合一致）', () => {
+    const raw = '好的，翻译如下：\n<t1>\nB\n</t1>\n\n<t0>\nA\n</t0>\n完成';
+    expect(parseDelimitedBatch(raw, 2)).toEqual(['A', 'B']);
+  });
+
+  it('主路径：offset=100 时 index 按 offset 对齐', () => {
+    const raw = '<t100>\nA\n</t100>\n\n<t101>\nB\n</t101>';
+    expect(parseDelimitedBatch(raw, 2, 100)).toEqual(['A', 'B']);
+  });
+
+  // Fallback 1：===N=== 分隔符（legacy；e2e mock 仍在用 + 模型偶发回退）
+  it('fallback 1：===0===/===1=== 格式仍能解析（legacy）', () => {
     const raw = '===0===\n译文A\n\n===1===\n译文B';
     expect(parseDelimitedBatch(raw, 2)).toEqual(['译文A', '译文B']);
   });
@@ -168,6 +223,11 @@ describe('parseDelimitedBatch', () => {
     expect(parseDelimitedBatch('===0===\n只有一条', 3)).toEqual(['只有一条', '', '']);
   });
 
+  it('Qwen2.5 偶发只输出 "=== N"（无尾 ===）也能识别', () => {
+    const raw = '=== 0\n译文A\n\n=== 1\n译文B';
+    expect(parseDelimitedBatch(raw, 2)).toEqual(['译文A', '译文B']);
+  });
+
   it('降级：模型返回 JSON 时也能解析（兼容强模型 + 旧测试）', () => {
     const raw = '{"results":[{"index":0,"translated":"译文A"},{"index":1,"translated":"译文B"}]}';
     expect(parseDelimitedBatch(raw, 2)).toEqual(['译文A', '译文B']);
@@ -180,38 +240,43 @@ describe('parseDelimitedBatch', () => {
 });
 
 describe('buildBatchUserContent', () => {
-  it('无 smartDictIndices → 普通 ===N=== 列表', () => {
+  it('无 smartDictIndices → 普通 <tN>...</tN> 列表（offset=0）', () => {
     const out = buildBatchUserContent(['a', 'b']);
-    expect(out).toBe('===0===\na\n\n===1===\nb');
+    expect(out).toBe('<t0>\na\n</t0>\n\n<t1>\nb\n</t1>');
   });
 
-  it('smartDictIndices + perItemCandidates 非空 → "(dict: w1 w2)" 标注', () => {
+  it('smartDictIndices + perItemCandidates 非空 → 开始标签带 dict="..." 属性', () => {
     const out = buildBatchUserContent(
       ['english', '中文', 'slang'],
       new Set([0, 2]),
       [['mercurial', 'obscure'], null, ['lit']],
     );
-    expect(out).toContain('===0=== (dict: mercurial obscure)\nenglish');
-    expect(out).toContain('===1===\n中文');
-    expect(out).toContain('===2=== (dict: lit)\nslang');
+    expect(out).toContain('<t0 dict="mercurial obscure">\nenglish\n</t0>');
+    expect(out).toContain('<t1>\n中文\n</t1>');
+    expect(out).toContain('<t2 dict="lit">\nslang\n</t2>');
   });
 
-  it('candidates 为空 / null 的索引即使在 smartDictIndices 里也不打 (dict) 标', () => {
+  it('candidates 为空 / null 的索引即使在 smartDictIndices 里也不写 dict 属性', () => {
     const out = buildBatchUserContent(['x', 'y'], new Set([0, 1]), [[], null]);
-    expect(out).toContain('===0===\nx');
-    expect(out).toContain('===1===\ny');
-    expect(out).not.toContain('(dict');
+    expect(out).toContain('<t0>\nx\n</t0>');
+    expect(out).toContain('<t1>\ny\n</t1>');
+    expect(out).not.toContain('dict=');
   });
 
-  it('不传 perItemCandidates 时也不打 (dict) 标（无候选不请求字典）', () => {
+  it('不传 perItemCandidates 时也不写 dict 属性（无候选不请求字典）', () => {
     const out = buildBatchUserContent(['x'], new Set([0]));
-    expect(out).toBe('===0===\nx');
+    expect(out).toBe('<t0>\nx\n</t0>');
+  });
+
+  it('offset 非零时 tag 从 offset 起编号（避免原文含 <t0> 冲突）', () => {
+    const out = buildBatchUserContent(['hello', 'world'], undefined, undefined, 100);
+    expect(out).toBe('<t100>\nhello\n</t100>\n\n<t101>\nworld\n</t101>');
   });
 });
 
 describe('parseDelimitedBatchWithDict', () => {
   it('仅译文（无 ---DICT--- 段）→ translations 齐全，dictEntries 全 null', () => {
-    const raw = '===0===\n译文A\n\n===1===\n译文B';
+    const raw = '<t0>\n译文A\n</t0>\n\n<t1>\n译文B\n</t1>';
     const { translations, dictEntries } = parseDelimitedBatchWithDict(raw, 2);
     expect(translations).toEqual(['译文A', '译文B']);
     expect(dictEntries).toEqual([null, null]);
@@ -219,8 +284,8 @@ describe('parseDelimitedBatchWithDict', () => {
 
   it('部分条目带 ---DICT---：对应索引返回条目（含 level）其他为 null', () => {
     const raw =
-      '===0=== (dict)\n这是英文原文的译文。\n---DICT---\namazing|/əˈmeɪzɪŋ/|惊艳|cet6\nmercurial|/mɜːˈkjʊəriəl/|善变|ielts\n\n' +
-      '===1===\n这是中文原文不需要字典。';
+      '<t0 dict="amazing mercurial">\n这是英文原文的译文。\n---DICT---\namazing|/əˈmeɪzɪŋ/|惊艳|cet6\nmercurial|/mɜːˈkjʊəriəl/|善变|ielts\n</t0>\n\n' +
+      '<t1>\n这是中文原文不需要字典。\n</t1>';
     const { translations, dictEntries } = parseDelimitedBatchWithDict(raw, 2);
     expect(translations[0]).toBe('这是英文原文的译文。');
     expect(translations[1]).toBe('这是中文原文不需要字典。');
@@ -233,7 +298,7 @@ describe('parseDelimitedBatchWithDict', () => {
 
   it('宽松分隔符：多个 - 号、前导 bullet 都能解析，含 level', () => {
     const raw =
-      '===0=== (dict)\n译文\n----- DICT -----\n- obscure|/əbˈskjʊə/|晦涩|cet6\n* enigmatic|/ˌenɪɡˈmætɪk/|神秘|kaoyan';
+      '<t0 dict="obscure enigmatic">\n译文\n----- DICT -----\n- obscure|/əbˈskjʊə/|晦涩|cet6\n* enigmatic|/ˌenɪɡˈmætɪk/|神秘|kaoyan\n</t0>';
     const { translations, dictEntries } = parseDelimitedBatchWithDict(raw, 1);
     expect(translations[0]).toBe('译文');
     expect(dictEntries[0]).toEqual([
@@ -244,7 +309,7 @@ describe('parseDelimitedBatchWithDict', () => {
 
   it('缺 level 字段或 level 非法值时，level 字段被省略（不塞 undefined/cet4）', () => {
     const raw =
-      '===0=== (dict)\n译文\n---DICT---\nok|/ok/|好的\nfoo|/fu:/|福|cet4\nbar|/bɑ:/|吧|unknown';
+      '<t0 dict="ok foo bar">\n译文\n---DICT---\nok|/ok/|好的\nfoo|/fu:/|福|cet4\nbar|/bɑ:/|吧|unknown\n</t0>';
     const { dictEntries } = parseDelimitedBatchWithDict(raw, 1);
     expect(dictEntries[0]).toEqual([
       { term: 'ok', ipa: '/ok/', gloss: '好的' },
@@ -255,7 +320,7 @@ describe('parseDelimitedBatchWithDict', () => {
 
   it('畸形字典行（缺字段/空行）安全跳过，不影响译文', () => {
     const raw =
-      '===0=== (dict)\n译文\n---DICT---\nbroken\n|only pipes|\nok|/ok/|好的|ielts\n';
+      '<t0 dict="ok">\n译文\n---DICT---\nbroken\n|only pipes|\nok|/ok/|好的|ielts\n</t0>';
     const { translations, dictEntries } = parseDelimitedBatchWithDict(raw, 1);
     expect(translations[0]).toBe('译文');
     expect(dictEntries[0]).toEqual([{ term: 'ok', ipa: '/ok/', gloss: '好的', level: 'ielts' }]);
@@ -268,12 +333,17 @@ describe('parseDelimitedBatchWithDict', () => {
     expect(dictEntries).toEqual([null]);
   });
 
-  it('结尾 === 缺失（`===1 (dict)`）时也能提取 index（小模型退化兜底）', () => {
-    const raw = '===1 (dict)\n第二条译文。\n\n===2===\n第三条译文。';
-    const { translations } = parseDelimitedBatchWithDict(raw, 3);
-    expect(translations[0]).toBe('');
-    expect(translations[1]).toBe('第二条译文。');
-    expect(translations[2]).toBe('第三条译文。');
+  it('offset 非零时按 offset 对齐 index（回避原文 <t0> 冲突场景）', () => {
+    const raw = '<t100>\n译文甲\n</t100>\n\n<t101>\n译文乙\n</t101>';
+    const { translations } = parseDelimitedBatchWithDict(raw, 2, 100);
+    expect(translations).toEqual(['译文甲', '译文乙']);
+  });
+
+  it('===N=== legacy 格式回退（e2e mock 仍在用；dict 信息不抽取）', () => {
+    const raw = '===0===\n第一条译文\n\n===1===\n第二条译文';
+    const { translations, dictEntries } = parseDelimitedBatchWithDict(raw, 2);
+    expect(translations).toEqual(['第一条译文', '第二条译文']);
+    expect(dictEntries).toEqual([null, null]);
   });
 });
 
@@ -282,35 +352,36 @@ describe('composeSystemPrompt', () => {
 
   it('单条非严格 → systemPromptSingle', () => {
     const got = composeSystemPrompt(p, '简体中文', { batch: false, strict: false });
-    expect(got).not.toContain('===N===');
+    expect(got).not.toContain('<tN>');
     expect(got).toContain('简体中文');
     expect(got).not.toContain('严格模式');
   });
 
-  it('批量非严格 → systemPromptBatch，包含 ===N===', () => {
+  it('批量非严格 → systemPromptBatch，包含 <tN>...</tN> 格式说明', () => {
     const got = composeSystemPrompt(p, '简体中文', { batch: true, strict: false });
-    expect(got).toContain('===N===');
+    expect(got).toContain('<tN>');
+    expect(got).toContain('</tN>');
     expect(got).not.toContain('严格模式');
   });
 
   it('批量严格 → STRICT_PREFIX 在前', () => {
     const got = composeSystemPrompt(p, '简体中文', { batch: true, strict: true });
     expect(got.startsWith('【严格模式必须遵守】')).toBe(true);
-    expect(got).toContain('===N===');
+    expect(got).toContain('<tN>');
   });
 
   it('单条严格 → STRICT_PREFIX 在前', () => {
     const got = composeSystemPrompt(p, '简体中文', { batch: false, strict: true });
     expect(got.startsWith('【严格模式必须遵守】')).toBe(true);
-    expect(got).not.toContain('===N===');
+    expect(got).not.toContain('<tN>');
   });
 
-  it('批量 + smartDict → 附加字典融合说明，含 cet6/ielts/kaoyan 分级指令 + 候选列表语义', () => {
+  it('批量 + smartDict → 附加字典融合说明，含 cet6/ielts/kaoyan 分级指令 + dict 属性语义', () => {
     const got = composeSystemPrompt(p, '简体中文', { batch: true, strict: false, smartDict: true });
-    expect(got).toContain('===N===');
+    expect(got).toContain('<tN>');
     expect(got).toContain('---DICT---');
-    // 新版 user message 形如 "===0=== (dict: w1 w2)"，prompt 说明里用 "(dict:" 前缀描述
-    expect(got).toContain('(dict:');
+    // 新版 user message 形如 `<tN dict="w1 w2">`；prompt 说明里用 `dict="` 描述
+    expect(got).toContain('dict="');
     expect(got).toContain('候选');
     expect(got).toContain('cet6');
     expect(got).toContain('ielts');

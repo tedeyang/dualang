@@ -193,8 +193,8 @@ describe('model list', () => {
     // 等 loadSettingsFromStorage 的 async 初始化完成后 refreshPanel 才会填充列表
     await new Promise((r) => setTimeout(r, 20));
     const rows = document.querySelectorAll('.dualang-bubble-model-row');
-    // 当前可见：siliconflow-glm-4-9b / qwen3-8b / qwen2.5-7b
-    expect(rows.length).toBeGreaterThanOrEqual(3);
+    // 当前可见：siliconflow-glm-4-9b / qwen3-8b（qwen2.5-7b 已 hidden）
+    expect(rows.length).toBeGreaterThanOrEqual(2);
     // 不应渲染 hidden 的 Moonshot 预设
     const keys = Array.from(rows).map((r) => (r as HTMLElement).dataset.modelKey);
     expect(keys).not.toContain('moonshot-v1-8k');

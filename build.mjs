@@ -6,6 +6,7 @@ const isWatch = process.argv.includes('--watch');
 const common = {
   bundle: true,
   sourcemap: isDev ? 'inline' : false,
+  minify: !isDev,
   target: 'chrome120',
   logLevel: 'info',
 };

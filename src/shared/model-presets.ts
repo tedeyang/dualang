@@ -40,6 +40,8 @@ export const MODEL_PRESETS: ModelPreset[] = [
     provider: 'siliconflow',
     providerType: 'openai',
   },
+  // Qwen2.5：bench 实测 ~54% 批量解析失败（"on"退化污染分隔符），移出可见列表。
+  // 保留 hidden 条目供老用户 storage 反查（detectPreset 不破坏已有配置）。
   {
     key: 'siliconflow-qwen2.5-7b',
     displayName: 'Qwen2.5-7B',
@@ -47,6 +49,7 @@ export const MODEL_PRESETS: ModelPreset[] = [
     model: 'Qwen/Qwen2.5-7B-Instruct',
     provider: 'siliconflow',
     providerType: 'openai',
+    hidden: true,
   },
   // Kimi 官方（moonshot.cn）—— UI 隐藏，仅保留反查能力
   // 付费 key 上手门槛高、普通用户更适合走 SiliconFlow 免费模型

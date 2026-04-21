@@ -1,11 +1,11 @@
-// Provider profile registry
+// 模型提供方注册表（Provider profile registry）
 //
 // 集中描述每个模型提供方的调用参数：endpoint 路径、温度、思考模式控制字段、
-// streaming 支持、system prompt 模板。新增模型只需加一个 profile 条目，
+// 流式支持、system prompt 模板。新增模型只需加一个 profile 条目，
 // 无需改 api.ts 的 body 构造逻辑。
 //
-// Profile 的匹配顺序：第一个命中的生效；`matchBaseUrl`（substring）和
-// `matchModel`（regex）任一命中即算。都不命中则回落到 GENERIC_PROFILE。
+// Profile 的匹配顺序：第一个命中的生效；`matchBaseUrl`（子串匹配）和
+// `matchModel`（正则匹配）任一命中即算。都不命中则回落到 GENERIC_PROFILE。
 
 // BCP-47 语言代码 → prompt 里拼中文的显示名。
 // 放在这里（而不是 settings.ts）是因为它只被 prompt 拼装消费。
@@ -42,10 +42,14 @@ export type ProviderProfile = {
 // ========== 共享 prompt 模板 ==========
 // 设计原则：
 //   - 单条翻译 → 纯文本输出（零结构）
-//   - 多条批量 → ===N=== 分隔符（替代 JSON，小模型 7-9B 级处理 JSON 语法会崩）
+//   - 多条批量 → <tN>...</tN> XML 标签（比 ===N=== 更稳定；bench 实测 GLM/Qwen3 100% 遵循率，
+//     Qwen2.5 "on" 退化会污染标签但该模型已从 UI 移除）
 //   - 严格模式 → 通用前缀，可拼到任意 prompt 前
-// 历史教训：JSON 示例里的中文占位符（如"第一条翻译"）会被 7-9B 小模型当 template 照抄；
-// JSON 字符串里的 \\n\\n 段落编码也经常被模型忽略。改分隔符后两个问题一起消失。
+// 历史教训：
+//   - JSON 示例里的中文占位符（如"第一条翻译"）会被 7-9B 小模型当 template 照抄
+//   - ===N=== 分隔符在 Qwen2.5 上偶发只输出 "=== N"（无尾 ===），切 <tN>/</tN> 闭合对更稳健
+//   - 原文可能碰巧含 <tN> 字符串（代码片段、HTML 教学推文等），所以每次请求用 findSafeOffset
+//     选一个不与原文冲突的起始 N（默认 0；如果 0-N 冲突则偏移 100/1000）
 
 const SINGLE_PROMPT = (lang: string) => `请将用户提供的文本翻译成${lang}。
 
@@ -57,24 +61,17 @@ const SINGLE_PROMPT = (lang: string) => `请将用户提供的文本翻译成${l
 5. 保持原文的语气、风格（口语化、幽默、讽刺等）。`;
 
 const BATCH_PROMPT = (lang: string) => `请将以下多条推文分别翻译成${lang}。
-每条推文在输入中用 "===N===" 标记（N 是从 0 起的索引）。
+每条推文在用户消息中用 XML 标签 <tN>...</tN> 包裹（N 为数字索引，用户会给出具体值）。
 
 输出格式（严格遵守）：
-按相同的 "===N===" 格式输出对应译文，N 与输入对齐。译文里的段落分隔直接用真实空行保留，不需要任何特殊编码。
+按相同的 <tN>...</tN> 标签结构输出对应译文，标签里的 N 必须与用户消息里的 N 一一对应（不得改写、不得使用其他数字）。
 
 规则：
-1. 按 "===N===" 分隔符输出，index 与输入一一对应。
-2. 译文中的段落分隔用真实空行保留；不要用 \\n\\n 字面串，也不要 JSON 转义。
+1. 每条译文必须写在对应的 <tN> 与 </tN> 之间。
+2. 译文中的段落分隔用真实空行保留；不要 JSON 转义。
 3. 输出必须完全是${lang}；专有名词可保留原样。
-4. 只输出带分隔符的纯文本；不要 JSON、不要 markdown 代码块、不要解释。
-5. 如果某条原文已是${lang}，按原文返回（含段落结构）。
-
-输出模板（占位符不可照抄，仅示意结构）：
-===0===
-<TRANSLATION_0>
-
-===1===
-<TRANSLATION_1>`;
+4. 不要 markdown 代码块、不要解释、不要在标签外输出任何文字。
+5. 如果某条原文已是${lang}，按原文返回（含段落结构）。`;
 
 // 严格前缀 —— 拼在单条或批量 prompt 前，用于质量重试场景。
 // 显式禁止总结、强调段落保留；行为独立于输出格式（分隔符 or 纯文本）。
@@ -87,7 +84,7 @@ const STRICT_PREFIX = (lang: string) => `【严格模式必须遵守】
 `;
 
 // Combined call（翻译 + 字典融合）：仅在 batch 里追加。user message 会给需要字典的
-// 条目在 "===N===" 后加 "(dict: word1 word2 ...)" 形式的候选词；模型按 ---DICT--- 段输出。
+// 条目在 <tN> 的开始标签上加 `dict="word1 word2 ..."` 属性；模型按 ---DICT--- 段输出。
 //
 // level 用中国学生熟悉的考试分级（详见 docs/superpowers/reports/2026-04-20-glm-mixed-request-benchmark.md）：
 // GLM-4-9B 在 32 词金标集上 cet4/cet6/ielts/kaoyan 四分类 96.88% 准确。
@@ -95,23 +92,24 @@ const STRICT_PREFIX = (lang: string) => `【严格模式必须遵守】
 const BATCH_DICT_SUFFIX = (lang: string) => `
 
 【字典融合】
-输入中标注 "===N=== (dict: w1 w2 w3)" 的条目需在译文后追加字典块；未标注的条目不要加字典块。
-括号里的词是预筛过的高难候选，字典条目只能从这些候选里选。
+开始标签带 dict 属性的条目（形如 <tN dict="word1 word2">）需在译文后、关闭标签 </tN> 前追加字典块；无 dict 属性的条目不要加字典块。
+dict 属性里的词是预筛过的高难候选，字典条目只能从这些候选里选。
 
-字典块格式（四段式，竖线分隔）：
+字典块格式（---DICT--- 单独一行，之后每行一条，四段式竖线分隔）：
 
-===N=== (dict: w1 w2 w3)
+<tN dict="w1 w2 w3">
 <译文>
 ---DICT---
 原词|/IPA/|${lang}释义|level
 原词2|/IPA/|${lang}释义|level
+</tN>
 
 字典规则：
-1. 条目必须来自候选列表；候选外的词一律不要注释。
+1. 条目必须来自 dict 属性的候选词；候选外的词一律不要注释。
 2. level 从 {cet6, ielts, kaoyan} 选 —— 分别对应六级 / 雅思 / 考研。
 3. IPA 写国际音标，两头用斜线包裹；释义用${lang}，简短（≤8 字），不要整句解释。
-4. 若候选列表为空或确实都不需要注释，直接省略 ---DICT--- 段，不要写空段。
-5. 无 "(dict: ...)" 标记的条目一律不输出 ---DICT--- 段；多写会让解析失败。`;
+4. 若候选都不需要注释，直接省略 ---DICT--- 段，不要写空段。
+5. 无 dict 属性的条目一律不输出 ---DICT--- 段；多写会让解析失败。`;
 
 /** 根据 profile + 是否批量 + 是否严格模式 + 是否字典融合，组装最终的 system prompt */
 export function composeSystemPrompt(
@@ -127,68 +125,105 @@ export function composeSystemPrompt(
 import type { DictionaryEntry } from '../shared/types';
 
 /**
- * 构造 batch 的 user message。每条前缀 "===N==="；当该 index 在 smartDictIndices 里，
- * 若 perItemCandidates 为对应 index 提供了词列表，则附加 "(dict: w1 w2 w3)" 指示模型。
- * 候选为空的索引不加 "(dict)" 标记 —— 模型不会误输出空 ---DICT--- 段。
+ * 查找一个安全的起始 offset，使得 <t{offset}> .. <t{offset+count-1}> 都不与 texts 里
+ * 已有的 `<tN>` 字符串冲突。
+ *
+ * 为什么需要：原文可能是代码片段 / HTML 教学 / AI 编程推文，恰好含 `<t0>` 或 `</t5>`。
+ * 此时 parser 的 `<t(\d+)>...</t\1>` 正则会把原文里的标签当成分隔符，翻译串到错误的槽里。
+ *
+ * 策略：默认 0；冲突时试 100 / 1000 / 10000。只要原文不含 `<t100>` 这种字面串就安全，
+ * 而真实推文里出现 `<t100>` 的概率基本为零。同时检查 `</tN>` 闭合对，防止半边冲突。
+ */
+export function findSafeOffset(texts: string[], count: number): number {
+  const combined = texts.join('\n');
+  for (const candidate of [0, 100, 1000, 10000, 100000]) {
+    let collision = false;
+    for (let i = 0; i < count; i++) {
+      const n = candidate + i;
+      // 开始标签可带属性（dict="..."），所以用 "<tN>" 或 "<tN " 两种前缀都视为冲突
+      if (
+        combined.includes(`<t${n}>`) ||
+        combined.includes(`<t${n} `) ||
+        combined.includes(`</t${n}>`)
+      ) {
+        collision = true;
+        break;
+      }
+    }
+    if (!collision) return candidate;
+  }
+  return 100000; // 兜底；实际永远走不到（推文包含 `<t100000>` 的概率 ~ 0）
+}
+
+/**
+ * 构造 batch 的 user message。每条用 `<tN>...</tN>` 包裹（N = offset + i）；
+ * 当该 index 在 smartDictIndices 里、且 perItemCandidates 提供了词列表时，开始标签
+ * 追加 `dict="w1 w2"` 属性指示模型输出字典块。
+ *
+ * @param offset 由 findSafeOffset 计算，用于避免原文碰撞；默认 0（向后兼容 / 测试便利）
  */
 export function buildBatchUserContent(
   texts: string[],
   smartDictIndices?: Set<number>,
   perItemCandidates?: (string[] | null | undefined)[],
+  offset = 0,
 ): string {
   return texts
     .map((t, i) => {
-      let mark = '';
+      const n = offset + i;
+      let dictAttr = '';
       if (smartDictIndices && smartDictIndices.has(i)) {
         const candidates = perItemCandidates?.[i];
         if (candidates && candidates.length > 0) {
-          mark = ` (dict: ${candidates.join(' ')})`;
+          // 候选词是本地预筛过的 ASCII 单词，不会含引号 / 尖括号 —— 无需转义
+          dictAttr = ` dict="${candidates.join(' ')}"`;
         }
       }
-      return `===${i}===${mark}\n${t}`;
+      return `<t${n}${dictAttr}>\n${t}\n</t${n}>`;
     })
     .join('\n\n');
 }
 
 /**
  * 解析 combined 响应：同时抽取译文 + 字典。
- * 每个 "===N===" chunk 内可能带 "---DICT---" 分隔；前段是译文，后段是每行一条的字典。
+ * 主路径匹配 `<tN ...>...</tN>`（N = offset + i，i 为 texts 下标）；
+ * tag 内内容按 `---DICT---` 拆分，前段译文、后段字典。
  *
- * 容错策略（GLM-4-9B 等小模型在多条 batch 下会偶发输出退化）：
- *   - "===N===" 的结尾 === 允许缺失：`===1 (dict)` 也当 index=1 处理
- *   - "(dict)" 记号可以有可以无、位置灵活
- *   - "---DICT---" 分隔线允许 ≥ 2 连字号且大小写宽松
- *   - 解析完全失败（0 条 hit）时回落到老的 parseDelimitedBatch（可能命中 JSON 回退）
+ * 降级：若 `<tN>` 主路径零命中（模型忽略指令 / e2e mock 仍用老格式），回落到 parseDelimitedBatch
+ * 的 `===N===` / JSON 路径；此时 dictEntries 保持全 null，字典走 content 端独立 API 兜底。
  */
 export function parseDelimitedBatchWithDict(
   raw: string,
   expectedCount: number,
+  offset = 0,
 ): { translations: string[]; dictEntries: (DictionaryEntry[] | null)[] } {
   const translations = new Array<string>(expectedCount).fill('');
   const dictEntries = new Array<DictionaryEntry[] | null>(expectedCount).fill(null);
 
-  // 宽松头部匹配：`={2,}` 开头、捕获 digit、允许任意 "(dict)" / 残缺 `===` 后缀
-  const parts = raw.split(/^={2,}\s*(\d+)\s*(?:={2,})?[^\n]*\n?/m);
+  // `<t(\d+)[^>]*>` 允许开始标签带属性（如 dict="..."）；`\1` 反向引用保证闭合数字一致
+  const re = /<t(\d+)[^>]*>([\s\S]*?)<\/t\1>/g;
   let anyHit = false;
-  for (let i = 1; i < parts.length - 1; i += 2) {
-    const idx = parseInt(parts[i], 10);
-    if (!Number.isFinite(idx) || idx < 0 || idx >= expectedCount) continue;
-    const chunk = parts[i + 1] || '';
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw)) !== null) {
+    const rawIdx = parseInt(m[1], 10);
+    const i = rawIdx - offset;
+    if (!Number.isFinite(i) || i < 0 || i >= expectedCount) continue;
+    const chunk = m[2] || '';
 
     // DICT 分隔：前后至少 2 个连字号 + "DICT"（大小写宽松）
     const dictSplit = chunk.split(/\n\s*-{2,}\s*DICT\s*-{2,}\s*\n?/i);
-    translations[idx] = (dictSplit[0] || '').replace(/\n{3,}$/, '').trim();
+    translations[i] = (dictSplit[0] || '').replace(/\n{3,}$/, '').trim();
     anyHit = true;
 
     if (dictSplit.length > 1) {
       const entries = parseDictLines(dictSplit.slice(1).join('\n'));
-      if (entries.length > 0) dictEntries[idx] = entries;
+      if (entries.length > 0) dictEntries[i] = entries;
     }
   }
   if (anyHit) return { translations, dictEntries };
 
-  // 回落：走老的非字典 JSON/分隔符解析（dictEntries 保持全 null）
-  return { translations: parseDelimitedBatch(raw, expectedCount), dictEntries };
+  // 回落：老格式（===N=== / JSON）；dictEntries 保持全 null
+  return { translations: parseDelimitedBatch(raw, expectedCount, offset), dictEntries };
 }
 
 function parseDictLines(body: string): DictionaryEntry[] {
@@ -219,14 +254,34 @@ function normalizeDictLevel(s: string): 'cet6' | 'ielts' | 'kaoyan' | undefined 
 }
 
 /**
- * 解析批量模式的 "===N===" 分隔符输出为 string[]，index 对齐。
- * 若主路径（分隔符）未命中，降级尝试 JSON 格式（兼容不听话的强模型 / mock 测试）。
+ * 解析批量模式响应为 string[]，index 对齐。
+ * 三层解析，按优先级：
+ *   1. `<tN>...</tN>` XML 标签（当前主路径；N = offset + i，用 `\1` 反向引用保证闭合一致）
+ *   2. `===N===` 分隔符（legacy；小模型偶发回退 + e2e mock 仍用此格式）
+ *   3. JSON `{"results":[{"index":N,"translated":"..."}]}`（强模型忽略指令时）
  */
-export function parseDelimitedBatch(raw: string, expectedCount: number): string[] {
-  const result = new Array(expectedCount).fill('');
-  // 主路径：按 "===N===" 拆分（行首匹配）；split 把捕获组也放进结果中
-  // 形如: ['前置噪声', '0', '内容0', '1', '内容1', ...]
-  const parts = raw.split(/^===\s*(\d+)\s*===\s*$\n?/m);
+export function parseDelimitedBatch(raw: string, expectedCount: number, offset = 0): string[] {
+  const result = new Array<string>(expectedCount).fill('');
+
+  // 主路径：<tN>...</tN>（非贪婪 + 反向引用）
+  const tagRe = /<t(\d+)[^>]*>([\s\S]*?)<\/t\1>/g;
+  let tagHit = false;
+  let m: RegExpExecArray | null;
+  while ((m = tagRe.exec(raw)) !== null) {
+    const rawIdx = parseInt(m[1], 10);
+    const i = rawIdx - offset;
+    if (!Number.isFinite(i) || i < 0 || i >= expectedCount) continue;
+    // tag 内可能带 ---DICT--- 段（当 combined call 降级到 parseDelimitedBatch 时仍要剥掉）
+    const chunk = (m[2] || '').split(/\n\s*-{2,}\s*DICT\s*-{2,}/i)[0];
+    result[i] = chunk.replace(/\n{3,}$/, '').trim();
+    tagHit = true;
+  }
+  if (tagHit) return result;
+
+  // Fallback 1：老 ===N=== 分隔符。index 按字面取（不减 offset）——
+  // legacy 响应里的索引是基于 0 的（mock / 模型回退输出），不会用 offset。
+  // 宽松：结尾 === 允许缺失；用 [ \t]* 防止 \s* 吃掉换行导致内容被卷进分隔符
+  const parts = raw.split(/^={2,}[ \t]*(\d+)[ \t]*(?:={2,})?[^\n]*\n?/m);
   let anyHit = false;
   for (let i = 1; i < parts.length - 1; i += 2) {
     const idx = parseInt(parts[i], 10);

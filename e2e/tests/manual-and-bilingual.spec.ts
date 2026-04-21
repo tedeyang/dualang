@@ -5,7 +5,7 @@ const mockPagePath = 'http://localhost:9999/e2e/fixtures/x-mock.html';
 async function setupApi(context: any, translatedText = '翻译结果。') {
   await context.route('https://api.moonshot.cn/v1/chat/completions', async (route: any) => {
     const body = JSON.parse(route.request().postData() || '{}');
-    const count = (body.messages?.[1]?.content?.match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+    const count = (body.messages?.[1]?.content?.match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
     const results = Array.from({ length: count }, (_, i) => ({
       index: i,
       translated: translatedText
@@ -155,15 +155,18 @@ test.describe('Display Mode: inline（段落对照）', () => {
 test.describe('Display Mode: bilingual（整体对照）', () => {
   test.beforeEach(async ({ popupPage }) => saveDisplayMode(popupPage, 'bilingual'));
 
-  test('bilingual 模式下有 dualang-bilingual class 和 克隆原文块', async ({ context }) => {
+  test('bilingual 模式：原生 tweetText 可见（变暗）+ card 带 dualang-bilingual 类', async ({ context }) => {
     await setupApi(context, '火星将会令人惊叹。');
     const page = await context.newPage();
     await page.goto(mockPagePath);
     await page.setViewportSize({ width: 1280, height: 800 });
 
+    // 新方案：tweetText 不再隐藏，避免切换 append↔bilingual 时页面跳动
+    // 强调通过 CSS 色彩实现（原生 tweetText 变暗 + 译文原生色）
     await expect(page.locator('#tweet-1 .dualang-bilingual')).toBeVisible({ timeout: 5000 });
-    await expect(page.locator('#tweet-1 [data-testid="tweetText"]')).toBeHidden();
-    await expect(page.locator('#tweet-1 .dualang-original-html')).toBeVisible();
+    await expect(page.locator('#tweet-1 [data-testid="tweetText"]')).toBeVisible();
+    // 不再克隆原文到 card 内部
+    await expect(page.locator('#tweet-1 .dualang-original-html')).toHaveCount(0);
 
     await page.close();
   });

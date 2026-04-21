@@ -42,7 +42,7 @@ test.describe('Target Language Setting', () => {
     await context.route('https://api.moonshot.cn/v1/chat/completions', async (route) => {
       const body = route.request().postData() || '';
       requestBodies.push(body);
-      const count = (JSON.parse(body).messages?.[1]?.content?.match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = (JSON.parse(body).messages?.[1]?.content?.match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       const results = Array.from({ length: count }, (_, i) => ({ index: i, translated: `译文${i}` }));
       await route.fulfill({
         status: 200,
@@ -83,7 +83,7 @@ test.describe('Target Language Setting', () => {
     await context.route('https://api.moonshot.cn/v1/chat/completions', async (route) => {
       const body = route.request().postData() || '';
       requestBodies.push(body);
-      const count = (JSON.parse(body).messages?.[1]?.content?.match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = (JSON.parse(body).messages?.[1]?.content?.match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       const results = Array.from({ length: count }, (_, i) => ({ index: i, translated: `translation${i}` }));
       await route.fulfill({
         status: 200,

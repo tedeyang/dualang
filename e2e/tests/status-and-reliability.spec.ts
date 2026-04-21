@@ -17,7 +17,7 @@ function makeApiRoute(delay = 0) {
   return async (route: any) => {
     const postData = JSON.parse(route.request().postData() || '{}');
     const content: string = postData.messages?.[1]?.content || '';
-    const count = (content.match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+    const count = (content.match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
     const results = Array.from({ length: count }, (_, i) => ({
       index: i, translated: `测试翻译 ${i}`
     }));
@@ -67,7 +67,7 @@ test.describe('Status Indicators', () => {
     await context.route('https://api.moonshot.cn/v1/chat/completions', async (route) => {
       const postData = JSON.parse(route.request().postData() || '{}');
       const content: string = postData.messages?.[1]?.content || '';
-      const count = (content.match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = (content.match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       const results = Array.from({ length: count }, (_, i) => ({ index: i, translated: `翻译${i}` }));
       await route.fulfill({
         status: 200, contentType: 'application/json',
@@ -191,7 +191,7 @@ test.describe('Fallback API', () => {
     });
     await context.route('https://api.siliconflow.cn/v1/chat/completions', async (route) => {
       fbHit++;
-      const count = ((JSON.parse(route.request().postData() || '{}').messages?.[1]?.content || '').match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = ((JSON.parse(route.request().postData() || '{}').messages?.[1]?.content || '').match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       const results = Array.from({ length: count }, (_, i) => ({ index: i, translated: `兜底译 ${i}` }));
       await route.fulfill({
         status: 200, contentType: 'application/json',
@@ -239,7 +239,7 @@ test.describe('Fallback API', () => {
     await context.route('https://api.siliconflow.cn/v1/chat/completions', async (route) => {
       const postData = JSON.parse(route.request().postData() || '{}');
       const content: string = postData.messages?.[1]?.content || '';
-      const count = (content.match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = (content.match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       const results = Array.from({ length: count }, (_, i) => ({
         index: i, translated: `硅基兜底翻译 ${i}`
       }));
@@ -284,7 +284,7 @@ test.describe('Hedged Request', () => {
       await new Promise(r => setTimeout(r, 800));
       const postData = JSON.parse(route.request().postData() || '{}');
       const content: string = postData.messages?.[1]?.content || '';
-      const count = (content.match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = (content.match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       const results = Array.from({ length: count }, (_, i) => ({ index: i, translated: `主翻译 ${i}` }));
       await route.fulfill({
         status: 200, contentType: 'application/json',
@@ -297,7 +297,7 @@ test.describe('Hedged Request', () => {
       fbHit = true;
       const postData = JSON.parse(route.request().postData() || '{}');
       const content: string = postData.messages?.[1]?.content || '';
-      const count = (content.match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = (content.match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       const results = Array.from({ length: count }, (_, i) => ({ index: i, translated: `兜底快译 ${i}` }));
       await route.fulfill({
         status: 200, contentType: 'application/json',
@@ -334,7 +334,7 @@ test.describe('Hedged Request', () => {
     let mainHit = 0, fbHit = 0;
     await context.route('https://api.moonshot.cn/v1/chat/completions', async (route) => {
       mainHit++;
-      const count = ((JSON.parse(route.request().postData() || '{}').messages?.[1]?.content || '').match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = ((JSON.parse(route.request().postData() || '{}').messages?.[1]?.content || '').match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       const results = Array.from({ length: count }, (_, i) => ({ index: i, translated: `快主译 ${i}` }));
       await route.fulfill({
         status: 200, contentType: 'application/json',
@@ -373,7 +373,7 @@ test.describe('Hedged Request', () => {
     // 主快、兜底慢 — 主先完成 → fbAbort.abort() → 败者抛 AbortError，
     // 不应被 callWithRetry 当成 fatal 写入 dualang_error_v1
     await context.route('https://api.moonshot.cn/v1/chat/completions', async (route) => {
-      const count = ((JSON.parse(route.request().postData() || '{}').messages?.[1]?.content || '').match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = ((JSON.parse(route.request().postData() || '{}').messages?.[1]?.content || '').match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       const results = Array.from({ length: count }, (_, i) => ({ index: i, translated: `主快译 ${i}` }));
       await route.fulfill({
         status: 200, contentType: 'application/json',

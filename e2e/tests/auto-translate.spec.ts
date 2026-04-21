@@ -20,7 +20,7 @@ test.describe('Auto Translate with Scroll', () => {
     await context.route('https://api.moonshot.cn/v1/chat/completions', async (route) => {
       const postData = JSON.parse(route.request().postData() || '{}');
       const content = postData.messages?.[1]?.content || '';
-      const count = (content.match(/===\s*\d+\s*===|推文 \d+:/g) || []).length || 1;
+      const count = (content.match(/===\s*\d+\s*===|推文 \d+:|<t\d+[^>]*>/g) || []).length || 1;
       const results = [];
       for (let i = 0; i < count; i++) {
         results.push({ index: i, translated: '自动翻译测试。' });

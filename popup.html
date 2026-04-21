@@ -33,13 +33,12 @@
           <optgroup label="⭐ 推荐（bench v2 实测）">
             <option value="siliconflow-glm-4-9b">SiliconFlow GLM-4-9B · 1.9s · 质量 8.7 · 免费（默认）</option>
           </optgroup>
-          <optgroup label="其他免费（有局限）">
-            <option value="siliconflow-qwen2.5-7b">SiliconFlow Qwen2.5-7B · ~1.5s · 禁流式（CJK 偶发乱码）、数字易错</option>
+          <optgroup label="其他免费">
             <option value="siliconflow-qwen3-8b">SiliconFlow Qwen3-8B · 4.0s · 质量 8.5</option>
           </optgroup>
           <option value="custom">自定义</option>
         </select>
-        <p class="hint">延迟与质量来自 <code>scripts/benchmark-v2.mjs</code> 实测（2026-04-18）。详见 <code>models_benchmark.md</code>。</p>
+        <p class="hint">延迟与质量来自内部基准测试（2026-04-18）。</p>
       </div>
       <div class="form-group">
         <label for="baseUrl">API 地址</label>
@@ -115,7 +114,6 @@
               <option value="siliconflow-glm-4-9b">SiliconFlow GLM-4-9B · 1.9s · 最稳 · 免费</option>
             </optgroup>
             <option value="siliconflow-qwen3-8b">SiliconFlow Qwen3-8B · 4.0s · 免费</option>
-            <option value="siliconflow-qwen2.5-7b">SiliconFlow Qwen2.5-7B · 禁流式、数字易错、仅降级备用</option>
             <option value="custom">自定义</option>
           </select>
         </div>

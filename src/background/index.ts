@@ -1,14 +1,16 @@
-// background.js - 服务工作者（orchestrator）
+// background.js —— Service Worker 编排层（orchestrator）
 
 import { getCache, getCacheBatch, setCache, cacheKey } from './cache';
-import { getSettings, invalidateSettingsCache, getMoonshotKey } from './settings';
+import { getSettings, invalidateSettingsCache, getMoonshotKey, getProviderKeyFromConfig } from './settings';
 import { rateLimiter } from './rate-limiter';
-import { doTranslateSingle, doTranslateBatchRequest, doTranslateBatchStream } from './api';
+import { doTranslateSingle, doTranslateBatchRequest, doTranslateBatchStream, doAnnotateDictionary } from './api';
 import { recordRequest, recordCacheHit, recordQualityRetry, recordError, getStats, resetStats, getRecentRttByModel } from './stats';
 import {
   buildFallbackSettings, buildSuperFineSettings, applyBatchResult, runFallback,
   isFallbackConfigured, shouldHedge, estimateTokens,
 } from './pipeline';
+import { extractDictionaryCandidates } from '../shared/english-candidates';
+import { filterHardCandidates } from './difficulty';
 import type { Settings, TokenUsage } from '../shared/types';
 
 // ===================== 设置缓存失效 =====================
@@ -139,6 +141,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       .catch(err => sendResponse({ success: false, error: err.message, retryable: !!err.retryable }));
     return true;
   }
+  if (request.action === 'annotateDictionary') {
+    handleAnnotateDictionary(request.payload)
+      .then(result => sendResponse({ success: true, data: result }))
+      .catch(err => sendResponse({ success: false, error: err.message, retryable: !!err.retryable }));
+    return true;
+  }
   if (request.action === 'getHedgeStats') {
     sendResponse({
       success: true,
@@ -163,6 +171,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     resetStats().then(() => sendResponse({ success: true }));
     return true;
   }
+  if (request.action === 'getProviderKey') {
+    // content script 切换模型时需要 provider 对应的 key；content 不能直接 fetch config.json
+    // （不在 web_accessible_resources 里，硬声明又会把 key 泄露给任意 X 页面）。
+    getProviderKeyFromConfig(String(request.provider || ''))
+      .then((apiKey) => sendResponse({ success: true, data: { apiKey } }))
+      .catch(() => sendResponse({ success: true, data: { apiKey: '' } }));
+    return true;
+  }
   if (request.action === 'recordQualityRetry') {
     // content script 质量重试时上报，让统计完整
     recordQualityRetry().then(() => sendResponse({ success: true }));
@@ -170,12 +186,76 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 });
 
+async function handleAnnotateDictionary(payload: any) {
+  const text = String(payload?.text || '').trim();
+  if (!text) return { entries: [] };
+  const rawCandidates = Array.isArray(payload?.candidates)
+    ? payload.candidates.map((x: any) => String(x || '').trim()).filter(Boolean)
+    : [];
+
+  // 本地难度预筛：Zipf + 音节 + 词长 打分，只把 top-6 高难词送给模型。
+  // bench：候选 20+ 时 RTT 达到 9-13s（模型要生成 10×~50 tokens 字典条目）；
+  // 降到 6 后输出体积减半，RTT 预计降到 5-7s，且学习价值"前 6 个最难"已经足够。
+  const hardCandidates = filterHardCandidates(rawCandidates, { threshold: 0.5, max: 6 });
+  if (hardCandidates.length === 0) {
+    console.log('[Dualang] dict.skip.allEasy', {
+      raw: rawCandidates.length, hard: 0, textLen: text.length,
+    });
+    return { entries: [] };
+  }
+
+  const settings = await getSettings();
+  const dictSettings = {
+    ...settings,
+    targetLang: payload?.targetLang || settings.targetLang,
+  };
+
+  // 走 rateLimiter 以便与翻译主路径共享 RPM/TPM 预算（否则快速滚动时几十条字典请求
+  // 同时发射，绕过限额轻松把 provider 打到 429）。priority=0：低于用户可见翻译。
+  // token 预估：原文 / 3（输入） + 1 个字典条目约 30 tokens * 候选词数上限
+  const tokenEstimate = Math.ceil(text.length / 3) + hardCandidates.length * 30;
+  const registerTask = await rateLimiter.acquire(tokenEstimate, 0);
+  const controller = new AbortController();
+  const release = registerTask(0, () => controller.abort());
+  const t0 = performance.now();
+  try {
+    const result = await doAnnotateDictionary(text, dictSettings, hardCandidates, controller.signal);
+    const rtt = performance.now() - t0;
+    recordRequest(settings.model, true, rtt).catch(() => {});
+    console.log('[Dualang] dict.request.ok', {
+      model: settings.model, rttMs: Math.round(rtt),
+      raw: rawCandidates.length, hard: hardCandidates.length, entries: result.entries.length,
+    });
+    return result;
+  } catch (err: any) {
+    if (err?.name !== 'AbortError') {
+      recordRequest(settings.model, false, performance.now() - t0).catch(() => {});
+      recordError(settings.model, err?.message || 'dict error').catch(() => {});
+      console.warn('[Dualang] dict.request.fail', {
+        model: settings.model, error: err?.message,
+        raw: rawCandidates.length, hard: hardCandidates.length,
+      });
+    }
+    // 字典失败不应上抛给 content —— 让主翻译链路继续；返回空结果
+    return { entries: [] };
+  } finally {
+    release();
+  }
+}
+
 async function handleTranslate(payload: any) {
   const settings = await getSettings();
   console.log('[Dualang] translate config baseUrl=', settings.baseUrl, 'model=', settings.model, 'priority=', payload.priority);
 
   if (payload.texts && Array.isArray(payload.texts)) {
-    return handleTranslateBatch(payload.texts, settings, payload.priority || 0, !!payload.skipCache, !!payload.strictMode);
+    return handleTranslateBatch(
+      payload.texts,
+      settings,
+      payload.priority || 0,
+      !!payload.skipCache,
+      !!payload.strictMode,
+      Array.isArray(payload.englishFlags) ? payload.englishFlags : undefined,
+    );
   }
 
   // 单条模式（向后兼容）
@@ -399,6 +479,7 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
               completedParagraphs++;
             }
           }
+          totalTokens += result.usage?.total_tokens || 0;
         });
         if (!disconnected) {
           port.postMessage({ action: 'progress', completed: Math.min(start + chunk.length, paragraphs.length), total: paragraphs.length });
@@ -442,7 +523,9 @@ async function raceMainAndFallback(
   settings: Settings,
   outerSignal: AbortSignal,
   strictMode = false,
-): Promise<{ translations: string[]; usage?: TokenUsage; winnerModel: string; winnerBaseUrl: string }> {
+  smartDictIndices?: Set<number>,
+  perItemCandidates?: (string[] | null | undefined)[],
+): Promise<{ translations: string[]; dictEntries?: (import('../shared/types').DictionaryEntry[] | null)[]; usage?: TokenUsage; winnerModel: string; winnerBaseUrl: string }> {
   const hedgeDelayMs = resolveHedgeDelayMs(settings);
 
   const mainAbort = new AbortController();
@@ -458,7 +541,7 @@ async function raceMainAndFallback(
   let mainSettled = false;
 
   const mainT0 = performance.now();
-  const mainP = doTranslateBatchRequest(texts, settings, mainAbort.signal, 3, strictMode)
+  const mainP = doTranslateBatchRequest(texts, settings, mainAbort.signal, 3, strictMode, { smartDictIndices, perItemCandidates })
     .then(r => {
       mainSettled = true;
       recordMainRtt(performance.now() - mainT0);
@@ -471,12 +554,12 @@ async function raceMainAndFallback(
   //   2) 主在延迟期内失败 → 立刻启动兜底，不再等 — "fallback" 语义优先于"赛跑"语义
   //   3) 主在延迟期内成功 → 兜底永不启动（节省配额）；fbP 会保持 pending，
   //      但 Promise.any 已用主的结果 resolve，不会挂起
-  const fbP = new Promise<{ translations: string[]; usage?: TokenUsage }>((resolve, reject) => {
+  const fbP = new Promise<{ translations: string[]; dictEntries?: (import('../shared/types').DictionaryEntry[] | null)[]; usage?: TokenUsage }>((resolve, reject) => {
     let fbFired = false;
     const fireFallback = () => {
       if (fbFired) return;
       fbFired = true;
-      doTranslateBatchRequest(texts, fallbackSettings, fbAbort.signal, 3, strictMode)
+      doTranslateBatchRequest(texts, fallbackSettings, fbAbort.signal, 3, strictMode, { smartDictIndices, perItemCandidates })
         .then(resolve)
         .catch(e => { fbErr = e; reject(e); });
     };
@@ -502,6 +585,7 @@ async function raceMainAndFallback(
     const useSettings = winner.src === 'main' ? settings : fallbackSettings;
     return {
       translations: winner.result.translations,
+      dictEntries: winner.result.dictEntries,
       usage: winner.result.usage,
       winnerModel: useSettings.model,
       winnerBaseUrl: useSettings.baseUrl,
@@ -547,20 +631,31 @@ async function executeMain(
   abortSignal: AbortSignal,
   strictMode: boolean,
   priority: number,
+  smartDictIndices?: Set<number>,
+  perItemCandidates?: (string[] | null | undefined)[],
 ) {
   const hedged = shouldHedge(settings, priority);
   const mainMaxRetries = (isFallbackConfigured(settings) && !hedged) ? 0 : 3;
   const mainT0 = performance.now();
 
   if (hedged) {
-    return raceMainAndFallback(toTranslateTexts, settings, abortSignal, strictMode);
+    return raceMainAndFallback(toTranslateTexts, settings, abortSignal, strictMode, smartDictIndices, perItemCandidates);
   }
-  const r = await doTranslateBatchRequest(toTranslateTexts, settings, abortSignal, mainMaxRetries, strictMode);
+  const r = await doTranslateBatchRequest(
+    toTranslateTexts, settings, abortSignal, mainMaxRetries, strictMode, { smartDictIndices, perItemCandidates },
+  );
   recordMainRtt(performance.now() - mainT0);
   return r;
 }
 
-async function handleTranslateBatch(texts: string[], settings: Settings, priority = 0, skipCache = false, strictMode = false) {
+async function handleTranslateBatch(
+  texts: string[],
+  settings: Settings,
+  priority = 0,
+  skipCache = false,
+  strictMode = false,
+  englishFlags?: boolean[],
+) {
   const { results, toTranslateIndices, toTranslateTexts } = await batchCacheRead(texts, settings, skipCache);
 
   // 全命中：不占 rate limiter、不做 in-flight 登记
@@ -573,15 +668,58 @@ async function handleTranslateBatch(texts: string[], settings: Settings, priorit
     recordCacheHit(texts.length - toTranslateTexts.length).catch(() => {});
   }
 
-  // in-flight 去重：同一批 texts 并发请求共享一个 promise
-  const batchHash = cacheKey(toTranslateTexts.join('\n---BATCH---\n'), settings.targetLang, settings.model, settings.baseUrl);
+  // englishFlags (全量) → smartDictIndices (子集 index)：只有待翻译且 english 为 true 的条目
+  // 在 prompt 里标 "(dict)"。缓存命中条目不会重新请求字典，内容侧有 dictCache + 分离 API fallback 兜住。
+  let smartDictIndices: Set<number> | undefined;
+  let perItemCandidates: (string[] | null)[] | undefined;
+  if (englishFlags && englishFlags.length === texts.length) {
+    const s = new Set<number>();
+    const cand: (string[] | null)[] = new Array(toTranslateTexts.length).fill(null);
+    for (let i = 0; i < toTranslateIndices.length; i++) {
+      if (!englishFlags[toTranslateIndices[i]]) continue;
+      // 本地预筛：先按停用词 / 长度 / 大小写抽出原始候选，再用 Zipf + 音节 + 词长打分
+      // 只留"B2 及以上"高难词（≤6 个）送进 prompt。候选为空的 item 不会被标 "(dict)"。
+      // max=6 是根据 bench 实测：10 条字典输出要 9-13s，6 条降到 5-7s。
+      const raw = extractDictionaryCandidates(toTranslateTexts[i]);
+      const hard = filterHardCandidates(raw, { threshold: 0.5, max: 6 });
+      if (hard.length > 0) {
+        s.add(i);
+        cand[i] = hard;
+      }
+    }
+    if (s.size > 0) {
+      smartDictIndices = s;
+      perItemCandidates = cand;
+    }
+  }
+  // dictOut 三态语义（关键：区分"没 attempt 过"和"attempt 了但空"）：
+  //   undefined   → 这个 item 在 combined call 里没 attempt 过（缓存命中 / 非英文 / 本地预筛 0 hard）
+  //   null        → attempt 了但模型没输出 ---DICT--- 段
+  //   []          → attempt 了，段存在但没有可解析的条目
+  //   [entries]   → 正常返回
+  // content 根据此三态决定是否发独立字典 API：undefined → 发 fallback；其他 → 跳过（防止双重 API 浪费）。
+  const dictOut: ((import('../shared/types').DictionaryEntry[] | null | undefined)[]) | undefined =
+    smartDictIndices ? new Array(texts.length) : undefined;
+
+  // in-flight 去重：同一批 texts 并发请求共享一个 promise。注意 key 包含 dict 维度
+  // —— 否则开启字典和关闭字典的两次并发请求会共享同一次不带字典的结果。
+  const dictKeyPart = smartDictIndices ? `|dict:${[...smartDictIndices].sort((a, b) => a - b).join(',')}` : '';
+  const batchHash = cacheKey(
+    toTranslateTexts.join('\n---BATCH---\n') + dictKeyPart,
+    settings.targetLang, settings.model, settings.baseUrl,
+  );
   if (inFlight.has(batchHash)) {
     const apiResult = await inFlight.get(batchHash);
     for (let i = 0; i < toTranslateIndices.length; i++) {
       results[toTranslateIndices[i]] = apiResult.translations[i];
+      // 三态语义：只有 combined attempt 过的子集 index 才写 dictOut；其他保持 undefined
+      if (dictOut && smartDictIndices?.has(i)) {
+        dictOut[toTranslateIndices[i]] = apiResult.dictEntries?.[i] ?? null;
+      }
     }
     return {
       translations: results,
+      dictEntries: dictOut,
       usage: apiResult.usage,
       model: apiResult.model || settings.model,
       baseUrl: apiResult.baseUrl || settings.baseUrl,
@@ -597,7 +735,7 @@ async function handleTranslateBatch(texts: string[], settings: Settings, priorit
   const release = registerTask(priority, () => abortController.abort());
   const startedAt = performance.now();
 
-  const flightPromise = executeMain(toTranslateTexts, settings, abortController.signal, strictMode, priority)
+  const flightPromise = executeMain(toTranslateTexts, settings, abortController.signal, strictMode, priority, smartDictIndices, perItemCandidates)
     .then(async (apiResult: any) => {
       const rtt = performance.now() - startedAt;
       const usedModel = apiResult.winnerModel || settings.model;
@@ -606,9 +744,11 @@ async function handleTranslateBatch(texts: string[], settings: Settings, priorit
       console.log('[Dualang] translation.request.ok', {
         model: usedModel, rttMs: Math.round(rtt), tokens: apiResult.usage?.total_tokens, count: toTranslateTexts.length,
       });
-      await applyBatchResult(texts, toTranslateIndices, apiResult, results, settings, usedModel);
+      await applyBatchResult(texts, toTranslateIndices, apiResult, results, settings, usedModel, dictOut, smartDictIndices);
       return {
-        translations: results, usage: apiResult.usage,
+        translations: results,
+        dictEntries: dictOut,
+        usage: apiResult.usage,
         model: usedModel, baseUrl: usedBaseUrl, fromCache: false,
       };
     })
@@ -631,10 +771,12 @@ async function handleTranslateBatch(texts: string[], settings: Settings, priorit
       console.log('[Dualang] fallback.activated', {
         reason: err.message, retryable: !!err.retryable, to: settings.fallbackModel,
       });
-      const { apiResult, settings: fbSettings } = await runFallback(toTranslateTexts, settings);
-      await applyBatchResult(texts, toTranslateIndices, apiResult, results, fbSettings, fbSettings.model);
+      const { apiResult, settings: fbSettings } = await runFallback(toTranslateTexts, settings, smartDictIndices, perItemCandidates);
+      await applyBatchResult(texts, toTranslateIndices, apiResult, results, fbSettings, fbSettings.model, dictOut, smartDictIndices);
       return {
-        translations: results, usage: apiResult.usage,
+        translations: results,
+        dictEntries: dictOut,
+        usage: apiResult.usage,
         model: fbSettings.model, baseUrl: fbSettings.baseUrl, fromCache: false,
       };
     })
