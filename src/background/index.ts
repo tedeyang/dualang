@@ -408,7 +408,18 @@ async function handleTranslateStream(payload: any, port: chrome.runtime.Port) {
 //   background → content: { action:'done', totalTokens, model, baseUrl }
 //   background → content: { action:'error', error }
 async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
-  const CHUNK = 5;
+  // chunk size 权衡：
+  //  - 大 chunk → 调用次数少，STRICT_PREFIX 系统提示复读次数少，总 tokens 低、TPM 峰值低
+  //  - 小 chunk → 首屏更快、单次失败损失小
+  //  实测 10 段是免费 TPM 50K/min 下的稳定点（307 段长文从 62 次调用降到 31 次）。
+  const CHUNK = 10;
+  // chunk 间节流：避免 burst 打满 SiliconFlow 免费 TPM。800ms ≈ 平均 ~30K tokens/min。
+  const THROTTLE_MS = 800;
+  // 429 / TPM 错误专项重试：硅基的 TPM 是滑动窗口，等 15s 再试通常能恢复。
+  const TPM_BACKOFF_MS = 15_000;
+  const isTpmError = (msg: string) => /429|TPM|rate.?limit/i.test(msg);
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
   let disconnected = false;
   port.onDisconnect.addListener(() => { disconnected = true; });
   const abortController = new AbortController();
@@ -462,16 +473,16 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
 
     // 串行处理 chunks：Kimi k2.5 reasoning 模型单 chunk 就比较慢，再并发容易打爆
     // rate limit。串行 + SSE 流式组合保证"第一段就能开始读"的渐进体验。
+    // chunk 间固定节流 + 429 专项重试（TPM 滑动窗口通常 15s 内恢复）。
     for (let ci = 0; ci < totalChunks; ci++) {
       if (disconnected || abortController.signal.aborted) return;
       const start = ci * CHUNK;
       const chunk = paragraphs.slice(start, start + CHUNK);
-      try {
+
+      const runChunk = async () => {
         const pushedIndices = new Set<number>();
-        await doTranslateBatchStream(
-          chunk,
-          settings,
-          abortController.signal,
+        const result = await doTranslateBatchStream(
+          chunk, settings, abortController.signal,
           (subIndex, translated) => {
             if (disconnected) return;
             const globalIndex = start + subIndex;
@@ -479,30 +490,48 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
             port.postMessage({ action: 'partial', index: globalIndex, translated });
             completedParagraphs++;
           },
-          true, // strictMode：提示保留段落结构，减少模型压缩
-        ).then((result) => {
-          // 补推流式未覆盖的条目（通常是最后一条）
-          for (let i = 0; i < result.translations.length; i++) {
-            if (pushedIndices.has(i)) continue;
-            const t = result.translations[i];
-            if (!t) continue;
-            const globalIndex = start + i;
-            if (!disconnected) {
-              port.postMessage({ action: 'partial', index: globalIndex, translated: t });
-              completedParagraphs++;
-            }
+          true, // strictMode：保留段落结构，减少模型压缩
+        );
+        // 补推流式未覆盖的条目（通常是最后一条）
+        for (let i = 0; i < result.translations.length; i++) {
+          if (pushedIndices.has(i)) continue;
+          const t = result.translations[i];
+          if (!t) continue;
+          const globalIndex = start + i;
+          if (!disconnected) {
+            port.postMessage({ action: 'partial', index: globalIndex, translated: t });
+            completedParagraphs++;
           }
-          totalTokens += result.usage?.total_tokens || 0;
-        });
-        if (!disconnected) {
-          port.postMessage({ action: 'progress', completed: Math.min(start + chunk.length, paragraphs.length), total: paragraphs.length });
         }
+        totalTokens += result.usage?.total_tokens || 0;
+      };
+
+      try {
+        await runChunk();
       } catch (err: any) {
-        console.warn('[Dualang] super-fine chunk fail', { chunkIndex: ci, error: err.message });
-        // 单 chunk 失败不中止整体，继续下一个
-        if (!disconnected) {
-          port.postMessage({ action: 'chunkFail', chunkIndex: ci, error: err.message });
+        if (isTpmError(err.message) && !disconnected && !abortController.signal.aborted) {
+          // TPM 限流：等窗口滑出后重试一次。再失败才计 chunkFail。
+          console.warn('[Dualang] super-fine chunk TPM, retrying', { chunkIndex: ci, backoffMs: TPM_BACKOFF_MS });
+          await sleep(TPM_BACKOFF_MS);
+          if (disconnected || abortController.signal.aborted) return;
+          try {
+            await runChunk();
+          } catch (retryErr: any) {
+            console.warn('[Dualang] super-fine chunk fail after retry', { chunkIndex: ci, error: retryErr.message });
+            if (!disconnected) port.postMessage({ action: 'chunkFail', chunkIndex: ci, error: retryErr.message });
+          }
+        } else {
+          console.warn('[Dualang] super-fine chunk fail', { chunkIndex: ci, error: err.message });
+          if (!disconnected) port.postMessage({ action: 'chunkFail', chunkIndex: ci, error: err.message });
         }
+      }
+
+      if (!disconnected) {
+        port.postMessage({ action: 'progress', completed: Math.min(start + chunk.length, paragraphs.length), total: paragraphs.length });
+      }
+      // 节流：下一 chunk 前强制间隔，把峰值 TPM 压到 50K/min 以下
+      if (ci < totalChunks - 1 && !disconnected && !abortController.signal.aborted) {
+        await sleep(THROTTLE_MS);
       }
     }
 
