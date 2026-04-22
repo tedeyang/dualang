@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect } from 'vitest';
-import { isAlreadyTargetLanguage, shouldSkipContent, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, isVerbatimReturn, rebuildParagraphs, splitParagraphsByDom, splitLinesByDom, extractAnchoredBlocks, extractText } from './utils';
+import { isAlreadyTargetLanguage, shouldSkipContent, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, isVerbatimReturn, rebuildParagraphs, splitParagraphsByDom, splitLinesByDom, extractAnchoredBlocks, extractText, extractTextWithMedia } from './utils';
 
 // ========== isAlreadyTargetLanguage ==========
 
@@ -566,6 +566,57 @@ describe('extractAnchoredBlocks', () => {
 });
 
 // ========== extractText ==========
+
+describe('extractTextWithMedia', () => {
+  it('无媒体：text 同 extractText，media 为空', () => {
+    document.body.innerHTML = '<div id="t">Hello world</div>';
+    const r = extractTextWithMedia(document.getElementById('t')!);
+    expect(r.text).toBe('Hello world');
+    expect(r.media).toEqual([]);
+  });
+
+  it('嵌入 <img>：替换成 [[M0]] 占位符，media[0] 是 clone', () => {
+    document.body.innerHTML =
+      '<div id="t">before <a href="/z"><div data-testid="tweetPhoto"><img alt="Image" src="a.jpg"></div></a> after</div>';
+    const el = document.getElementById('t')!;
+    const r = extractTextWithMedia(el);
+    expect(r.text).toContain('[[M0]]');
+    expect(r.media).toHaveLength(1);
+    // 媒体单元根向上爬到 tweetPhoto（优于直接 <img>）
+    expect(r.media[0].getAttribute('data-testid')).toBe('tweetPhoto');
+    // 原 DOM 未被破坏 —— 提取后图片仍在原位
+    expect(el.querySelector('img')).not.toBeNull();
+  });
+
+  it('多个 <img>：依次编号 [[M0]] [[M1]]，按 DOM 顺序', () => {
+    document.body.innerHTML =
+      '<div id="t">A <img alt="Image" src="1.jpg"> B <img alt="Image" src="2.jpg"> C</div>';
+    const el = document.getElementById('t')!;
+    const r = extractTextWithMedia(el);
+    const m0 = r.text.indexOf('[[M0]]');
+    const m1 = r.text.indexOf('[[M1]]');
+    expect(m0).toBeGreaterThan(-1);
+    expect(m1).toBeGreaterThan(m0);
+    expect(r.media).toHaveLength(2);
+  });
+
+  it('<video> / <audio> 也被识别并替换', () => {
+    document.body.innerHTML = '<div id="t">v: <video src="a.mp4"></video> a: <audio src="a.mp3"></audio></div>';
+    const r = extractTextWithMedia(document.getElementById('t')!);
+    expect(r.text).toMatch(/\[\[M0\]\]/);
+    expect(r.text).toMatch(/\[\[M1\]\]/);
+    expect(r.media).toHaveLength(2);
+  });
+
+  it('多个 <img> 共享同一 tweetPhoto 容器 → 只算一个媒体单元', () => {
+    document.body.innerHTML =
+      '<div id="t">x <div data-testid="tweetPhoto"><img src="a.jpg"><img src="b.jpg"></div> y</div>';
+    const r = extractTextWithMedia(document.getElementById('t')!);
+    // 两张 img 被去重到同一 tweetPhoto 根
+    expect(r.media).toHaveLength(1);
+    expect(r.text.match(/\[\[M\d+\]\]/g)?.length).toBe(1);
+  });
+});
 
 describe('splitLinesByDom', () => {
   it('按单 \\n 切行并保留 <a> 锚点可点击', () => {

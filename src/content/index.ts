@@ -1,4 +1,4 @@
-import { shouldSkipContent, isAlreadyTargetLanguage, extractText, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, isVerbatimReturn, rebuildParagraphs, splitParagraphsByDom, splitIntoParagraphs, extractAnchoredBlocks, isLongText, isLongRichElement } from './utils';
+import { shouldSkipContent, isAlreadyTargetLanguage, extractText, extractTextWithMedia, getContentId, hasSuspiciousLineMismatch, isWrongLanguage, isVerbatimReturn, rebuildParagraphs, splitParagraphsByDom, splitIntoParagraphs, extractAnchoredBlocks, isLongText, isLongRichElement } from './utils';
 import { getModelMeta } from '../shared/model-meta';
 import * as bubble from './super-fine-bubble';
 import { renderInlineSlots, fillSlot, clearInlineSlots } from './super-fine-render';
@@ -14,7 +14,7 @@ import {
   TRANSLATION_CACHE_MAX, TRANSLATION_CACHE_TTL_MS,
   SCHEDULER_URGENT_DELAY_MS, SCHEDULER_IDLE_DELAY_MS, SCHEDULER_MAX_AGGREGATE_MS,
   SHOW_MORE_STABLE_MS,
-  REQUEST_TIMEOUT_MS, LONG_CHUNK_TIMEOUT_MS, STREAM_TIMEOUT_MS, SUPER_FINE_TIMEOUT_MS,
+  REQUEST_TIMEOUT_MS, LONG_CHUNK_TIMEOUT_MS, STREAM_TIMEOUT_MS, SUPER_FINE_TIMEOUT_MS, adaptiveTimeoutMs,
 } from './constants';
 
 type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCache?: boolean };
@@ -238,7 +238,11 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
           retranslateBoost: !!extras?.retranslateBoost,
         },
       }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error(`翻译请求超时 (${REQUEST_TIMEOUT_MS / 1000}s)`)), REQUEST_TIMEOUT_MS)),
+      new Promise((_, reject) => {
+        const totalChars = texts.reduce((a, t) => a + t.length, 0);
+        const timeoutMs = adaptiveTimeoutMs(totalChars, REQUEST_TIMEOUT_MS);
+        setTimeout(() => reject(new Error(`翻译请求超时 (${Math.round(timeoutMs / 1000)}s)`)), timeoutMs);
+      }),
     ]);
     if (!response?.success) {
       const e: any = new Error(response?.error || '翻译失败');
@@ -1113,7 +1117,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
         continue;
       }
 
-      const text = extractText(tweetTextEl);
+      const { text, media } = extractTextWithMedia(tweetTextEl);
       if (!text) { batchIndex++; continue; }
 
       if (isAlreadyTargetLanguage(text, targetLang) || shouldSkipContent(text)) {
@@ -1123,7 +1127,9 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       }
 
       // 刷新 show-more 检测基线：记录当前送翻的文本长度
-      ensureState(article).lastText = tweetTextEl.textContent || '';
+      const state = ensureState(article);
+      state.lastText = tweetTextEl.textContent || '';
+      state.media = media;  // 译文渲染时替换 [[Mn]] 占位符（translation-only 模式不丢媒体）
       batch.push({
         article,
         text,
@@ -1314,7 +1320,9 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
 
     port.postMessage({ action: 'translate', payload: { texts, priority: hasHighPriority ? 1 : 0 } });
 
-    // 30s 超时保护
+    // 按总字符量动态超时，长文单次 batch 也能撑到完成
+    const streamTotalChars = texts.reduce((a, t) => a + t.length, 0);
+    const streamTimeoutMs = adaptiveTimeoutMs(streamTotalChars, STREAM_TIMEOUT_MS);
     setTimeout(() => {
       if (slotReleased) return;
       let anyStuck = false;
@@ -1322,14 +1330,14 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
         if (translatingSet.has(item.article)) { anyStuck = true; break; }
       }
       if (anyStuck) {
-        perfLog('streamTimeout', { batchSize: batch.length });
+        perfLog('streamTimeout', { batchSize: batch.length, timeoutMs: streamTimeoutMs });
         releaseSlot();
-        const e: any = new Error(`流式翻译超时 (${STREAM_TIMEOUT_MS / 1000}s)`);
+        const e: any = new Error(`流式翻译超时 (${Math.round(streamTimeoutMs / 1000)}s)`);
         e.retryable = true;
         handleSubBatchError(e, batch, apiT0, performance.now() - apiT0);
         try { port.disconnect(); } catch (_) {}
       }
-    }, STREAM_TIMEOUT_MS);
+    }, streamTimeoutMs);
   }
 
   // ========== 渲染单条翻译结果 + 写入内容 ID 缓存 ==========
@@ -1430,14 +1438,16 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
   // ========== 立即翻译（Show more / 用户操作，不进队列不受并发限制）==========
   // isQualityRetry=true 时绕过缓存读取，避免刚写入的坏翻译把自己的重试吃掉
   async function translateImmediate(article: Element, tweetTextEl: Element, isQualityRetry = false) {
-    const text = extractText(tweetTextEl);
+    const { text, media } = extractTextWithMedia(tweetTextEl);
     if (!text || isAlreadyTargetLanguage(text, targetLang) || shouldSkipContent(text)) {
       showPassAndHide(article);
       return;
     }
     // 入队时捕获内容 ID 和文本长度基线（基线用于下次 show-more 检测）
     const originalContentId = getContentId(article);
-    ensureState(article).lastText = tweetTextEl.textContent || '';
+    const state0 = ensureState(article);
+    state0.lastText = tweetTextEl.textContent || '';
+    state0.media = media;
     showStatus(article, 'loading');
     const apiT0 = performance.now();
     // 立即通道不走 withSlot（priority 2 绕限流）但仍要让浮球转起来
@@ -1696,9 +1706,10 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
    *     当前译文不满意，需要模型给出不同角度的结果
    */
   async function translateImmediateBoost(article: Element, tweetTextEl: Element): Promise<void> {
-    const text = extractText(tweetTextEl);
+    const { text, media } = extractTextWithMedia(tweetTextEl);
     if (!text) return;
     const originalContentId = getContentId(article);
+    ensureState(article).media = media;
     activeRequests++;
     bubble.setTranslationActivity(activeRequests);
     try {
@@ -1754,13 +1765,14 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     article: Element, tweetTextEl: Element,
     translatedText: string, originalText: string,
   ) {
+    const media = ensureState(article).media;
     renderTranslation(
       article,
       tweetTextEl,
       translatedText,
       originalText,
       displayMode,
-      { lineFusionEnabled },
+      { lineFusionEnabled, media },
       unobserveArticle,
     );
   }

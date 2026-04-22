@@ -142,11 +142,12 @@ export function shouldHedge(settings: Settings, priority: number): boolean {
 }
 
 /**
- * 估算 token：输入字符 + 每条 80 token JSON 结构开销，除以 3（字节→token 近似）。
- * 返回 rate-limiter acquire 时要求的 tokenEstimate。
+ * 估算 token：输入字符 + 每条 120 token JSON 结构开销，除以 2（EN→CJK 展开保守值）。
+ * 与 api.ts 的 computeMaxTokens 保持同一比率；rate-limiter acquire 时要求的 tokenEstimate
+ * 反映真实配额占用，避免长文 batch 被 limiter 误判能过关实际却触发 TPM。
  */
 export function estimateTokens(texts: string[], maxTokens: number | string | undefined): number {
   const totalChars = texts.reduce((s, t) => s + t.length, 0);
   const mt = parseInt(String(maxTokens ?? ''), 10) || 4096;
-  return Math.ceil((totalChars + mt * texts.length) / 3);
+  return Math.ceil((totalChars + mt * texts.length) / 2);
 }

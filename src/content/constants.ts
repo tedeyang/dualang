@@ -27,14 +27,35 @@ export const SCHEDULER_MAX_AGGREGATE_MS = 800;
 export const SHOW_MORE_STABLE_MS = 80;
 
 // ===================== 超时 =====================
-/** 常规批量翻译 sendMessage 请求超时（毫秒）。 */
+/**
+ * 这些是短推文的"保底"超时；长文用 adaptiveTimeoutMs 根据字符量动态扩展。
+ * 固定 30s 超时在长文（20k+ 字符、需要 60-120s 才能完成）场景下会级联失败：
+ * 第一次 30s 超时 → 质量重试 → 又 30s 超时 → 次数用尽红叉。
+ */
+/** 常规批量翻译 sendMessage 请求超时 baseline（毫秒）。 */
 export const REQUEST_TIMEOUT_MS = 30_000;
-/** 长文分段翻译单 chunk 超时（毫秒）。5 段 ~4k 字符输入时 GLM-4-9B 偶尔需要更久。 */
+/** 长文分段翻译单 chunk 超时 baseline（毫秒）。5 段 ~4k 字符输入时 GLM-4-9B 偶尔需要更久。 */
 export const LONG_CHUNK_TIMEOUT_MS = 60_000;
-/** 流式翻译端到端超时（毫秒）。 */
+/** 流式翻译端到端超时 baseline（毫秒）。 */
 export const STREAM_TIMEOUT_MS = 30_000;
-/** 超级精翻（长文浮球）整体超时（毫秒）。 */
+/** 超级精翻（长文浮球）整体超时（毫秒）。精翻是 147+ 段 serial chunks，已在顶层控制。 */
 export const SUPER_FINE_TIMEOUT_MS = 600_000;
+
+/**
+ * 根据字符量动态算超时。吞吐基准 150 chars/sec（GLM-4-9B on SiliconFlow
+ * 经验值：20-40 tokens/sec × 4 chars/token = 80-160 chars/sec，取偏保守的 150 给
+ * 2x 安全余量）。短内容用 baselineMs 保底避免过短，长内容扩展到 3 min 上限防挂死。
+ *
+ * 20k 字符 → 133s；4k 字符 → 27s（取 baseline 60s）；500 字符 → 3s（取 baseline 30s）。
+ */
+export function adaptiveTimeoutMs(
+  charCount: number,
+  baselineMs: number,
+  maxMs = 180_000,
+): number {
+  const scaledMs = Math.ceil(charCount / 150) * 1000;
+  return Math.min(maxMs, Math.max(baselineMs, scaledMs));
+}
 
 // ===================== IntersectionObserver =====================
 /** preload observer 的 rootMargin（上下各一屏）。数字会被拼成 '${N}px 0px ${N}px 0px'。 */

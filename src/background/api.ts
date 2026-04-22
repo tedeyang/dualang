@@ -55,18 +55,38 @@ export function applyThinkingMode(body: any, settings: Settings, profile?: Provi
 
 // ===================== body 构造辅助 =====================
 
+/** 绝对上限 —— 防止估算值异常大浪费配额，也避开部分 provider 的硬上限（通常 8k-32k）。 */
+const MAX_TOKENS_HARD_CAP = 32_000;
+
+/**
+ * 自适应 max_tokens：把 user 设置的 per-item 上限与输入字符量两个信号取较大者。
+ *
+ * 为什么不是固定 4096：
+ *   - 20k 字符的 X 长文翻译输出约 10-14k tokens（EN→ZH 译文字符约为输入 70%；CJK
+ *     每字 ~1.5 token；标签 / 段落开销另计）。固定 4096 会在模型中途被 max_tokens
+ *     截断，表现为返回 713 左右字符的"被掐头"译文，触发质量重试死循环。
+ *   - 短推文不降低：当 estimate 小于 userCap × count 时用 userCap × count 保底，
+ *     维持和旧逻辑一致的"宽裕"行为，避免意外踩到短文本模型输出偏长的边界。
+ *
+ * 比率 chars/2：按 EN→ZH 经验估值，1 输入字符 ≈ 0.5 输出 token（包含 JSON 结构开销
+ * 已单独计入 items × 120）。比旧公式的 chars/3 更宽，给 CJK 展开留安全空间。
+ */
+export function computeMaxTokens(settings: Settings, texts: string[]): number | undefined {
+  const userCap = parseInt(String(settings.maxTokens ?? ''), 10);
+  if (isNaN(userCap) || userCap <= 0) return undefined;
+  const inputChars = texts.reduce((sum, t) => sum + t.length, 0);
+  const estimated = Math.ceil(inputChars / 2) + texts.length * 120;
+  const userFloor = userCap * Math.max(1, texts.length);
+  return Math.min(MAX_TOKENS_HARD_CAP, Math.max(userFloor, estimated));
+}
+
+// 向后兼容的细分别名 —— 当前仅供 tests / 外部调用。新代码统一用 computeMaxTokens。
 function maxTokensPerItem(settings: Settings): number | undefined {
-  const n = parseInt(String(settings.maxTokens ?? ''), 10);
-  return !isNaN(n) && n > 0 ? n : undefined;
+  return computeMaxTokens(settings, ['']);  // 1 条空串 → 返回 userFloor
 }
 
 function maxTokensForBatch(settings: Settings, texts: string[]): number | undefined {
-  const maxPerItem = maxTokensPerItem(settings);
-  if (maxPerItem === undefined) return undefined;
-  // 输出长度 ≈ 输入 / 3 + 每条 80 token 的 JSON 结构开销；取与 user 设置上限的较大者
-  const inputChars = texts.reduce((sum, t) => sum + t.length, 0);
-  const estimatedOutput = Math.ceil(inputChars / 3) + texts.length * 80;
-  return Math.max(maxPerItem * texts.length, estimatedOutput);
+  return computeMaxTokens(settings, texts);
 }
 
 // ===================== API 错误分类 =====================
@@ -186,7 +206,7 @@ export async function doTranslateSingle(text: string, settings: Settings, signal
     stream: profile.supportsStreaming && !!settings.enableStreaming,
   };
 
-  const mt = maxTokensPerItem(settings);
+  const mt = computeMaxTokens(settings, [text]);
   if (mt !== undefined) body.max_tokens = mt;
   applyThinkingMode(body, settings, profile);
 

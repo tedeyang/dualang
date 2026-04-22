@@ -82,6 +82,69 @@ describe('renderTranslation line fusion', () => {
   });
 });
 
+describe('media placeholder substitution', () => {
+  function makeMediaEl(src: string): HTMLElement {
+    const a = document.createElement('a');
+    a.href = '/photo';
+    a.setAttribute('data-testid', 'tweetPhoto');
+    const img = document.createElement('img');
+    img.src = src; img.alt = 'Image';
+    a.appendChild(img);
+    return a;
+  }
+
+  it('translation-only：译文里的 [[M0]] 换成对应 media 克隆', () => {
+    const { article, tweetTextEl } = setupArticle('before <img alt="Image" src="/a.jpg"> after');
+    const mediaEl = makeMediaEl('/a.jpg');
+    renderTranslation(
+      article, tweetTextEl,
+      '前 [[M0]] 后', 'before [[M0]] after', 'translation-only',
+      { media: [mediaEl] },
+    );
+    const card = article.querySelector('.dualang-translation')!;
+    expect(card.querySelector('img')).not.toBeNull();
+    expect(card.querySelector('img')!.getAttribute('src')).toBe('/a.jpg');
+    // 兜底区段不出现（占位符被消费）
+    expect(card.querySelector('.dualang-media-tail')).toBeNull();
+  });
+
+  it('模型吞掉 [[M0]]：tail 兜底追加媒体，避免丢失', () => {
+    const { article, tweetTextEl } = setupArticle('x');
+    const mediaEl = makeMediaEl('/a.jpg');
+    renderTranslation(
+      article, tweetTextEl,
+      '译文但模型漏了占位符', 'orig', 'translation-only',
+      { media: [mediaEl] },
+    );
+    const card = article.querySelector('.dualang-translation')!;
+    expect(card.querySelector('.dualang-media-tail')).not.toBeNull();
+    expect(card.querySelector('.dualang-media-tail img')!.getAttribute('src')).toBe('/a.jpg');
+  });
+
+  it('多个媒体保持相对顺序', () => {
+    const { article, tweetTextEl } = setupArticle('x');
+    const m0 = makeMediaEl('/0.jpg');
+    const m1 = makeMediaEl('/1.jpg');
+    renderTranslation(
+      article, tweetTextEl,
+      '前 [[M0]] 中 [[M1]] 后', 'x', 'translation-only',
+      { media: [m0, m1] },
+    );
+    const imgs = article.querySelectorAll('.dualang-translation img');
+    expect(imgs).toHaveLength(2);
+    expect(imgs[0].getAttribute('src')).toBe('/0.jpg');
+    expect(imgs[1].getAttribute('src')).toBe('/1.jpg');
+  });
+
+  it('media 为空时译文正常渲染（无占位符也不抛）', () => {
+    const { article, tweetTextEl } = setupArticle('hello');
+    renderTranslation(article, tweetTextEl, '你好', 'hello', 'translation-only');
+    const card = article.querySelector('.dualang-translation')!;
+    expect(card.textContent).toContain('你好');
+    expect(card.querySelector('.dualang-media-tail')).toBeNull();
+  });
+});
+
 describe('linkifyText', () => {
   it('纯文本无 URL：返回单个 text 节点', () => {
     const frag = linkifyText('Hello world no link here');

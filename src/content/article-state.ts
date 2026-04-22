@@ -25,6 +25,9 @@ export interface ArticleState {
   qualityRetried?: boolean;
   /** 超级精翻（长文）当前占用的 port，用于用户点击取消时 disconnect */
   superFinePort?: chrome.runtime.Port;
+  /** 本次翻译时抽出的媒体单元 clone（与发送给模型的文本中的 [[Mn]] 占位符对应）。
+   *  渲染译文卡时替换回对应位置；模型吞掉占位符时由 renderTranslation 末尾 tail 兜底。 */
+  media?: HTMLElement[];
 }
 
 const states = new WeakMap<Element, ArticleState>();

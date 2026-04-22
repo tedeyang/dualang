@@ -335,7 +335,7 @@ async function handleTranslateStream(payload: any, port: chrome.runtime.Port) {
 
     const totalChars = toTranslateTexts.reduce((sum, t) => sum + t.length, 0);
     const maxTokens = parseInt(settings.maxTokens, 10) || 4096;
-    const tokenEstimate = Math.ceil((totalChars + maxTokens * toTranslateTexts.length) / 3);
+    const tokenEstimate = Math.ceil((totalChars + maxTokens * toTranslateTexts.length) / 2);
     const priority = payload.priority || 0;
     const registerTask = await rateLimiter.acquire(tokenEstimate, priority);
 

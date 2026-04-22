@@ -162,6 +162,28 @@ article[data-dualang-line-fusion="true"] .dualang-translation {
   padding-top: 0;
 }
 
+/* ===== 译文 / 原文里嵌入的媒体（克隆自原 DOM）=====
+ * extractTextWithMedia 把 tweetPhoto / <a> 包装好的图片/视频换成 [[Mn]] 占位符送翻译；
+ * 渲染译文时按占位符位置替换回来。X.com 的图片布局靠外层 grid；我们把它塞进 card 后
+ * 只需保证不溢出、保持比例，其余交给 X.com 自己的内层样式（color-scheme 由 html 继承）。
+ */
+.dualang-media {
+  display: block;
+  max-width: 100%;
+  margin: 8px 0;
+}
+.dualang-media img,
+.dualang-media video {
+  max-width: 100%;
+  height: auto;
+  border-radius: 12px;
+}
+/* 模型吞掉占位符时的兜底：追加在译文末尾，比正文略低调 */
+.dualang-media-tail {
+  margin-top: 10px;
+  opacity: 0.92;
+}
+
 /* ===== 译文 / 原文里的 URL 链接 =====
  * linkifyText 把字符串里的 http(s):// URL 包进 <a.dualang-link>，无论在 .dualang-para
  * 还是 .dualang-line-fusion-* 里都强制用 X 的 accent 蓝 —— 否则 bilingual !important

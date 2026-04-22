@@ -1,5 +1,5 @@
 import { splitIntoParagraphs } from './utils';
-import { LONG_CHUNK_TIMEOUT_MS } from './constants';
+import { LONG_CHUNK_TIMEOUT_MS, adaptiveTimeoutMs } from './constants';
 
 /**
  * 长文专用路径：把 text 按 \n\n 切成 N 段，5 段一 chunk 串行送 API，
@@ -68,12 +68,15 @@ function requestChunkViaPort(
     let chunkModel: string | undefined;
     let chunkBaseUrl: string | undefined;
 
+    // 按 chunk 字符量自适应超时：~4k 字符的 chunk 会拿 60s baseline；更长 chunk 线性扩展到 3 min。
+    const chunkChars = chunkTexts.reduce((a, t) => a + t.length, 0);
+    const chunkTimeoutMs = adaptiveTimeoutMs(chunkChars, LONG_CHUNK_TIMEOUT_MS);
     const timeout = setTimeout(() => {
       if (settled) return;
       settled = true;
       try { port.disconnect(); } catch (_) {}
-      reject(new Error(`长文 chunk @${chunkOffset} 翻译超时 (${LONG_CHUNK_TIMEOUT_MS / 1000}s)`));
-    }, LONG_CHUNK_TIMEOUT_MS);
+      reject(new Error(`长文 chunk @${chunkOffset} 翻译超时 (${Math.round(chunkTimeoutMs / 1000)}s)`));
+    }, chunkTimeoutMs);
 
     port.onMessage.addListener((msg) => {
       if (settled) return;

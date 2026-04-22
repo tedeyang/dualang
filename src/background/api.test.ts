@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 // Mock chrome-dependent modules before importing api.ts
 vi.mock('./error-report', () => ({ reportFatalError: vi.fn(), clearErrorState: vi.fn() }));
 
-const { classifyApiError, applyThinkingMode } = await import('./api');
+const { classifyApiError, applyThinkingMode, computeMaxTokens } = await import('./api');
 
 describe('classifyApiError', () => {
   // 429 variants
@@ -165,5 +165,41 @@ describe('applyThinkingMode', () => {
     expect(body.enable_thinking).toBeUndefined();
     expect(body.reasoning_effort).toBeUndefined();
     expect(body.thinking).toBeUndefined();
+  });
+});
+
+describe('computeMaxTokens', () => {
+  it('未设置 maxTokens → undefined（保留模型默认）', () => {
+    expect(computeMaxTokens({} as any, ['hello'])).toBeUndefined();
+    expect(computeMaxTokens({ maxTokens: 0 } as any, ['hello'])).toBeUndefined();
+    expect(computeMaxTokens({ maxTokens: 'abc' } as any, ['hello'])).toBeUndefined();
+  });
+
+  it('短文本：用 userCap × count 保底（短输入时 estimate 小于 userFloor）', () => {
+    const s = { maxTokens: 4096 } as any;
+    expect(computeMaxTokens(s, ['hi'])).toBe(4096);
+    expect(computeMaxTokens(s, ['a'.repeat(500)])).toBe(4096);
+    // 5 条 500 字 → estimated 1250+600=1850 < userFloor 4096×5=20480
+    expect(computeMaxTokens(s, Array(5).fill('a'.repeat(500)))).toBe(20480);
+  });
+
+  it('长文本：estimate 超过 userFloor 时取 estimate（20k 字符 → 10120 tokens）', () => {
+    const s = { maxTokens: 4096 } as any;
+    // 1 条 20000 字 → estimated 10000+120=10120，userFloor 4096 → 10120
+    expect(computeMaxTokens(s, ['a'.repeat(20_000)])).toBe(10120);
+  });
+
+  it('极长文本受 32k 硬上限夹住', () => {
+    const s = { maxTokens: 4096 } as any;
+    // 100k 字 → estimated 50120 → min(32000, 50120) = 32000
+    expect(computeMaxTokens(s, ['a'.repeat(100_000)])).toBe(32_000);
+  });
+
+  it('用户显式设置超大 cap 时仍尊重（只受 32k 上限压）', () => {
+    const s = { maxTokens: 16_000 } as any;
+    // userFloor 16000 > estimated 570 → 16000
+    expect(computeMaxTokens(s, ['a'.repeat(1000)])).toBe(16_000);
+    // 5 条小文本 → userFloor 16000×5=80000 被 32k 夹住
+    expect(computeMaxTokens(s, Array(5).fill('a'.repeat(100)))).toBe(32_000);
   });
 });

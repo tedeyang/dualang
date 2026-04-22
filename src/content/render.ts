@@ -5,6 +5,9 @@ import { splitNonEmptyLines, alignTranslatedLines } from './line-fusion';
 
 type RenderEnhancements = {
   lineFusionEnabled?: boolean;
+  /** 原文抽出的媒体单元克隆，按 `[[Mn]]` 编号索引。渲染时把译文里的占位符
+   *  替换成对应 clone。未被模型保留的媒体在渲染末尾兜底追加，避免丢失。 */
+  media?: HTMLElement[];
 };
 
 /**
@@ -36,6 +39,9 @@ export function renderTranslation(
   const card = document.createElement('div');
   card.className = 'dualang-translation';
   article.setAttribute('data-dualang-mode', displayMode);
+
+  const media = enhancements.media || [];
+  const usedMedia = new Set<number>();
 
   let translatedParas = translatedText
     .split(/(?:\n\s*\n|---PARA---)/)
@@ -73,7 +79,7 @@ export function renderTranslation(
       // 行数和字符串切出的 origLines 对不上时退回字符串模式（linkifyText 兜底）。
       const origFragments = splitLinesByDom(tweetTextEl);
       const useFragments = origFragments.length === origLines.length;
-      renderLineFusion(card, useFragments ? origFragments : origLines, aligned.lines);
+      renderLineFusion(card, useFragments ? origFragments : origLines, aligned.lines, media, usedMedia);
       renderedByFusion = true;
     }
   }
@@ -112,7 +118,7 @@ export function renderTranslation(
         if (translatedParas[i]) {
           const trans = document.createElement('div');
           trans.className = 'dualang-para';
-          trans.appendChild(linkifyText(translatedParas[i]));
+          trans.appendChild(substituteMediaAndLinkify(translatedParas[i], media, usedMedia));
           pair.appendChild(trans);
         }
         card.appendChild(pair);
@@ -121,7 +127,7 @@ export function renderTranslation(
       for (let i = originalParas.length; i < translatedParas.length; i++) {
         const trans = document.createElement('div');
         trans.className = 'dualang-para';
-        trans.appendChild(linkifyText(translatedParas[i]));
+        trans.appendChild(substituteMediaAndLinkify(translatedParas[i], media, usedMedia));
         card.appendChild(trans);
       }
     }
@@ -138,7 +144,19 @@ export function renderTranslation(
     //   - bilingual: tweetText 改暗色 + card.dualang-para 原生色
     //   - translation-only: tweetText display:none + card.dualang-para 原生色
     if (displayMode === 'bilingual') card.classList.add('dualang-bilingual');
-    appendTranslationParas(card, translatedParas);
+    appendTranslationParas(card, translatedParas, media, usedMedia);
+  }
+
+  // 兜底：模型可能把 [[Mn]] 占位符吞掉；把所有未被 substituteMedia 消费过的媒体
+  // 追加到 card 末尾，至少保证媒体不丢失（位置可能不精确）。
+  if (media.length > 0) {
+    for (let i = 0; i < media.length; i++) {
+      if (usedMedia.has(i)) continue;
+      const tail = document.createElement('div');
+      tail.className = 'dualang-media-tail';
+      tail.appendChild(media[i].cloneNode(true));
+      card.appendChild(tail);
+    }
   }
 
   tweetTextEl.parentNode!.insertBefore(card, tweetTextEl.nextSibling);
@@ -156,6 +174,8 @@ function renderLineFusion(
   card: HTMLElement,
   originalLines: string[] | DocumentFragment[],
   translatedLines: string[],
+  media: HTMLElement[] = [],
+  usedMedia: Set<number> = new Set(),
 ): void {
   for (let i = 0; i < translatedLines.length; i++) {
     const pair = document.createElement('div');
@@ -165,7 +185,9 @@ function renderLineFusion(
       const orig = document.createElement('div');
       orig.className = 'dualang-line-fusion-orig';
       if (typeof origItem === 'string') {
-        orig.appendChild(linkifyText(origItem));
+        // 原文行是字符串形态时也可能含 [[Mn]]（DOM 切片失败回落路径）—— 消费一次，
+        // 相同 clone 不会重复占用：usedMedia 跨行共享，tail 兜底只捡没人用过的。
+        orig.appendChild(substituteMediaAndLinkify(origItem, media, usedMedia));
       } else {
         // 克隆 fragment 节点，保留原 DOM 的 <a href> 可点击语义。
         orig.appendChild(origItem);
@@ -178,7 +200,7 @@ function renderLineFusion(
 
     const trans = document.createElement('div');
     trans.className = 'dualang-line-fusion-trans';
-    trans.appendChild(linkifyText(translatedLines[i]));
+    trans.appendChild(substituteMediaAndLinkify(translatedLines[i], media, usedMedia));
     pair.appendChild(trans);
     card.appendChild(pair);
   }
@@ -189,12 +211,51 @@ function renderLineFusion(
  * 渲染为一整行空行（与 X.com 原生 tweetText 的段落间距视觉一致）。
  * 旧做法是每段一个 <div> + margin-top 近似，但 margin 值永远对不齐 line-height 撑出的空行。
  */
-function appendTranslationParas(card: HTMLElement, translatedParas: string[]): void {
+function appendTranslationParas(
+  card: HTMLElement,
+  translatedParas: string[],
+  media: HTMLElement[] = [],
+  usedMedia: Set<number> = new Set(),
+): void {
   if (translatedParas.length === 0) return;
   const p = document.createElement('div');
   p.className = 'dualang-para';
-  p.appendChild(linkifyText(translatedParas.join('\n\n')));
+  p.appendChild(substituteMediaAndLinkify(translatedParas.join('\n\n'), media, usedMedia));
   card.appendChild(p);
+}
+
+/**
+ * 占位符感知的 linkify：把文本里的 `[[Mn]]` 替换成 `media[n]` 的 clone，其余段落交给
+ * linkifyText 处理 URL / @mention / #hashtag。
+ *
+ *   - `usedMedia` 记录哪些 index 已消费过，主 renderTranslation 最后扫描兜底时跳过。
+ *   - `media[n]` 是在 extractTextWithMedia 里已经 `cloneNode(true)` 过的快照；这里再
+ *     clone 一次，因为同一个 card 可能在多个位置被写入（如行对照里两行共享同一 `[[M0]]`，
+ *     或者 tail 兜底与段内同时用）。
+ */
+function substituteMediaAndLinkify(
+  text: string,
+  media: HTMLElement[],
+  usedMedia: Set<number>,
+): DocumentFragment {
+  if (media.length === 0 || !/\[\[M\d+\]\]/.test(text)) return linkifyText(text);
+  const frag = document.createDocumentFragment();
+  const re = /\[\[M(\d+)\]\]/g;
+  let cursor = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > cursor) frag.appendChild(linkifyText(text.slice(cursor, m.index)));
+    const idx = parseInt(m[1], 10);
+    if (media[idx]) {
+      usedMedia.add(idx);
+      const clone = media[idx].cloneNode(true) as HTMLElement;
+      clone.classList.add('dualang-media');
+      frag.appendChild(clone);
+    }
+    cursor = m.index + m[0].length;
+  }
+  if (cursor < text.length) frag.appendChild(linkifyText(text.slice(cursor)));
+  return frag;
 }
 
 /**

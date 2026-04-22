@@ -445,6 +445,84 @@ export function splitLinesByDom(el: Element): DocumentFragment[] {
   return result;
 }
 
+/**
+ * 从 tweetText / rich-article 容器里抽出"媒体单元"（图片 / 视频 / 音频及其 X.com 外层
+ * `<a>` 包装 / `[data-testid="tweetPhoto"]` 容器），用 `[[Mn]]` 占位符在原文本中标记位置。
+ *
+ * 目的：模型只处理纯文本，但我们需要在译文渲染时把原媒体放回原位 —— 占位符就是"别动
+ * 这个 token"的锚点。模型被 system prompt 要求原样保留，失败兜底在渲染侧。
+ *
+ * 返回的 media 已是 `cloneNode(true)`，DOM 里的原件不动；调用方可多次克隆用到
+ * 不同 card 里（translation-only / inline 每段都可能用到同一 clone）。
+ *
+ * 识别策略：以 `<img>` / `<video>` / `<audio>` 为锚点，向上爬最多 4 层找最近的
+ * `[data-testid="tweetPhoto"]` 或 `<a>` 包装元素作为"媒体单元根"。找不到就用元素自身。
+ * 避免把外层巨大的 grid 容器也吃进来（会干扰 innerText 的 block 边界）。
+ */
+export interface MediaExtraction {
+  text: string;
+  /** 按占位符编号 0..N-1 存放的媒体单元克隆（含 <a> 包装 / 点击可放大等交互）。 */
+  media: HTMLElement[];
+}
+
+const MEDIA_SELECTOR = 'img, video, audio';
+
+function findMediaUnitRoot(el: Element): Element {
+  let cursor: Element | null = el;
+  for (let i = 0; i < 4 && cursor; i++) {
+    if (cursor.getAttribute?.('data-testid') === 'tweetPhoto') return cursor;
+    if (cursor.tagName === 'A' && cursor.parentElement?.getAttribute('aria-label')?.includes('Image')) return cursor;
+    cursor = cursor.parentElement;
+  }
+  // 退而求其次：用 img/video/audio 的直接 <a> 包装（有 href 指向原图 / 视频 URL）
+  cursor = el;
+  for (let i = 0; i < 3 && cursor; i++) {
+    if (cursor.tagName === 'A') return cursor;
+    cursor = cursor.parentElement;
+  }
+  return el;
+}
+
+export function extractTextWithMedia(el: Element): MediaExtraction {
+  const rawMedia = Array.from(el.querySelectorAll<HTMLElement>(MEDIA_SELECTOR));
+  // 去重：多张 `<img>` 可能共享同一 tweetPhoto / `<a>` 包装，按媒体单元根去重。
+  const seenRoots = new Set<Element>();
+  const units: HTMLElement[] = [];
+  for (const m of rawMedia) {
+    const root = findMediaUnitRoot(m) as HTMLElement;
+    // 只处理确实在 el 内部的元素（防御 findMediaUnitRoot 爬出容器）
+    if (!el.contains(root)) continue;
+    if (seenRoots.has(root)) continue;
+    seenRoots.add(root);
+    units.push(root);
+  }
+
+  if (units.length === 0) {
+    return { text: extractText(el), media: [] };
+  }
+
+  // 原地替换：media 单元 → `[[Mn]]` 文本节点；读 innerText；再把原节点放回去。
+  // 参照 dict-def 的 detach-extract-reattach 模式（utils.ts 中 extractText 里已实现）。
+  const restores: Array<{ parent: Node; next: Node | null; placeholder: Text; original: HTMLElement }> = [];
+  for (let i = 0; i < units.length; i++) {
+    const original = units[i];
+    const parent = original.parentNode;
+    if (!parent) continue;
+    const placeholder = document.createTextNode(`[[M${i}]]`);
+    const next = original.nextSibling;
+    parent.replaceChild(placeholder, original);
+    restores.push({ parent, next, placeholder, original });
+  }
+  const text = extractText(el);
+  // 恢复
+  for (const r of restores) {
+    r.parent.replaceChild(r.original, r.placeholder);
+  }
+  // 克隆供调用方安全插入到任意 card（译文卡、行对照、段对照等），不破坏原 DOM。
+  const media = units.map((u) => u.cloneNode(true) as HTMLElement);
+  return { text, media };
+}
+
 // ===================== 长文判定 =====================
 // 统一门槛：≥ 4000 字符 且 ≥ 6 段落/段块。
 // 两种输入路径：纯文本（走 chunked 翻译）和 rich DOM（走浮球精翻）。
