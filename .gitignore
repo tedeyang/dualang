@@ -33,3 +33,6 @@ npm-debug.log*
 
 # Playwright test artifacts
 e2e/test-results/
+
+# Development process docs (kept locally, not in git)
+docs/superpowers/
