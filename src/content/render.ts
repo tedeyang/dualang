@@ -35,6 +35,10 @@ export function renderTranslation(
 ): void {
   const t0 = performance.now();
   if (article.querySelector('.dualang-translation')) return;
+  // 长文走 super-fine（fillSlot 内联渲染），绝不能走这条路径 —— 否则
+  // `data-dualang-mode` 和 `data-dualang-line-fusion` 会被意外设上，
+  // CSS `article[data-dualang-line-fusion="true"] richTextView { display:none }` 触发黑屏。
+  if (article.getAttribute('data-dualang-long-article') === 'true') return;
 
   const card = document.createElement('div');
   card.className = 'dualang-translation';

@@ -7,6 +7,7 @@ import { telemetry } from './telemetry';
 import { normalizeDisplayMode, type DisplayMode } from './display-mode';
 import { requestTranslationChunked } from './long-article-chunked';
 import { findAndPrepareGrokCards, GROK_DISCLAIMER_PREFIXES } from './grok-card';
+import { ctaTranslateNow, ctaCancel } from '../shared/i18n';
 import { renderTranslation } from './render';
 import { isLikelyEnglishText, extractDictionaryCandidates, applyDictionaryAnnotations, clearDictionaryAnnotations, type DictEntry } from './smart-dict';
 import {
@@ -703,6 +704,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     renderInlineSlots(article, blocks);
 
     bubble.setBubbleState(articleId, 'translating', { completed: 0, total: blocks.length });
+    updateLongArticleCta(article, 'translating');
 
     // img-alt 块用 "[图: alt]" 发给模型，便于作为独立段落翻译
     const paragraphs = blocks.map((b) => b.kind === 'img-alt' ? `[图: ${b.text}]` : b.text);
@@ -716,6 +718,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       finished = true;
       try { port?.disconnect(); } catch (_) {}
       bubble.setBubbleState(articleId, 'failed');
+      updateLongArticleCta(article, 'failed');
       logBiz('translation.superFine.fail', { error: 'timeout' }, 'warn');
     }, SUPER_FINE_TIMEOUT_MS);
 
@@ -724,6 +727,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     } catch (err: any) {
       clearTimeout(timeout);
       bubble.setBubbleState(articleId, 'failed');
+      updateLongArticleCta(article, 'failed');
       logBiz('translation.superFine.fail', { error: 'connect:' + err.message }, 'warn');
       return;
     }
@@ -746,17 +750,34 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       } else if (msg.action === 'done') {
         finished = true;
         clearTimeout(timeout);
-        bubble.setBubbleState(articleId, 'done');
         const rtt = performance.now() - apiT0;
-        showSuccess(article, { model: msg.model || metaModel, baseUrl: msg.baseUrl || metaBaseUrl, tokens: msg.totalTokens });
-        logBiz('translation.superFine.ok', {
-          paragraphs: blocks.length, completed: msg.completed, rttMs: rtt.toFixed(0), model: msg.model || metaModel,
-        });
+        // background 的 handleSuperFineStream 即便部分 chunk 失败也会发 'done'，
+        // 只在 completed/total 字段上区分。必须在这里兜住：完成率 < 90% 判失败，
+        // 保留 CTA 可见以便用户重试；否则（>=90% 视作可接受的尾部 slot 漏推）走 done。
+        const completed = typeof msg.completed === 'number' ? msg.completed : 0;
+        const total = typeof msg.total === 'number' ? msg.total : blocks.length;
+        const ratio = total > 0 ? completed / total : 1;
+        if (ratio < 0.9) {
+          bubble.setBubbleState(articleId, 'failed');
+          updateLongArticleCta(article, 'failed');
+          showFail(article, `精翻部分失败：${completed}/${total} 段完成`);
+          logBiz('translation.superFine.partial', {
+            paragraphs: blocks.length, completed, total, rttMs: rtt.toFixed(0), model: msg.model || metaModel,
+          }, 'warn');
+        } else {
+          bubble.setBubbleState(articleId, 'done');
+          updateLongArticleCta(article, 'done');
+          showSuccess(article, { model: msg.model || metaModel, baseUrl: msg.baseUrl || metaBaseUrl, tokens: msg.totalTokens });
+          logBiz('translation.superFine.ok', {
+            paragraphs: blocks.length, completed, rttMs: rtt.toFixed(0), model: msg.model || metaModel,
+          });
+        }
         try { port?.disconnect(); } catch (_) {}
       } else if (msg.action === 'error') {
         finished = true;
         clearTimeout(timeout);
         bubble.setBubbleState(articleId, 'failed');
+        updateLongArticleCta(article, 'failed');
         logBiz('translation.superFine.fail', { error: msg.error }, 'warn');
         showFail(article, msg.error);
         try { port?.disconnect(); } catch (_) {}
@@ -768,6 +789,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       finished = true;
       clearTimeout(timeout);
       bubble.setBubbleState(articleId, 'failed');
+      updateLongArticleCta(article, 'failed');
     });
 
     port.postMessage({
@@ -902,6 +924,38 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
           if (hasTweet || hasGrokMarker) {
             pendingScanRoots.add(el);
           }
+
+          // 竞态防护：twitterArticleRichTextView 可能以空骨架出现在 article 里，
+          // 段落后续一个个 appendChild 进去。三种检测形态：
+          //   a) addedNode 本身是 richTextView
+          //   b) addedNode 包含 richTextView
+          //   c) addedNode 是 richTextView 的后代（段落级注入）← 原版 guard 漏掉的
+          // 任一命中 + 所属 article 已被当短推文处理（有 mode / line-fusion 但没 long-article）
+          // → 清理旧翻译状态，让 scanAndQueue 重新评估是否是长文。
+          const richView =
+            (el.matches?.('[data-testid="twitterArticleRichTextView"]') && el) ||
+            el.querySelector?.('[data-testid="twitterArticleRichTextView"]') ||
+            el.closest?.('[data-testid="twitterArticleRichTextView"]');
+          if (richView) {
+            const art = richView.closest?.('article[data-testid="tweet"]');
+            const hasDirtyAttrs = art && (art.getAttribute('data-dualang-mode') || art.getAttribute('data-dualang-line-fusion'));
+            if (hasDirtyAttrs) {
+              if (art.getAttribute('data-dualang-long-article') === 'true') {
+                // 长文已就位但被误设了 mode/line-fusion（line-fusion 的 CSS 会隐藏 richTextView → 黑屏）。
+                // 只清属性和误插的 .dualang-translation 卡，保留 super-fine 的 slot 和 long-article 状态。
+                art.querySelector('.dualang-translation')?.remove();
+                art.removeAttribute('data-dualang-mode');
+                art.removeAttribute('data-dualang-line-fusion');
+              } else {
+                // 短推文路径遗留的脏状态（richTextView 异步加载的竞态）：全清，重扫走长文分支。
+                art.querySelector('.dualang-translation')?.remove();
+                art.removeAttribute('data-dualang-mode');
+                art.removeAttribute('data-dualang-line-fusion');
+                processedTweets.delete(art);
+                pendingScanRoots.add(art);
+              }
+            }
+          }
         }
       }
 
@@ -984,7 +1038,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
         }
       }
 
-      // X Articles 长文：跳过常规自动翻译，改由浮球"精翻此文"按钮触发
+      // X Articles 长文：跳过常规自动翻译，在文章头部注入 CTA 链接 + 浮球入口
       if (isXArticle(article)) {
         const richTextEl = article.querySelector('[data-testid="twitterArticleRichTextView"]');
         if (richTextEl && isLongRichElement(richTextEl)) {
@@ -993,8 +1047,19 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
             article.setAttribute('data-dualang-article-id', contentId || ('la-' + Math.random().toString(36).slice(2, 10)));
           }
           bubble.setLongArticle(article);
+          injectLongArticleCta(article, richTextEl);
           newlyRegistered++;
           return; // 不注册 viewport/preload observer
+        }
+        // richTextView 存在但文本/块数还没到阈值 —— 典型场景是 X Articles
+        // 骨架先渲染、段落异步填充。此时**不能**走短推文路径（否则译的是标题摘要，
+        // 随后 richTextView 填满又会产生双重翻译 + CSS 冲突）。
+        // 从 processedTweets 摘出 article，等 MutationObserver 捕获段落填充后
+        // 触发 pendingScanRoots 重新评估。
+        if (richTextEl) {
+          processedTweets.delete(article);
+          newlyRegistered++;
+          return;
         }
       }
 
@@ -1012,6 +1077,10 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
   function queueTranslation(article, highPriority = false) {
     if (!enabled) return;
     telemetry.inc("queueTranslationCalls");
+    // 长文走 super-fine 专属流水线（CTA/浮球触发 + fillSlot 渲染），
+    // 绝不允许进入常规 translate→renderTranslation 分支，否则会被设 line-fusion
+    // 触发 CSS 隐藏 richTextView（= 黑屏）。
+    if (article.getAttribute('data-dualang-long-article') === 'true') return;
     if (article.querySelector('.dualang-translation')) return;
     if (translatingSet.has(article)) return;
 
@@ -1757,6 +1826,45 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     });
 
     tweetTextEl.parentNode.insertBefore(btn, tweetTextEl.nextSibling);
+  }
+
+  // ========== 长文 inline CTA 链接 ==========
+  // 在长文 article 的 richTextView 前注入"立即 X 光速翻译"链接，
+  // 点击后触发精翻，翻译中变为"取消翻译"，完成后隐藏。
+  function injectLongArticleCta(article: Element, richTextEl: Element): void {
+    if (article.querySelector('.dualang-long-cta')) return;
+    const cta = document.createElement('a');
+    cta.className = 'dualang-long-cta';
+    cta.href = 'javascript:void(0)';
+    cta.textContent = ctaTranslateNow(targetLang);
+    cta.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (cta.dataset.state === 'translating') {
+        // 取消
+        const port = getState(article)?.superFinePort;
+        try { port?.disconnect(); } catch (_) {}
+        return;
+      }
+      // 发起精翻
+      translateArticleSuperFine(article);
+    });
+    richTextEl.parentNode?.insertBefore(cta, richTextEl);
+  }
+
+  /** 精翻状态变化时同步更新 article 内的 CTA 链接 */
+  function updateLongArticleCta(article: Element, state: 'translating' | 'done' | 'failed'): void {
+    const cta = article.querySelector<HTMLElement>('.dualang-long-cta');
+    if (!cta) return;
+    cta.dataset.state = state;
+    if (state === 'translating') {
+      cta.textContent = ctaCancel(targetLang);
+    } else if (state === 'done') {
+      cta.style.display = 'none';
+    } else {
+      // failed → 恢复为"立即翻译"，允许重试
+      cta.textContent = ctaTranslateNow(targetLang);
+    }
   }
 
   // 包一层闭包绑定：调用方保持 renderTranslation(article, tweetTextEl, translated, original)

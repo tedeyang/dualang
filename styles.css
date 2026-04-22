@@ -17,6 +17,8 @@
   --dl-bg-inset:       #0b0d10;   /* 下沉区块（模型列表行、segment 容器） */
   --dl-bg-hover:       #1c1f23;   /* 模型行 hover */
   --dl-dict-def:       #e8c77a;   /* 字典释义色 */
+  --dl-sf-accent:      #c9a24e;   /* 精翻左侧书脊线 */
+  --dl-sf-accent-bg:   rgba(201,162,78,0.06); /* 精翻译文底色 */
   --dl-panel-shadow:   0 12px 32px rgba(0,0,0,0.55), 0 2px 6px rgba(0,0,0,0.35), 0 0 0 1px rgba(255,255,255,0.02) inset;
   --dl-btn-hover-bg:   rgba(255,255,255,0.04);   /* segment 按钮 hover 遮罩 */
 }
@@ -35,6 +37,8 @@ html[data-dualang-theme="light"] {
   --dl-bg-inset:       #eff3f4;
   --dl-bg-hover:       #e5eaed;
   --dl-dict-def:       #a06000;
+  --dl-sf-accent:      #b8860b;   /* 精翻左侧书脊线（亮色） */
+  --dl-sf-accent-bg:   rgba(184,134,11,0.05);
   --dl-panel-shadow:   0 8px 24px rgba(0,0,0,0.12), 0 2px 6px rgba(0,0,0,0.08), 0 0 0 1px rgba(0,0,0,0.05) inset;
   --dl-btn-hover-bg:   rgba(0,0,0,0.04);
 }
@@ -172,10 +176,24 @@ article[data-dualang-line-fusion="true"] .dualang-translation {
   max-width: 100%;
   margin: 8px 0;
 }
+/* 克隆的 tweetPhoto 容器自带 X.com 绝对定位 class（r-1p0dtai 等），
+ * 脱离原 grid 后无宽高约束；必须 !important 重置定位并限高。 */
+.dualang-media[data-testid="tweetPhoto"] {
+  position: relative !important;
+  overflow: hidden;
+}
+/* X 原图用 background-image 做模糊占位 + <img> 做清晰层；脱离容器后
+ * 占位层也绝对定位膨胀，直接隐藏——card 里只需实际 <img>。 */
+.dualang-media[data-testid="tweetPhoto"] > div {
+  display: none;
+}
 .dualang-media img,
 .dualang-media video {
+  position: static !important;
+  width: auto !important;
+  height: auto !important;
+  inset: unset !important;
   max-width: 100%;
-  height: auto;
   border-radius: 12px;
 }
 /* 模型吞掉占位符时的兜底：追加在译文末尾，比正文略低调 */
@@ -254,6 +272,21 @@ article[data-dualang-mode="bilingual"] .dualang-translation {
   opacity: 0.45;
   cursor: default;
 }
+
+/* ===== 长文 inline CTA 链接 ===== */
+.dualang-long-cta {
+  display: block;
+  text-align: right;
+  margin-bottom: 8px;
+  font-size: 13px;
+  color: #1d9bf0;
+  cursor: pointer;
+  text-decoration: none;
+  user-select: none;
+  transition: opacity 0.15s;
+}
+.dualang-long-cta:hover { text-decoration: underline; }
+.dualang-long-cta[data-state="translating"] { color: var(--dl-text-muted); }
 
 /* ===== 翻译状态指示器 ===== */
 .dualang-status {
@@ -808,6 +841,8 @@ article[data-dualang-mode="bilingual"] .dualang-translation {
 .dualang-inline-translation {
   color: var(--dl-text-secondary);
   margin: 6px 0 12px 0;
+  padding-left: 12px;
+  border-left: 2.5px solid transparent;
   white-space: pre-wrap;
   word-wrap: break-word;
   min-height: 1.2em;
@@ -818,6 +853,12 @@ article[data-dualang-mode="bilingual"] .dualang-translation {
   background-size: 200% 100%;
   animation: dualang-slot-pulse 1.6s ease-in-out infinite;
   border-radius: 4px;
+  border-left-color: transparent;
 }
 .dualang-inline-translation--img::before { content: "🖼 "; opacity: 0.6; }
-.dualang-inline-translation--filled { animation: dualang-slot-fadein 0.35s ease-out; }
+.dualang-inline-translation--filled {
+  animation: dualang-slot-fadein 0.35s ease-out;
+  border-left-color: var(--dl-sf-accent);
+  background: var(--dl-sf-accent-bg);
+  border-radius: 0 4px 4px 0;
+}
