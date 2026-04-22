@@ -4,7 +4,12 @@
  * 不修改页面 / 设置；仅挂 console listener。60s 超时或收到 done 事件后退出并汇报。
  */
 
-import playwright from '/Users/tedeyang/GitHub/dualang/e2e/node_modules/playwright/index.js';
+import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+const require = createRequire(import.meta.url);
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const playwright = require(join(__dirname, '../e2e/node_modules/playwright'));
 const { chromium } = playwright;
 
 const CDP_URL = 'http://localhost:9222';
