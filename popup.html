@@ -19,42 +19,16 @@
     </div>
 
     <div class="tabs" role="tablist">
-      <button class="tab-button active" data-tab="main" role="tab">主</button>
+      <button class="tab-button active" data-tab="translation" role="tab">翻译</button>
       <button class="tab-button" data-tab="providers" role="tab">Providers</button>
+      <button class="tab-button" data-tab="main" role="tab">主（旧）</button>
       <button class="tab-button" data-tab="speed" role="tab">兜底 & 加速</button>
       <button class="tab-button" data-tab="stats" role="tab">统计</button>
       <button class="tab-button" data-tab="advanced" role="tab">高级</button>
     </div>
 
-    <!-- ===== Tab: 主 ===== -->
-    <div class="tab-panel active" data-panel="main">
-      <div class="form-group">
-        <label for="preset">模型提供方</label>
-        <select id="preset">
-          <optgroup label="⭐ 推荐（bench v2 实测）">
-            <option value="siliconflow-glm-4-9b">SiliconFlow GLM-4-9B · 1.9s · 质量 8.7 · 免费（默认）</option>
-          </optgroup>
-          <optgroup label="其他免费">
-            <option value="siliconflow-qwen3-8b">SiliconFlow Qwen3-8B · 4.0s · 质量 8.5</option>
-          </optgroup>
-          <option value="custom">自定义</option>
-        </select>
-        <p class="hint">延迟与质量来自内部基准测试（2026-04-18）。</p>
-      </div>
-      <div class="form-group">
-        <label for="baseUrl">API 地址</label>
-        <input type="text" id="baseUrl" placeholder="https://api.siliconflow.cn/v1">
-      </div>
-      <div class="form-group">
-        <label for="apiKey">API Key</label>
-        <input type="password" id="apiKey" placeholder="sk-...">
-        <p class="hint" id="apiKeyHint">在 <a href="https://cloud.siliconflow.cn/" target="_blank">SiliconFlow</a> 获取免费 API Key</p>
-      </div>
-      <div class="form-group">
-        <label for="model">模型名</label>
-        <input type="text" id="model" placeholder="THUDM/GLM-4-9B-0414">
-      </div>
-
+    <!-- ===== Tab: 翻译（全局翻译行为 —— 与具体 provider 无关） ===== -->
+    <div class="tab-panel active" data-panel="translation">
       <div class="form-group">
         <label for="targetLang">目标语言</label>
         <select id="targetLang">
@@ -97,13 +71,53 @@
         <label class="toggle"><input type="checkbox" id="smartDictEnabled"><span class="slider"></span></label>
         <span class="toggle-label">智能字典（仅英文原文）</span>
       </div>
+
+      <div class="form-group toggle-group">
+        <label class="toggle"><input type="checkbox" id="enableStreaming"><span class="slider"></span></label>
+        <span class="toggle-label">流式输出（SSE）</span>
+      </div>
+      <p class="hint" style="margin-top:-8px; margin-bottom:10px;">逐条翻译结果实时渲染，但缓存对此模式不生效</p>
     </div>
 
-    <!-- ===== Tab: Providers（智能路由器 — P2 MVP） ===== -->
+    <!-- ===== Tab: 主（旧） —— Providers 没配好时的回退，仅为老用户保留 ===== -->
+    <div class="tab-panel" data-panel="main">
+      <p class="hint" style="margin-bottom:10px;">
+        💡 推荐在 <strong>Providers</strong> 标签中管理模型；此处仅作为 Providers 列表为空时的回退配置，
+        保留是为了老用户无缝迁移。
+      </p>
+      <div class="form-group">
+        <label for="preset">模型提供方</label>
+        <select id="preset">
+          <optgroup label="⭐ 推荐（bench v2 实测）">
+            <option value="siliconflow-glm-4-9b">SiliconFlow GLM-4-9B · 1.9s · 质量 8.7 · 免费（默认）</option>
+          </optgroup>
+          <optgroup label="其他免费">
+            <option value="siliconflow-qwen3-8b">SiliconFlow Qwen3-8B · 4.0s · 质量 8.5</option>
+          </optgroup>
+          <option value="custom">自定义</option>
+        </select>
+        <p class="hint">延迟与质量来自内部基准测试（2026-04-18）。</p>
+      </div>
+      <div class="form-group">
+        <label for="baseUrl">API 地址</label>
+        <input type="text" id="baseUrl" placeholder="https://api.siliconflow.cn/v1">
+      </div>
+      <div class="form-group">
+        <label for="apiKey">API Key</label>
+        <input type="password" id="apiKey" placeholder="sk-...">
+        <p class="hint" id="apiKeyHint">在 <a href="https://cloud.siliconflow.cn/" target="_blank">SiliconFlow</a> 获取免费 API Key</p>
+      </div>
+      <div class="form-group">
+        <label for="model">模型名</label>
+        <input type="text" id="model" placeholder="THUDM/GLM-4-9B-0414">
+      </div>
+    </div>
+
+    <!-- ===== Tab: Providers（智能路由器） ===== -->
     <div class="tab-panel" data-panel="providers">
       <p class="hint" style="margin-bottom:10px;">
-        多模型接力与智能路由的底座；这里的列表将供未来的路由器使用。
-        当前版本翻译仍走"主"/"兜底"标签下的配置。
+        管理用于翻译的模型 API。列表首条是 <strong>主</strong>、次条是 <strong>备</strong>；
+        主调用失败时会自动切备。每条可单独测试能力（短/中/长 + 批量 + 流式）。
       </p>
 
       <div id="providerAddForm" class="provider-add" style="display:none;">
@@ -245,11 +259,6 @@
         <label for="maxTokens">最大输出 Token / 条</label>
         <input type="number" id="maxTokens" min="1" max="128000" step="1">
       </div>
-      <div class="form-group toggle-group">
-        <label class="toggle"><input type="checkbox" id="enableStreaming"><span class="slider"></span></label>
-        <span class="toggle-label">启用流式输出（SSE）</span>
-      </div>
-      <p class="hint" style="margin-top:-8px; margin-bottom:4px;">逐条翻译结果实时渲染，但缓存对此模式不生效</p>
     </div>
 
     <button id="saveBtn" class="btn-primary" style="margin-top:16px;">保存设置</button>

@@ -72,6 +72,9 @@ describe('validateProviderForm', () => {
   it('apiKey required', () => {
     expect(validateProviderForm({ ...base, apiKey: '' })).toMatch(/API Key/);
   });
+  it('apiKey optional in edit mode', () => {
+    expect(validateProviderForm({ ...base, apiKey: '' }, { requireApiKey: false })).toBeNull();
+  });
 });
 
 describe('buildProviderEntry', () => {
