@@ -36,3 +36,12 @@ e2e/test-results/
 
 # Development process docs (kept locally, not in git)
 docs/superpowers/
+
+# Ad-hoc CDP debug probes (one-off scripts; scripts/cdp-probe-dict.mjs IS tracked)
+scripts/cdp-click-and-monitor.mjs
+scripts/cdp-click-and-watch-fusion.mjs
+scripts/cdp-passive-watch.mjs
+scripts/cdp-probe-long-article.mjs
+scripts/cdp-probe-long-article-deep.mjs
+scripts/cdp-reload-and-probe.mjs
+scripts/cdp-super-fine-completion.mjs
