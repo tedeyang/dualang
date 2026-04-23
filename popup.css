@@ -526,6 +526,53 @@ select:focus {
   margin-bottom: 10px;
   background: #0a1a26;
 }
+
+.routing-config {
+  border: 1px solid #2f3336;
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: #0a0a0a;
+}
+.routing-config__title {
+  font-size: 11px;
+  font-weight: 700;
+  color: #1d9bf0;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+.routing-config__modes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.routing-config__modes label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.routing-config__pref {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: #71767b;
+  margin-bottom: 4px;
+}
+.routing-config__pref input[type="range"] {
+  flex: 1;
+  accent-color: #1d9bf0;
+}
+.routing-config__pref-val {
+  min-width: 36px;
+  text-align: right;
+  color: #1d9bf0;
+  font-weight: 600;
+}
 .provider-card__sample {
   margin-top: 8px;
   padding: 8px;

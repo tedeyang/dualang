@@ -205,6 +205,130 @@ describe('selectCandidates', () => {
   });
 });
 
+describe('selectCandidates — smart mode', () => {
+  beforeEach(resetStorage);
+
+  it('enumerates all enabled, not just primary/secondary', async () => {
+    await storageMod.saveProviders([
+      mkEntry('p1', 'https://a/v1', 'Ma'),
+      mkEntry('p2', 'https://b/v1', 'Mb'),
+      mkEntry('p3', 'https://c/v1', 'Mc'),
+    ]);
+    await storageMod.setApiKey('p1', 'k1');
+    await storageMod.setApiKey('p2', 'k2');
+    await storageMod.setApiKey('p3', 'k3');
+    await storageMod.setRoutingSettings({
+      mode: 'smart', preference: 0.5, concurrency: 1,
+      primaryId: 'p1', // should be ignored in smart mode
+    });
+    const cands = await selectCandidates({ kind: 'batch' });
+    expect(cands).toHaveLength(3);
+    // 所有都是 untested → 得分相同，排序可能不稳定；只验证全部返回
+    expect(cands.map((c) => c.id).sort()).toEqual(['p1', 'p2', 'p3']);
+  });
+
+  it('sorts by score descending (fast provider wins)', async () => {
+    await storageMod.saveProviders([
+      mkEntry('p-slow', 'https://slow/v1', 'M'),
+      mkEntry('p-fast', 'https://fast/v1', 'M'),
+    ]);
+    await storageMod.setApiKey('p-slow', 'k');
+    await storageMod.setApiKey('p-fast', 'k');
+    await storageMod.setRoutingSettings({
+      mode: 'smart', preference: 0, concurrency: 1,  // pref=0 → all weight on speed
+    });
+    const { createEWMA } = await import('../../shared/ewma');
+    await storageMod.setPerformance('p-slow', {
+      rttMs: { short: createEWMA(5000), medium: createEWMA(), long: createEWMA() },
+      tokensPerSec: createEWMA(),
+      successRate: createEWMA(1),
+      qualityScore: createEWMA(1),
+      lastSampleAt: Date.now(),
+    });
+    await storageMod.setPerformance('p-fast', {
+      rttMs: { short: createEWMA(200), medium: createEWMA(), long: createEWMA() },
+      tokensPerSec: createEWMA(),
+      successRate: createEWMA(1),
+      qualityScore: createEWMA(1),
+      lastSampleAt: Date.now(),
+    });
+    const cands = await selectCandidates({ kind: 'batch', originalChars: 50 });
+    expect(cands[0].id).toBe('p-fast');
+    expect(cands[1].id).toBe('p-slow');
+    expect(cands[0].scoring?.score).toBeGreaterThan(cands[1].scoring!.score);
+  });
+
+  it('filters out PERMANENT_DISABLED', async () => {
+    await storageMod.saveProviders([
+      mkEntry('p1', 'https://a/v1', 'M'),
+      mkEntry('p2', 'https://b/v1', 'M'),
+    ]);
+    await storageMod.setApiKey('p1', 'k1');
+    await storageMod.setApiKey('p2', 'k2');
+    await storageMod.setCircuit('p1', {
+      ...createCircuitRecord(),
+      state: 'PERMANENT_DISABLED',
+    });
+    await storageMod.setRoutingSettings({
+      mode: 'smart', preference: 0.5, concurrency: 1,
+    });
+    const cands = await selectCandidates({ kind: 'batch' });
+    expect(cands.map((c) => c.id)).toEqual(['p2']);
+  });
+
+  it('filters out batch=broken when ctx.kind=batch', async () => {
+    await storageMod.saveProviders([
+      mkEntry('p1', 'https://a/v1', 'M'),
+      mkEntry('p2', 'https://b/v1', 'M'),
+    ]);
+    await storageMod.setApiKey('p1', 'k1');
+    await storageMod.setApiKey('p2', 'k2');
+    await storageMod.setCapability('p1', {
+      batch: 'broken', streaming: 'proven', thinkingMode: 'optional', observedAt: 0,
+    });
+    await storageMod.setRoutingSettings({
+      mode: 'smart', preference: 0.5, concurrency: 1,
+    });
+    const batchOnly = await selectCandidates({ kind: 'batch' });
+    expect(batchOnly.map((c) => c.id)).toEqual(['p2']);
+    // single 模式下 p1 未被否决
+    const single = await selectCandidates({ kind: 'single' });
+    expect(single.map((c) => c.id).sort()).toEqual(['p1', 'p2']);
+  });
+
+  it('PROBING probeWeight shrinks score (still included but demoted)', async () => {
+    await storageMod.saveProviders([
+      mkEntry('p-probing', 'https://a/v1', 'M'),
+      mkEntry('p-healthy', 'https://b/v1', 'M'),
+    ]);
+    await storageMod.setApiKey('p-probing', 'k1');
+    await storageMod.setApiKey('p-healthy', 'k2');
+    // Both have identical profile, but p-probing is in PROBING with weight 0.1
+    const { createEWMA } = await import('../../shared/ewma');
+    const perf = {
+      rttMs: { short: createEWMA(500), medium: createEWMA(), long: createEWMA() },
+      tokensPerSec: createEWMA(),
+      successRate: createEWMA(1),
+      qualityScore: createEWMA(1),
+      lastSampleAt: Date.now(),
+    };
+    await storageMod.setPerformance('p-probing', perf);
+    await storageMod.setPerformance('p-healthy', perf);
+    await storageMod.setCircuit('p-probing', {
+      ...createCircuitRecord(),
+      state: 'PROBING',
+      probeWeight: 0.1,
+    });
+    await storageMod.setRoutingSettings({
+      mode: 'smart', preference: 0.5, concurrency: 1,
+    });
+    const cands = await selectCandidates({ kind: 'batch' });
+    expect(cands[0].id).toBe('p-healthy');
+    expect(cands[1].id).toBe('p-probing');
+    expect(cands[0].scoring!.score).toBeGreaterThan(cands[1].scoring!.score * 5);
+  });
+});
+
 describe('resolveSettings', () => {
   beforeEach(resetStorage);
 

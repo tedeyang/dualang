@@ -17,9 +17,11 @@ import {
   setApiKey,
   getCapability,
   getCircuit,
+  getRoutingSettings,
+  setRoutingSettings,
 } from '../background/router/storage';
 import { makeProviderId } from '../background/router/migration';
-import type { ProviderEntry } from '../shared/router-types';
+import type { ProviderEntry, RoutingMode } from '../shared/router-types';
 
 function escapeText(s: unknown): string {
   return String(s ?? '').replace(/[&<>"']/g, (c) =>
@@ -195,6 +197,48 @@ export async function initProvidersTab(): Promise<void> {
   const modelEl = byId<HTMLInputElement>('pfModel');
   const keyEl = byId<HTMLInputElement>('pfApiKey');
   const tagsEl = byId<HTMLInputElement>('pfTags');
+  const rmFailover = byId<HTMLInputElement>('rmFailover');
+  const rmSmart = byId<HTMLInputElement>('rmSmart');
+  const prefSlider = byId<HTMLInputElement>('prefSlider');
+  const prefValLabel = byId<HTMLSpanElement>('prefValLabel');
+  const prefRow = byId<HTMLDivElement>('prefRow');
+  const routingHint = byId<HTMLParagraphElement>('routingHint');
+
+  // 加载路由配置并初始化 UI
+  const routing = await getRoutingSettings();
+  rmFailover.checked = routing.mode === 'failover';
+  rmSmart.checked = routing.mode === 'smart';
+  prefSlider.value = String(Math.round(routing.preference * 100));
+  prefValLabel.textContent = `${prefSlider.value}%`;
+  updateRoutingHint(routing.mode);
+  updatePrefVisibility(routing.mode);
+
+  function updateRoutingHint(mode: RoutingMode) {
+    routingHint.textContent = mode === 'failover'
+      ? '主从等价于现有行为：primary → secondary 顺序回退。'
+      : '智能按 speed/quality/load/stability 综合评分动态选最优 provider。';
+  }
+  function updatePrefVisibility(mode: RoutingMode) {
+    prefRow.style.opacity = mode === 'smart' ? '1' : '0.45';
+    prefSlider.disabled = mode !== 'smart';
+  }
+
+  async function saveRouting() {
+    const mode: RoutingMode = rmSmart.checked ? 'smart' : 'failover';
+    const preference = parseInt(prefSlider.value, 10) / 100;
+    await setRoutingSettings({ ...routing, mode, preference });
+    routing.mode = mode;
+    routing.preference = preference;
+    updateRoutingHint(mode);
+    updatePrefVisibility(mode);
+  }
+
+  rmFailover.addEventListener('change', saveRouting);
+  rmSmart.addEventListener('change', saveRouting);
+  prefSlider.addEventListener('input', () => {
+    prefValLabel.textContent = `${prefSlider.value}%`;
+  });
+  prefSlider.addEventListener('change', saveRouting);
 
   async function refresh() {
     const providers = await listProviders();

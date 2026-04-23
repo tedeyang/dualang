@@ -115,9 +115,24 @@
 
     <!-- ===== Tab: Providers（智能路由器） ===== -->
     <div class="tab-panel" data-panel="providers">
+      <div class="routing-config">
+        <div class="routing-config__title">路由模式</div>
+        <div class="routing-config__modes">
+          <label><input type="radio" name="routingMode" value="failover" id="rmFailover"> 主从（按固定顺序）</label>
+          <label><input type="radio" name="routingMode" value="smart" id="rmSmart"> 智能（按评分动态选）</label>
+        </div>
+        <div class="routing-config__pref" id="prefRow">
+          <span>最快</span>
+          <input type="range" min="0" max="100" step="5" id="prefSlider" value="50">
+          <span>最好</span>
+          <span class="routing-config__pref-val" id="prefValLabel">50%</span>
+        </div>
+        <p class="hint" id="routingHint">主从等价于现有行为：primary → secondary 顺序回退。</p>
+      </div>
+
       <p class="hint" style="margin-bottom:10px;">
-        管理用于翻译的模型 API。列表首条是 <strong>主</strong>、次条是 <strong>备</strong>；
-        主调用失败时会自动切备。每条可单独测试能力（短/中/长 + 批量 + 流式）。
+        管理用于翻译的模型 API。主从模式下首条是主、次条是备；智能模式下按综合评分挑选。
+        每条可单独测试能力（短/中/长 + 批量 + 流式）。
       </p>
 
       <div id="providerAddForm" class="provider-add" style="display:none;">
