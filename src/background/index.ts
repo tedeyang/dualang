@@ -19,6 +19,8 @@ import {
   getApiKey as routerGetApiKey,
   setCapability as routerSetCapability,
   setPerformance as routerSetPerformance,
+  getCircuit as routerGetCircuit,
+  getPerformance as routerGetPerformance,
 } from './router/storage';
 import { recordOutcome as routerRecordOutcome, classifyErrorKind } from './router/recorder';
 import { getEffectiveSettings } from './router/service';
@@ -255,6 +257,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
   if (request.action === 'getStats') {
     getStats().then(data => sendResponse({ success: true, data }));
+    return true;
+  }
+  if (request.action === 'getRouterStats') {
+    (async () => {
+      const providers = await routerListProviders();
+      const rows = await Promise.all(providers.map(async (p) => {
+        const [circuit, performance, hasKey] = await Promise.all([
+          routerGetCircuit(p.id),
+          routerGetPerformance(p.id),
+          routerGetApiKey(p.id).then(k => !!k),
+        ]);
+        return { id: p.id, label: p.label, model: p.model, baseUrl: p.baseUrl, enabled: p.enabled, hasKey, circuit, performance };
+      }));
+      sendResponse({ success: true, data: { providers: rows } });
+    })();
     return true;
   }
   if (request.action === 'getRecentRtt') {

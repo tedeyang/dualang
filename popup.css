@@ -388,6 +388,65 @@ select:focus {
   font-family: ui-monospace, SFMono-Regular, monospace;
 }
 
+/* ===== Router Health Panel ===== */
+.router-health-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rh-row {
+  padding: 8px 10px;
+  background: #0c0d10;
+  border: 1px solid #2f3336;
+  border-radius: 8px;
+}
+
+.rh-row__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.rh-row__label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #e7e9ea;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rh-row__metrics {
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  color: #71767b;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+
+.rh-row__metrics strong {
+  color: #e7e9ea;
+  font-weight: 600;
+}
+
+.circuit-badge {
+  font-size: 10px;
+  font-weight: 700;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  padding: 1px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  letter-spacing: 0.02em;
+}
+
+.circuit-badge--healthy  { background: rgba(0,186,124,0.18); color: #00ba7c; }
+.circuit-badge--probing  { background: rgba(247,168,0,0.18);  color: #f7a800; }
+.circuit-badge--cooling  { background: rgba(244,33,46,0.18);  color: #f4212e; }
+.circuit-badge--disabled { background: rgba(113,118,123,0.18); color: #71767b; }
+.circuit-badge--unknown  { background: rgba(113,118,123,0.12); color: #71767b; }
+
 .error-log {
   list-style: none;
   max-height: 140px;

@@ -256,6 +256,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const statTotalTokens = document.getElementById('statTotalTokens');
   const statCacheHitRate = document.getElementById('statCacheHitRate');
   const modelStatsList = document.getElementById('modelStatsList');
+  const routerHealthList = document.getElementById('routerHealthList');
   const errorLogList = document.getElementById('errorLogList');
   const refreshStatsBtn = document.getElementById('refreshStatsBtn');
   const resetStatsBtn = document.getElementById('resetStatsBtn');
@@ -371,10 +372,73 @@ document.addEventListener('DOMContentLoaded', async () => {
     return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
 
+  function circuitBadgeHtml(circuit: any): string {
+    if (!circuit) return '<span class="circuit-badge circuit-badge--unknown">未测</span>';
+    const state: string = circuit.state;
+    if (state === 'HEALTHY') return '<span class="circuit-badge circuit-badge--healthy">HEALTHY</span>';
+    if (state === 'PROBING') return '<span class="circuit-badge circuit-badge--probing">PROBING</span>';
+    if (state === 'COOLING') {
+      const mins = Math.max(0, Math.ceil((circuit.cooldownUntil - Date.now()) / 60_000));
+      return `<span class="circuit-badge circuit-badge--cooling">COOLING${mins > 0 ? ' ' + mins + 'min' : ''}</span>`;
+    }
+    if (state === 'PERMANENT_DISABLED') return '<span class="circuit-badge circuit-badge--disabled">DISABLED</span>';
+    return `<span class="circuit-badge circuit-badge--unknown">${escapeText(state)}</span>`;
+  }
+
+  function fmtEWMA(ewma: any, pct = false): string {
+    if (!ewma || ewma.count === 0) return '–';
+    return pct ? (ewma.value * 100).toFixed(0) + '%' : Math.round(ewma.value).toString();
+  }
+
+  function bestRttEWMA(rttMs: any): number | null {
+    if (!rttMs) return null;
+    for (const tier of ['short', 'medium', 'long']) {
+      if (rttMs[tier]?.count > 0) return Math.round(rttMs[tier].value);
+    }
+    return null;
+  }
+
+  function renderRouterHealth(data: any) {
+    if (!routerHealthList) return;
+    const providers: any[] = data?.providers || [];
+    if (!providers.length) {
+      routerHealthList.innerHTML = '<div class="stats-empty">暂无 Provider 数据</div>';
+      return;
+    }
+    routerHealthList.innerHTML = '';
+    for (const p of providers) {
+      const rtt = bestRttEWMA(p.performance?.rttMs);
+      const qualScore = p.performance?.qualityScore;
+      const succRate = p.performance?.successRate;
+      const probeInfo = p.circuit?.state === 'PROBING'
+        ? `<span>探针 <strong>${((p.circuit.probeWeight || 0) * 100).toFixed(0)}%</strong></span>`
+        : '';
+      const row = document.createElement('div');
+      row.className = 'rh-row';
+      row.innerHTML = `
+        <div class="rh-row__head">
+          ${circuitBadgeHtml(p.circuit)}
+          <span class="rh-row__label" title="${escapeText(p.model)}">${escapeText(p.label)}</span>
+        </div>
+        <div class="rh-row__metrics">
+          <span>质量 <strong>${fmtEWMA(qualScore, true)}</strong></span>
+          <span>成功 <strong>${fmtEWMA(succRate, true)}</strong></span>
+          <span>RTT <strong>${rtt === null ? '–' : rtt + 'ms'}</strong></span>
+          ${probeInfo}
+        </div>
+      `;
+      routerHealthList.appendChild(row);
+    }
+  }
+
   async function fetchAndRenderStats() {
     try {
-      const resp = await chrome.runtime.sendMessage({ action: 'getStats' });
-      if (resp?.success) renderStats(resp.data);
+      const [statsResp, routerResp] = await Promise.all([
+        chrome.runtime.sendMessage({ action: 'getStats' }),
+        chrome.runtime.sendMessage({ action: 'getRouterStats' }),
+      ]);
+      if (statsResp?.success) renderStats(statsResp.data);
+      if (routerResp?.success) renderRouterHealth(routerResp.data);
     } catch (_) {}
   }
 
