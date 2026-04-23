@@ -21,6 +21,7 @@ import {
   setPerformance as routerSetPerformance,
 } from './router/storage';
 import { recordOutcome as routerRecordOutcome, classifyErrorKind } from './router/recorder';
+import { getEffectiveSettings } from './router/service';
 
 // ===================== Router 数据迁移（幂等）=====================
 // SW 启动和 popup 打开都会触发；版本戳控制单次执行。
@@ -337,7 +338,9 @@ async function handleAnnotateDictionary(payload: any) {
 }
 
 async function handleTranslate(payload: any) {
-  const settings = await getSettings();
+  // P5: router 把 primary provider 注入到 settings 的 {apiKey,baseUrl,model} 字段，
+  // secondary 注入到 {fallback*}。无 primary 时 fall back 到 legacy getSettings。
+  const settings = await getEffectiveSettings({ kind: 'batch' });
   console.log('[Dualang] translate config baseUrl=', settings.baseUrl, 'model=', settings.model, 'priority=', payload.priority);
 
   if (payload.texts && Array.isArray(payload.texts)) {
@@ -390,7 +393,7 @@ async function handleTranslate(payload: any) {
 
 async function handleTranslateStream(payload: any, port: chrome.runtime.Port) {
   try {
-    const baseSettings = await getSettings();
+    const baseSettings = await getEffectiveSettings({ kind: 'batch' });
     const settings = payload.retranslateBoost
       ? ({ ...baseSettings, temperatureBoost: 0.3, retranslateBoost: true } as typeof baseSettings)
       : baseSettings;
@@ -427,7 +430,7 @@ async function handleTranslateStream(payload: any, port: chrome.runtime.Port) {
     }
 
     const totalChars = toTranslateTexts.reduce((sum, t) => sum + t.length, 0);
-    const maxTokens = parseInt(settings.maxTokens, 10) || 4096;
+    const maxTokens = parseInt(String(settings.maxTokens ?? ''), 10) || 4096;
     const tokenEstimate = Math.ceil((totalChars + maxTokens * toTranslateTexts.length) / 2);
     const priority = payload.priority || 0;
     const registerTask = await rateLimiter.acquire(tokenEstimate, priority);
