@@ -434,6 +434,11 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
     tpmLog: Array<{ t: number; tokens: number }>;
     cooldownUntil: number;  // epoch ms；0 = 立即可用
     disabled?: boolean;     // 永久故障（认证错/模型不存在等不可恢复错）永久剔除
+    // batch: 用 <tN>...</tN> 协议一次出 N 段译文（高效、低 token 开销）
+    // single: 拆成 N 个并行单条调用（兼容性高 —— 即便模型 batch 协议不稳也能接力，
+    //         代价是 prompt 头部重复 N 次、token 多 ~2-3x）
+    mode: 'batch' | 'single';
+    singleConcurrency?: number;  // single 模式内并行度，默认 3
   };
   /** 识别永久性错误：认证、模型不存在、参数错。这些不会"冷一会儿就好"，直接剔除。*/
   const isPermanentError = (msg: string) =>
@@ -481,11 +486,13 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
       if (!moonshotKey) throw new Error('Moonshot 模型需要 API Key；请在 config.json 的 providers.moonshot.apiKey 填入');
       slots.push({
         label: `moonshot:${payload.model}`, budget: MOONSHOT_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
+        mode: 'batch',
         settings: buildSuperFineSettings(baseSettings, { model: payload.model, apiKey: moonshotKey }),
       });
       if (baseSettings.apiKey) {
         slots.push({
           label: `primary:${baseSettings.model}`, budget: SF_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
+          mode: 'batch',
           settings: buildSuperFineSettings(baseSettings),
         });
       }
@@ -493,22 +500,26 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
       if (!baseSettings.apiKey) throw new Error('精翻需要 API Key；请在 popup 设置或 config.json 填入 SiliconFlow key');
       slots.push({
         label: `primary:${baseSettings.model}`, budget: SF_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
+        mode: 'batch',
         settings: buildSuperFineSettings(baseSettings),
       });
-      // 有 Moonshot key 就自动挂为接力路（独立账号 = 独立 TPM 桶，真正能接力）
-      // 硅基同账号接力（实测：同账号不同模型是独立 TPM 桶；零配置即可加速）。
-      // 选 Qwen3.5-9B 作接力：与 GLM-4-9B 同档（速度/质量相近），免费。
-      // 仅当主模型不是 Qwen3.5-9B 自己时加入，避免 self-relay 无意义。
-      if (!/Qwen3\.5-9B/i.test(baseSettings.model || '')) {
+      // 硅基同账号接力（实测：同账号不同模型是独立 TPM 桶）。
+      // batch 协议候选模型实测都崩（Qwen2.5-7B 标签全乱、Qwen3.5-9B reasoning 漏字、
+      // internlm 服务端 500），但 single 调用质量都过关。
+      // 用 single 模式接力 —— 多花 ~2-3x token 换更广接力面 + 0 协议风险。
+      if (!/Qwen2\.5-7B/i.test(baseSettings.model || '')) {
         slots.push({
-          label: 'sf-relay:Qwen/Qwen3.5-9B', budget: SF_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
-          settings: { ...buildSuperFineSettings(baseSettings), model: 'Qwen/Qwen3.5-9B' },
+          label: 'sf-single:Qwen/Qwen2.5-7B-Instruct',
+          budget: SF_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
+          mode: 'single', singleConcurrency: 3,
+          settings: { ...buildSuperFineSettings(baseSettings), model: 'Qwen/Qwen2.5-7B-Instruct' },
         });
       }
-      // Moonshot 锦上添花（独立账号 = 完全独立桶，且 TPM 配额最高）
+      // Moonshot 锦上添花（独立账号 = 完全独立桶，且 batch 协议稳）
       if (moonshotKey) {
         slots.push({
           label: 'moonshot:moonshot-v1-8k', budget: MOONSHOT_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
+          mode: 'batch',
           settings: buildSuperFineSettings(baseSettings, { model: 'moonshot-v1-8k', apiKey: moonshotKey }),
         });
       }
@@ -556,7 +567,8 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
       const start = ci * CHUNK;
       const chunk = paragraphs.slice(start, start + CHUNK);
 
-      const runChunkOn = async (slot: Slot) => {
+      // batch 模式：一次 <tN>...</tN> 协议出 N 段（默认；token 高效）
+      const runChunkBatch = async (slot: Slot) => {
         const pushedIndices = new Set<number>();
         const result = await doTranslateBatchStream(
           chunk, slot.settings, abortController.signal,
@@ -583,6 +595,41 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
         totalTokens += chunkTokens;
         slot.tpmLog.push({ t: Date.now(), tokens: chunkTokens });
       };
+
+      // single 模式：拆 N 个并行单条调用，绕开 batch 协议（兼容性兜底）
+      // 任一段非 TPM 错就抛给上层走 slot 切换；TPM 错继续等下一 chunk 走 cooldown
+      const runChunkSingle = async (slot: Slot) => {
+        const concurrency = Math.min(slot.singleConcurrency || 3, chunk.length);
+        let chunkTokens = 0;
+        let nextIdx = 0;
+        const worker = async () => {
+          while (true) {
+            const subIdx = nextIdx++;
+            if (subIdx >= chunk.length) break;
+            if (disconnected || abortController.signal.aborted) return;
+            const text = chunk[subIdx];
+            const r: any = await doTranslateSingle(text, slot.settings, abortController.signal, true);
+            // doTranslateSingle 在流式路径返回 {translated}；非流式路径返回原始 OpenAI JSON
+            // ({choices:[{message:{content}}], usage, ...})。两种 shape 都要兼容，
+            // 否则 QWEN_LEGACY 这种强制 stream=false 的 profile 会被静默吞掉译文。
+            const translated = (r.translated
+              || r.translations?.[0]
+              || r.choices?.[0]?.message?.content
+              || '').trim();
+            chunkTokens += r.usage?.total_tokens || 0;
+            if (translated && !disconnected) {
+              port.postMessage({ action: 'partial', index: start + subIdx, translated });
+              completedParagraphs++;
+            }
+          }
+        };
+        await Promise.all(Array.from({ length: concurrency }, () => worker()));
+        totalTokens += chunkTokens;
+        slot.tpmLog.push({ t: Date.now(), tokens: chunkTokens });
+      };
+
+      const runChunkOn = async (slot: Slot) =>
+        slot.mode === 'single' ? runChunkSingle(slot) : runChunkBatch(slot);
 
       // 本 chunk 在 pool 里最多尝试 slots.length 次；每个 slot 最多试一次，挂了就冷却切下一个
       const triedLabels = new Set<string>();

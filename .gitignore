@@ -45,3 +45,5 @@ scripts/cdp-probe-long-article.mjs
 scripts/cdp-probe-long-article-deep.mjs
 scripts/cdp-reload-and-probe.mjs
 scripts/cdp-super-fine-completion.mjs
+scripts/cdp-sf-list-free-models.mjs
+scripts/cdp-sf-price-zero.mjs
