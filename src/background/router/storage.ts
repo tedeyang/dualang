@@ -101,17 +101,35 @@ async function writeMap<T>(key: string, map: Record<string, T>): Promise<void> {
   await writeRaw('local', key, map);
 }
 
+// 每个 map key 一条串行链 —— 并行 setCapability / setApiKey 等会踩 RMW 竞态，
+// 共同读到同样的旧 map 再各自覆盖。用 per-key promise chain 把读-改-写串起来，
+// 代价是同 key 写入变成串行；跨 key 仍然并行。
+const ioChain: Map<string, Promise<unknown>> = new Map();
+function withMapLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = ioChain.get(key) || Promise.resolve();
+  const next = prev.then(fn, fn);
+  ioChain.set(
+    key,
+    next.catch(() => {}),
+  );
+  return next;
+}
+
 async function setInMap<T>(key: string, id: string, value: T): Promise<void> {
-  const map = { ...(await readMap<T>(key)) };
-  map[id] = value;
-  await writeMap(key, map);
+  await withMapLock(key, async () => {
+    const map = { ...(await readMap<T>(key)) };
+    map[id] = value;
+    await writeMap(key, map);
+  });
 }
 
 async function deleteFromMap(key: string, id: string): Promise<void> {
-  const map = { ...(await readMap<unknown>(key)) };
-  if (!(id in map)) return;
-  delete map[id];
-  await writeMap(key, map);
+  await withMapLock(key, async () => {
+    const map = { ...(await readMap<unknown>(key)) };
+    if (!(id in map)) return;
+    delete map[id];
+    await writeMap(key, map);
+  });
 }
 
 // ============ API keys (local) ============

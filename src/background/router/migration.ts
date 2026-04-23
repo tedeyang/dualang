@@ -11,6 +11,7 @@ import {
   listProviders,
   saveProviders,
   setApiKey,
+  getApiKey,
   setRoutingSettings,
   isMigrationDone,
   markMigrationDone,
@@ -155,23 +156,44 @@ export function computeMigration(
   return { toWrite: Array.from(byId.values()), apiKeys, routing };
 }
 
-/** 运行迁移：读快照 → 计算 → 写存储 → 打版本戳 */
+/**
+ * 运行迁移。两段式：
+ *   A) 首次：建 providers 列表 + 写 routing + 打版本戳（只跑一次）
+ *   B) 每次：对 sync 里有但 apiKeys map 里没的 provider，从 legacy/cfg 反查并补 key。
+ *      这条是必须的 —— 首次运行时若 legacy.apiKey 尚空（SW 抢先于用户保存前触发），
+ *      A 段落标志位会锁住，不补 B 就无法再从 legacy 带出 key。
+ */
 export async function runMigration(
   legacy: LegacySettingsSnapshot,
   cfg: ConfigJsonSnapshot,
 ): Promise<MigrationResult> {
-  if (await isMigrationDone(ROUTER_MIGRATION_VERSION)) {
-    return { inserted: [], skipped: await listProviders(), routing: await getRoutingSettings() };
-  }
+  const migrationAlreadyDone = await isMigrationDone(ROUTER_MIGRATION_VERSION);
   const existing = await listProviders();
   const existingRouting = await getRoutingSettings();
   const existingIds = new Set(existing.map((p) => p.id));
   const { toWrite, apiKeys, routing } = computeMigration(legacy, cfg, existing, existingRouting);
-  await saveProviders(toWrite);
-  await Promise.all(Object.entries(apiKeys).map(([id, k]) => setApiKey(id, k)));
-  await setRoutingSettings(routing);
-  await markMigrationDone(ROUTER_MIGRATION_VERSION);
-  const inserted = toWrite.filter((p) => !existingIds.has(p.id));
+
+  // A) 首次建 providers + routing + 标志位
+  if (!migrationAlreadyDone) {
+    await saveProviders(toWrite);
+    await setRoutingSettings(routing);
+    await markMigrationDone(ROUTER_MIGRATION_VERSION);
+  }
+
+  // B) 每次：对"现存 providers 但还没 apiKey" 的，从 apiKeys map 里补
+  const currentProviders = await listProviders();
+  const missing: Array<[string, string]> = [];
+  for (const p of currentProviders) {
+    const derived = apiKeys[p.id];
+    if (!derived) continue;
+    const stored = await getApiKey(p.id);
+    if (!stored) missing.push([p.id, derived]);
+  }
+  await Promise.all(missing.map(([id, k]) => setApiKey(id, k)));
+
+  const inserted = migrationAlreadyDone
+    ? []
+    : toWrite.filter((p) => !existingIds.has(p.id));
   const skipped = toWrite.filter((p) => existingIds.has(p.id));
   return { inserted, skipped, routing };
 }
