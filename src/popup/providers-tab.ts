@@ -98,11 +98,38 @@ export function renderCardHtml(data: RenderedCardData): string {
       <div class="provider-card__pills">${pills.join('')}</div>
       <div class="provider-card__actions">
         <button data-action="toggle" class="btn-secondary">${p.enabled ? '禁用' : '启用'}</button>
-        <button data-action="test" class="btn-secondary" disabled title="P3 采样器开发中">测试</button>
+        <button data-action="test" class="btn-secondary" title="串行跑 short/medium/long single + batch-5 + stream；约 10K tokens">测试</button>
         <button data-action="delete" class="btn-secondary btn-danger">删除</button>
       </div>
+      <div class="provider-card__sample" data-role="sample-log" style="display:none;"></div>
     </div>
   `;
+}
+
+// ============ Sampler UI 辅助 ============
+
+const CASE_LABEL: Record<string, string> = {
+  'short-single': '短文',
+  'medium-single': '中文',
+  'long-single': '长文',
+  'batch-5': '批量×5',
+  'stream-medium': '流式',
+};
+
+function fmtCaseLine(msg: { type: string; result?: any; error?: string }): string {
+  if (msg.type === 'case' && msg.result) {
+    const r = msg.result;
+    const label = CASE_LABEL[r.name] || r.name;
+    const badge = r.ok ? '✓' : '✗';
+    const rtt = r.rttMs > 0 ? ` ${r.rttMs}ms` : '';
+    const errTail = r.error ? ` · ${r.error}` : '';
+    const cls = r.ok ? 'pill--ok' : 'pill--bad';
+    return `<div class="sample-line"><span class="pill ${cls}">${badge}</span> <span>${label}${rtt}${errTail}</span></div>`;
+  }
+  if (msg.type === 'error') {
+    return `<div class="sample-line"><span class="pill pill--bad">✗</span> <span>${msg.error || '未知错误'}</span></div>`;
+  }
+  return '';
 }
 
 /** 纯函数：校验新增 / 编辑表单输入 */
@@ -253,10 +280,62 @@ export async function initProvidersTab(): Promise<void> {
       return;
     }
     if (action === 'test') {
-      // P3 接入
+      runTest(card!, id);
       return;
     }
   });
+
+  function runTest(card: HTMLElement, providerId: string) {
+    const logEl = card.querySelector<HTMLDivElement>('[data-role="sample-log"]');
+    const buttons = card.querySelectorAll<HTMLButtonElement>('button');
+    if (!logEl) return;
+    buttons.forEach((b) => (b.disabled = true));
+    logEl.innerHTML = '<div class="sample-line"><span class="pill">⏳</span> <span>采样中…</span></div>';
+    logEl.style.display = '';
+
+    let port: chrome.runtime.Port | null = null;
+    try {
+      port = chrome.runtime.connect(undefined, { name: 'router-sample' });
+    } catch (e: any) {
+      logEl.innerHTML = `<div class="sample-line"><span class="pill pill--bad">✗</span> <span>连接 background 失败：${escapeText(e?.message || e)}</span></div>`;
+      buttons.forEach((b) => (b.disabled = false));
+      return;
+    }
+
+    let finished = false;
+    const cleanup = () => {
+      buttons.forEach((b) => (b.disabled = false));
+    };
+
+    port.onMessage.addListener((msg: any) => {
+      if (msg.type === 'case') {
+        logEl.insertAdjacentHTML('beforeend', fmtCaseLine(msg));
+      } else if (msg.type === 'done') {
+        finished = true;
+        logEl.insertAdjacentHTML(
+          'beforeend',
+          `<div class="sample-line"><span class="pill pill--ok">✓</span> <span>完成（${Math.round(msg.totalRttMs / 1000)}s）</span></div>`,
+        );
+        cleanup();
+        // 刷新卡片以应用新 capability pills
+        setTimeout(() => { refresh().catch(() => {}); }, 600);
+      } else if (msg.type === 'error') {
+        finished = true;
+        logEl.insertAdjacentHTML('beforeend', fmtCaseLine(msg));
+        cleanup();
+      }
+    });
+    port.onDisconnect.addListener(() => {
+      if (!finished) {
+        logEl.insertAdjacentHTML(
+          'beforeend',
+          '<div class="sample-line"><span class="pill pill--bad">✗</span> <span>连接被中断</span></div>',
+        );
+        cleanup();
+      }
+    });
+    port.postMessage({ action: 'start', providerId });
+  }
 
   await refresh();
 }

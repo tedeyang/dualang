@@ -13,6 +13,13 @@ import { extractDictionaryCandidates } from '../shared/english-candidates';
 import { filterHardCandidates } from './difficulty';
 import type { Settings, TokenUsage } from '../shared/types';
 import { runMigration as runRouterMigration } from './router/migration';
+import { runSampler, type SamplerCaseResult } from './router/sampler';
+import {
+  listProviders as routerListProviders,
+  getApiKey as routerGetApiKey,
+  setCapability as routerSetCapability,
+  setPerformance as routerSetPerformance,
+} from './router/storage';
 
 // ===================== Router 数据迁移（幂等）=====================
 // SW 启动和 popup 打开都会触发；版本戳控制单次执行。
@@ -65,8 +72,55 @@ chrome.runtime.onConnect.addListener((port) => {
         handleSuperFineStream(msg.payload, port);
       }
     });
+  } else if (port.name === 'router-sample') {
+    // 路由器 provider 采样端口：popup 触发，串行跑 battery 后持久化 capability + performance
+    const abortController = new AbortController();
+    port.onDisconnect.addListener(() => abortController.abort());
+    port.onMessage.addListener((msg) => {
+      if (msg.action === 'start' && msg.providerId) {
+        handleRouterSample(msg.providerId, port, abortController.signal);
+      }
+    });
   }
 });
+
+async function handleRouterSample(
+  providerId: string,
+  port: chrome.runtime.Port,
+  signal: AbortSignal,
+) {
+  try {
+    const all = await routerListProviders();
+    const provider = all.find((p) => p.id === providerId);
+    if (!provider) throw new Error(`provider 不存在: ${providerId}`);
+    const apiKey = await routerGetApiKey(providerId);
+    if (!apiKey) throw new Error('该 provider 未配置 API Key');
+
+    const result = await runSampler(
+      { provider, apiKey },
+      signal,
+      (caseResult: SamplerCaseResult) => {
+        try { port.postMessage({ type: 'case', result: caseResult }); } catch (_) {}
+      },
+    );
+    await Promise.all([
+      routerSetCapability(providerId, result.capability),
+      routerSetPerformance(providerId, result.performance),
+    ]);
+    try {
+      port.postMessage({
+        type: 'done',
+        capability: result.capability,
+        performance: result.performance,
+        totalRttMs: result.totalRttMs,
+      });
+    } catch (_) {}
+  } catch (e: any) {
+    try { port.postMessage({ type: 'error', error: (e?.message || String(e)).slice(0, 200) }); } catch (_) {}
+  } finally {
+    try { port.disconnect(); } catch (_) {}
+  }
+}
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create('keepalive', { periodInMinutes: 1 });

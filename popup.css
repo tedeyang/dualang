@@ -526,3 +526,20 @@ select:focus {
   margin-bottom: 10px;
   background: #0a1a26;
 }
+.provider-card__sample {
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid #2f3336;
+  border-radius: 8px;
+  background: #060606;
+  font-size: 11px;
+  color: #71767b;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sample-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
