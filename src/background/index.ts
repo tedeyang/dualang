@@ -12,6 +12,35 @@ import {
 import { extractDictionaryCandidates } from '../shared/english-candidates';
 import { filterHardCandidates } from './difficulty';
 import type { Settings, TokenUsage } from '../shared/types';
+import { runMigration as runRouterMigration } from './router/migration';
+
+// ===================== Router 数据迁移（幂等）=====================
+// SW 启动和 popup 打开都会触发；版本戳控制单次执行。
+async function maybeRunRouterMigration() {
+  try {
+    const s = await getSettings();
+    let cfg: any = {};
+    try {
+      const res = await fetch(chrome.runtime.getURL('config.json'));
+      if (res.ok) cfg = await res.json();
+    } catch (_) {}
+    await runRouterMigration(
+      {
+        apiKey: s.apiKey,
+        baseUrl: s.baseUrl,
+        model: s.model,
+        fallbackEnabled: s.fallbackEnabled,
+        fallbackApiKey: s.fallbackApiKey,
+        fallbackBaseUrl: s.fallbackBaseUrl,
+        fallbackModel: s.fallbackModel,
+      },
+      cfg,
+    );
+  } catch (e) {
+    console.warn('[router] migration failed (non-fatal):', e);
+  }
+}
+maybeRunRouterMigration();
 
 // ===================== 设置缓存失效 =====================
 chrome.storage.onChanged.addListener((changes, area) => {

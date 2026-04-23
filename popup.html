@@ -20,6 +20,7 @@
 
     <div class="tabs" role="tablist">
       <button class="tab-button active" data-tab="main" role="tab">主</button>
+      <button class="tab-button" data-tab="providers" role="tab">Providers</button>
       <button class="tab-button" data-tab="speed" role="tab">兜底 & 加速</button>
       <button class="tab-button" data-tab="stats" role="tab">统计</button>
       <button class="tab-button" data-tab="advanced" role="tab">高级</button>
@@ -95,6 +96,50 @@
       <div class="form-group toggle-group">
         <label class="toggle"><input type="checkbox" id="smartDictEnabled"><span class="slider"></span></label>
         <span class="toggle-label">智能字典（仅英文原文）</span>
+      </div>
+    </div>
+
+    <!-- ===== Tab: Providers（智能路由器 — P2 MVP） ===== -->
+    <div class="tab-panel" data-panel="providers">
+      <p class="hint" style="margin-bottom:10px;">
+        多模型接力与智能路由的底座；这里的列表将供未来的路由器使用。
+        当前版本翻译仍走"主"/"兜底"标签下的配置。
+      </p>
+
+      <div id="providerAddForm" class="provider-add" style="display:none;">
+        <div class="form-group">
+          <label for="pfLabel">名称</label>
+          <input type="text" id="pfLabel" placeholder="GLM-4-9B · SiliconFlow">
+        </div>
+        <div class="form-group">
+          <label for="pfBaseUrl">API 地址</label>
+          <input type="text" id="pfBaseUrl" placeholder="https://api.siliconflow.cn/v1">
+        </div>
+        <div class="form-group">
+          <label for="pfModel">模型名</label>
+          <input type="text" id="pfModel" placeholder="THUDM/GLM-4-9B-0414">
+        </div>
+        <div class="form-group">
+          <label for="pfApiKey">API Key</label>
+          <input type="password" id="pfApiKey" placeholder="sk-...">
+        </div>
+        <div class="form-group">
+          <label for="pfTags">标签（空格分隔，可选）</label>
+          <input type="text" id="pfTags" placeholder="free fast">
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button id="pfSaveBtn" class="btn-primary" style="flex:1;">保存</button>
+          <button id="pfCancelBtn" class="btn-secondary" style="flex:1;">取消</button>
+        </div>
+        <div id="pfError" class="status" style="display:none;"></div>
+      </div>
+
+      <button id="providerAddBtn" class="btn-secondary" style="width:100%; margin-bottom:10px;">
+        ＋ 添加 Provider
+      </button>
+
+      <div id="providerList" class="provider-list">
+        <div class="stats-empty">加载中...</div>
       </div>
     </div>
 

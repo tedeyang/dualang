@@ -21,7 +21,7 @@ cd e2e && npx playwright test tests/translation.spec.ts         # single spec
 cd e2e && npx playwright test --ui                              # Playwright UI
 ```
 
-**`content.js` / `background.js` are build outputs** — gitignored. Source of truth is `src/`. `popup.js` is legacy raw JS (not yet bundled; see TODO in popup refactor).
+**`content.js` / `background.js` / `popup.js` are build outputs** — gitignored. Source of truth is `src/`.
 
 ## Loading the Extension
 

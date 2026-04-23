@@ -1,5 +1,7 @@
 import { getModelMeta } from '../shared/model-meta';
 import { MODEL_PRESETS, detectPreset as detectPresetShared } from '../shared/model-presets';
+import { runMigration } from '../background/router/migration';
+import { initProvidersTab } from './providers-tab';
 
 // popup DOM 是静态的；找不到就是 HTML/bundle 不对应，快速失败比到处 null 检查更清晰
 function byId<T extends HTMLElement>(id: string): T {
@@ -143,6 +145,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     hedgedDelayModeSelect.value = exists ? optionValue : 'auto';
   }
   fallbackConfigDiv.style.display = settings.fallbackEnabled ? '' : 'none';
+
+  // 触发路由器数据迁移（幂等；第一次打开 popup 时把旧 settings + config.json 喂入）
+  try {
+    await runMigration(
+      {
+        apiKey: settings.apiKey,
+        baseUrl: settings.baseUrl,
+        model: settings.model,
+        fallbackEnabled: settings.fallbackEnabled,
+        fallbackApiKey: settings.fallbackApiKey,
+        fallbackBaseUrl: settings.fallbackBaseUrl,
+        fallbackModel: settings.fallbackModel,
+      },
+      localConfig || {},
+    );
+  } catch (e) {
+    console.warn('[router] migration skipped:', e);
+  }
 
   function detectFallbackPreset(baseUrl, model) {
     for (const [key, cfg] of Object.entries(FALLBACK_PRESETS)) {
@@ -379,14 +399,20 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // ===== Tabs =====
+  let providersInited = false;
   const tabButtons = document.querySelectorAll<HTMLButtonElement>('.tab-button');
   const tabPanels = document.querySelectorAll<HTMLElement>('.tab-panel');
   tabButtons.forEach((btn) => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const target = btn.dataset.tab;
       tabButtons.forEach(b => b.classList.toggle('active', b.dataset.tab === target));
       tabPanels.forEach(p => p.classList.toggle('active', p.dataset.panel === target));
       onTabSwitch(target || '');
+      if (target === 'providers' && !providersInited) {
+        providersInited = true;
+        try { await initProvidersTab(); }
+        catch (e) { console.warn('[providers-tab] init failed:', e); }
+      }
     });
   });
 
