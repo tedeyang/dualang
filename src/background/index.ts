@@ -20,6 +20,7 @@ import {
   setCapability as routerSetCapability,
   setPerformance as routerSetPerformance,
 } from './router/storage';
+import { recordOutcome as routerRecordOutcome, classifyErrorKind } from './router/recorder';
 
 // ===================== Router 数据迁移（幂等）=====================
 // SW 启动和 popup 打开都会触发；版本戳控制单次执行。
@@ -723,6 +724,8 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
       const runChunkOn = async (slot: Slot) =>
         slot.mode === 'single' ? runChunkSingle(slot) : runChunkBatch(slot);
 
+      const chunkChars = chunk.reduce((s, t) => s + t.length, 0);
+
       // 本 chunk 在 pool 里最多尝试 slots.length 次；每个 slot 最多试一次，挂了就冷却切下一个
       const triedLabels = new Set<string>();
       let chunkSucceeded = false;
@@ -745,13 +748,27 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
           console.log('[Dualang] super-fine relay', { chunkIndex: ci, slot: slot.label });
           lastSlotLabel = slot.label;
         }
+        const slotStartedAt = Date.now();
+        const tokensBefore = totalTokens;
         try {
           await runChunkOn(slot);
           chunkSucceeded = true;
+          routerRecordOutcome(slot.settings.model, slot.settings.baseUrl, {
+            originalChars: chunkChars,
+            rttMs: Date.now() - slotStartedAt,
+            success: true,
+            totalTokens: totalTokens - tokensBefore,
+          });
           break;
         } catch (err: any) {
           triedLabels.add(slot.label);
           const msg = err.message || String(err);
+          routerRecordOutcome(slot.settings.model, slot.settings.baseUrl, {
+            originalChars: chunkChars,
+            rttMs: Date.now() - slotStartedAt,
+            success: false,
+            errorKind: classifyErrorKind(err),
+          });
           if (isPermanentError(msg)) {
             slot.disabled = true;
             console.warn('[Dualang] super-fine slot DISABLED (permanent error)', {
@@ -1031,6 +1048,12 @@ async function handleTranslateBatch(
       const usedModel = apiResult.winnerModel || settings.model;
       const usedBaseUrl = apiResult.winnerBaseUrl || settings.baseUrl;
       recordRequest(usedModel, true, rtt, apiResult.usage).catch(() => {});
+      routerRecordOutcome(usedModel, usedBaseUrl, {
+        originalChars: toTranslateTexts.reduce((s, t) => s + t.length, 0),
+        rttMs: rtt,
+        success: true,
+        totalTokens: apiResult.usage?.total_tokens,
+      });
       console.log('[Dualang] translation.request.ok', {
         model: usedModel, rttMs: Math.round(rtt), tokens: apiResult.usage?.total_tokens, count: toTranslateTexts.length,
       });
@@ -1051,6 +1074,12 @@ async function handleTranslateBatch(
       }
       recordRequest(settings.model, false, rtt).catch(() => {});
       recordError(settings.model, err.message || String(err)).catch(() => {});
+      routerRecordOutcome(settings.model, settings.baseUrl, {
+        originalChars: toTranslateTexts.reduce((s, t) => s + t.length, 0),
+        rttMs: rtt,
+        success: false,
+        errorKind: classifyErrorKind(err),
+      });
       console.warn('[Dualang] translation.request.fail', {
         model: settings.model, rttMs: Math.round(rtt), error: err.message, retryable: err.retryable,
       });
@@ -1061,7 +1090,14 @@ async function handleTranslateBatch(
       console.log('[Dualang] fallback.activated', {
         reason: err.message, retryable: !!err.retryable, to: settings.fallbackModel,
       });
+      const fbStartedAt = performance.now();
       const { apiResult, settings: fbSettings } = await runFallback(toTranslateTexts, settings, smartDictIndices, perItemCandidates);
+      routerRecordOutcome(fbSettings.model, fbSettings.baseUrl, {
+        originalChars: toTranslateTexts.reduce((s, t) => s + t.length, 0),
+        rttMs: performance.now() - fbStartedAt,
+        success: true,
+        totalTokens: apiResult.usage?.total_tokens,
+      });
       await applyBatchResult(texts, toTranslateIndices, apiResult, results, fbSettings, fbSettings.model, dictOut, smartDictIndices);
       return {
         translations: results,
