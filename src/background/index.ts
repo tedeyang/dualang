@@ -1056,6 +1056,7 @@ async function handleTranslateBatch(
         rttMs: rtt,
         success: true,
         totalTokens: apiResult.usage?.total_tokens,
+        translatedTexts: apiResult.translations,
       });
       console.log('[Dualang] translation.request.ok', {
         model: usedModel, rttMs: Math.round(rtt), tokens: apiResult.usage?.total_tokens, count: toTranslateTexts.length,
@@ -1100,6 +1101,7 @@ async function handleTranslateBatch(
         rttMs: performance.now() - fbStartedAt,
         success: true,
         totalTokens: apiResult.usage?.total_tokens,
+        translatedTexts: apiResult.translations,
       });
       await applyBatchResult(texts, toTranslateIndices, apiResult, results, fbSettings, fbSettings.model, dictOut, smartDictIndices);
       return {

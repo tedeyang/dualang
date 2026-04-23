@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { tierOf, applyOutcome, nextCircuit } from './recorder';
+import { tierOf, applyOutcome, nextCircuit, computeQualityScore } from './recorder';
 import { createEWMA } from '../../shared/ewma';
 import { createCircuitRecord, type PerformanceProfile } from '../../shared/router-types';
 
@@ -86,6 +86,59 @@ describe('applyOutcome', () => {
       originalChars: 50, rttMs: NaN, success: true,
     });
     expect(p.rttMs.short.count).toBe(0);
+  });
+});
+
+describe('computeQualityScore', () => {
+  it('empty array → 1.0', () => {
+    expect(computeQualityScore([])).toBe(1);
+  });
+
+  it('empty string item → 0', () => {
+    expect(computeQualityScore([''])).toBe(0);
+  });
+
+  it('non-CJK text → 1.0 neutral', () => {
+    expect(computeQualityScore(['Hello world this is English'])).toBe(1.0);
+  });
+
+  it('good CJK translation → high score', () => {
+    const score = computeQualityScore(['这是一段很好的中文翻译，包含很多汉字内容表达流畅']);
+    expect(score).toBeGreaterThan(0.7);
+  });
+
+  it('high English leak → lower score than clean CJK', () => {
+    const clean = computeQualityScore(['这是中文翻译内容非常丰富']);
+    // enough CJK to trigger heuristic (cjk > 0.05) but predominantly English
+    const leaky = computeQualityScore(['这是一个 but in English this product is absolutely outstanding for everyone']);
+    expect(leaky).toBeLessThan(clean);
+  });
+
+  it('averages across batch', () => {
+    const score = computeQualityScore(['这是中文翻译内容', '']);
+    expect(score).toBeGreaterThan(0);
+    expect(score).toBeLessThan(1);
+  });
+});
+
+describe('applyOutcome quality integration', () => {
+  it('translatedTexts drives qualityScore above success proxy', () => {
+    const p = applyOutcome(undefined, {
+      originalChars: 50, rttMs: 500, success: true,
+      translatedTexts: ['这是一段内容丰富的中文翻译文字非常流畅'],
+    });
+    expect(p.qualityScore.value).toBeGreaterThan(0.5);
+    expect(p.qualityScore.value).toBeLessThanOrEqual(1);
+  });
+
+  it('falls back to success=1 proxy when translatedTexts absent', () => {
+    const p = applyOutcome(undefined, { originalChars: 50, rttMs: 500, success: true });
+    expect(p.qualityScore.value).toBe(1);
+  });
+
+  it('failure without translatedTexts gives quality 0', () => {
+    const p = applyOutcome(undefined, { originalChars: 50, rttMs: 500, success: false });
+    expect(p.qualityScore.value).toBe(0);
   });
 });
 

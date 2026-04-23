@@ -20,6 +20,7 @@ import {
   setCircuit,
 } from './storage';
 import { transitionOnFailure, transitionOnSuccess } from './circuit';
+import { cjkRatio, englishLeakRatio } from './sampler-validators';
 
 export interface Outcome {
   /** 原文总字符数（用来决定放入 short/medium/long 哪个 tier） */
@@ -32,6 +33,8 @@ export interface Outcome {
   /** 如果失败，错误类型（429 / 5xx / net / etc.）—— 当前 P4 只影响 successRate；
    *  熔断/冷却由 P5 接手。*/
   errorKind?: string;
+  /** 译文列表（P8 quality V1）：提供时从 cjkRatio/englishLeak 推导 qualityScore */
+  translatedTexts?: string[];
 }
 
 /** 文本长度分桶：与 sampler 的 short/medium/long 统一语义。 */
@@ -66,6 +69,30 @@ export async function resolveProviderId(
   return match?.id || null;
 }
 
+/**
+ * V1 quality heuristic: maps cjkRatio + englishLeak to [0,1].
+ * Weights (0.6/0.4) and thresholds are V1 calibration — revisit in V2.
+ * Known blind spot: if translated text has no CJK (non-CJK target language),
+ * returns 1.0 neutral; a future version should use target-lang hints.
+ */
+export function computeQualityScore(translations: string[]): number {
+  if (!translations.length) return 1;
+  let total = 0;
+  for (const t of translations) {
+    if (!t.trim()) { total += 0; continue; }
+    const cjk = cjkRatio(t);
+    if (cjk > 0.05) {
+      const leak = englishLeakRatio(t);
+      const cjkScore = Math.min(cjk / 0.5, 1);
+      const leakScore = Math.max(1 - leak / 0.55, 0);
+      total += cjkScore * 0.6 + leakScore * 0.4;
+    } else {
+      total += 1.0;
+    }
+  }
+  return total / translations.length;
+}
+
 /** 纯函数：把 outcome 合并进 profile，返回新 profile。便于单测。*/
 export function applyOutcome(
   prev: PerformanceProfile | undefined,
@@ -83,9 +110,13 @@ export function applyOutcome(
     tokensPerSec = updateEWMA(tokensPerSec, tps);
   }
   const successRate = updateEWMA(base.successRate, outcome.success ? 1 : 0);
-  // 质量代理：P4 先用 success 做占位（实际 V1 启发式在 P8 接入）。
-  // 这样的话质量 EWMA 在没专门反馈前跟 successRate 保持一致。
-  const qualityScore = updateEWMA(base.qualityScore, outcome.success ? 1 : 0);
+  let rawQuality: number;
+  if (outcome.success && outcome.translatedTexts?.length) {
+    rawQuality = computeQualityScore(outcome.translatedTexts);
+  } else {
+    rawQuality = outcome.success ? 1 : 0;
+  }
+  const qualityScore = updateEWMA(base.qualityScore, rawQuality);
   return {
     rttMs,
     tokensPerSec,
