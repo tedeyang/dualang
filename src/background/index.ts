@@ -413,12 +413,54 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
   //  - 小 chunk → 首屏更快、单次失败损失小
   //  实测 10 段是免费 TPM 50K/min 下的稳定点（307 段长文从 62 次调用降到 31 次）。
   const CHUNK = 10;
-  // chunk 间节流：避免 burst 打满 SiliconFlow 免费 TPM。800ms ≈ 平均 ~30K tokens/min。
-  const THROTTLE_MS = 800;
-  // 429 / TPM 错误专项重试：硅基的 TPM 是滑动窗口，等 15s 再试通常能恢复。
-  const TPM_BACKOFF_MS = 15_000;
+  // chunk 间节流：把单 provider 的峰值 TPM 摊平。多 provider 接力时只控单路速率。
+  const THROTTLE_MS = 2000;
+  // Token-bucket 参数（每个 provider slot 独立一份）：滑动 60s 窗口。
+  // Primary（免费硅基 GLM）假设 50K TPM 上限；Moonshot 免费层通常 ≥ 200K，保守按 150K。
+  const TPM_WINDOW_MS = 60_000;
+  const SF_TPM_BUDGET = 35_000;
+  const MOONSHOT_TPM_BUDGET = 120_000;
+  // Provider 遇 429 进冷却期；冷却中的 slot 被接力跳过。窗口滑出自动恢复。
+  const TPM_COOLDOWN_MS = 60_000;
+  const NONTPM_COOLDOWN_MS = 15_000;  // 非 TPM 错误（网络抖、5xx）短冷却
+
   const isTpmError = (msg: string) => /429|TPM|rate.?limit/i.test(msg);
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  type Slot = {
+    label: string;
+    settings: Settings;
+    budget: number;
+    tpmLog: Array<{ t: number; tokens: number }>;
+    cooldownUntil: number;  // epoch ms；0 = 立即可用
+    disabled?: boolean;     // 永久故障（认证错/模型不存在等不可恢复错）永久剔除
+  };
+  /** 识别永久性错误：认证、模型不存在、参数错。这些不会"冷一会儿就好"，直接剔除。*/
+  const isPermanentError = (msg: string) =>
+    /not\s*found|permission|unauthorized|invalid.*key|401|403|404|does\s*not\s*exist/i.test(msg);
+  const tokensInWindow = (slot: Slot) => {
+    const cutoff = Date.now() - TPM_WINDOW_MS;
+    while (slot.tpmLog.length && slot.tpmLog[0].t < cutoff) slot.tpmLog.shift();
+    return slot.tpmLog.reduce((s, e) => s + e.tokens, 0);
+  };
+  /** 选出可立即用的最闲 slot。全部禁用/冷却/token 预算满时返回 null。*/
+  const pickSlot = (slots: Slot[]): Slot | null => {
+    const now = Date.now();
+    const candidates = slots.filter((s) => !s.disabled && s.cooldownUntil <= now && tokensInWindow(s) < s.budget);
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => tokensInWindow(a) - tokensInWindow(b));
+    return candidates[0];
+  };
+  /** 估算下一可用时间：冷却结束 or 窗口最老记录滑出 二者更早。*/
+  const nextAvailableAt = (slots: Slot[]): number => {
+    const active = slots.filter((s) => !s.disabled);
+    if (!active.length) return Infinity;
+    return Math.min(...active.map((s) => {
+      const coolOut = s.cooldownUntil;
+      const windowOut = s.tpmLog.length ? s.tpmLog[0].t + TPM_WINDOW_MS : 0;
+      return Math.max(coolOut, windowOut);
+    }));
+  };
 
   let disconnected = false;
   port.onDisconnect.addListener(() => { disconnected = true; });
@@ -427,25 +469,53 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
 
   try {
     const baseSettings = await getSettings();
-    // 精翻 provider 选择：默认复用主设置（SiliconFlow GLM-4-9B-0414）——
-    // 实测 TPM 充足 + 免费 + UTF-8 flush 已修，批量 chunked 稳定。
-    // Moonshot Kimi 为 opt-in：payload.model 以 `moonshot-` 或 `kimi-` 开头时切换。
+    // Provider 池：多 provider 接力，单路限流时自动切到下一路，冷却期满再回来。
+    // 同一账号的不同模型共享 TPM 桶（硅基），所以只把"不同账号/不同服务商"并列。
     const wantsMoonshot = typeof payload.model === 'string' &&
       (payload.model.startsWith('moonshot-') || payload.model.startsWith('kimi-'));
+    const moonshotKey = await getMoonshotKey();
 
-    let settings: Settings;  // filled by one of the two branches below
+    const slots: Slot[] = [];
+    // 主路：用户主设置。wantsMoonshot=true 时主路就是 Moonshot，primary 作为接力兜底。
     if (wantsMoonshot) {
-      const moonshotKey = await getMoonshotKey();
-      if (!moonshotKey) {
-        throw new Error('Moonshot 模型需要 API Key；请在 config.json 的 providers.moonshot.apiKey 填入，或不指定 model 以使用默认 GLM');
+      if (!moonshotKey) throw new Error('Moonshot 模型需要 API Key；请在 config.json 的 providers.moonshot.apiKey 填入');
+      slots.push({
+        label: `moonshot:${payload.model}`, budget: MOONSHOT_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
+        settings: buildSuperFineSettings(baseSettings, { model: payload.model, apiKey: moonshotKey }),
+      });
+      if (baseSettings.apiKey) {
+        slots.push({
+          label: `primary:${baseSettings.model}`, budget: SF_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
+          settings: buildSuperFineSettings(baseSettings),
+        });
       }
-      settings = buildSuperFineSettings(baseSettings, { model: payload.model, apiKey: moonshotKey });
     } else {
-      if (!baseSettings.apiKey) {
-        throw new Error('精翻需要 API Key；请在 popup 设置或 config.json 填入 SiliconFlow key');
+      if (!baseSettings.apiKey) throw new Error('精翻需要 API Key；请在 popup 设置或 config.json 填入 SiliconFlow key');
+      slots.push({
+        label: `primary:${baseSettings.model}`, budget: SF_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
+        settings: buildSuperFineSettings(baseSettings),
+      });
+      // 有 Moonshot key 就自动挂为接力路（独立账号 = 独立 TPM 桶，真正能接力）
+      // 硅基同账号接力（实测：同账号不同模型是独立 TPM 桶；零配置即可加速）。
+      // 选 Qwen3.5-9B 作接力：与 GLM-4-9B 同档（速度/质量相近），免费。
+      // 仅当主模型不是 Qwen3.5-9B 自己时加入，避免 self-relay 无意义。
+      if (!/Qwen3\.5-9B/i.test(baseSettings.model || '')) {
+        slots.push({
+          label: 'sf-relay:Qwen/Qwen3.5-9B', budget: SF_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
+          settings: { ...buildSuperFineSettings(baseSettings), model: 'Qwen/Qwen3.5-9B' },
+        });
       }
-      settings = buildSuperFineSettings(baseSettings);
+      // Moonshot 锦上添花（独立账号 = 完全独立桶，且 TPM 配额最高）
+      if (moonshotKey) {
+        slots.push({
+          label: 'moonshot:moonshot-v1-8k', budget: MOONSHOT_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
+          settings: buildSuperFineSettings(baseSettings, { model: 'moonshot-v1-8k', apiKey: moonshotKey }),
+        });
+      }
     }
+    console.log('[Dualang] super-fine provider pool', { slots: slots.map((s) => s.label) });
+    // 兼容旧代码：`settings` 指向主 slot（emit meta 用）
+    const settings = slots[0].settings;
 
     // content 端已经用 extractParagraphsByBlock 按 DOM block 结构切好段落
     // 直接接收数组，避免再做字符级拆分（容易因为 \n vs \n\n 差异出错）
@@ -471,18 +541,25 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
     let totalTokens = 0;
     let completedParagraphs = 0;
 
-    // 串行处理 chunks：Kimi k2.5 reasoning 模型单 chunk 就比较慢，再并发容易打爆
-    // rate limit。串行 + SSE 流式组合保证"第一段就能开始读"的渐进体验。
-    // chunk 间固定节流 + 429 专项重试（TPM 滑动窗口通常 15s 内恢复）。
+    // 串行 chunks，每 chunk 从 provider 池里挑最闲的 slot 跑。
+    // 单 slot 遇 TPM 进入 60s 冷却，自动切到下一 slot 接力；冷却期满自动回归 pool。
+    // 全部 slot 都在冷却/token 预算满时，sleep 到最早恢复时间再试。
+    let lastSlotLabel = '';
     for (let ci = 0; ci < totalChunks; ci++) {
       if (disconnected || abortController.signal.aborted) return;
+      // 所有 slot 永久故障 → pool 报废，整体失败
+      if (slots.every((s) => s.disabled)) {
+        console.warn('[Dualang] super-fine pool exhausted (all slots disabled)');
+        if (!disconnected) port.postMessage({ action: 'error', error: '所有 provider 永久不可用（auth / model 错误）' });
+        return;
+      }
       const start = ci * CHUNK;
       const chunk = paragraphs.slice(start, start + CHUNK);
 
-      const runChunk = async () => {
+      const runChunkOn = async (slot: Slot) => {
         const pushedIndices = new Set<number>();
         const result = await doTranslateBatchStream(
-          chunk, settings, abortController.signal,
+          chunk, slot.settings, abortController.signal,
           (subIndex, translated) => {
             if (disconnected) return;
             const globalIndex = start + subIndex;
@@ -490,9 +567,8 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
             port.postMessage({ action: 'partial', index: globalIndex, translated });
             completedParagraphs++;
           },
-          true, // strictMode：保留段落结构，减少模型压缩
+          true,
         );
-        // 补推流式未覆盖的条目（通常是最后一条）
         for (let i = 0; i < result.translations.length; i++) {
           if (pushedIndices.has(i)) continue;
           const t = result.translations[i];
@@ -503,33 +579,66 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
             completedParagraphs++;
           }
         }
-        totalTokens += result.usage?.total_tokens || 0;
+        const chunkTokens = result.usage?.total_tokens || 0;
+        totalTokens += chunkTokens;
+        slot.tpmLog.push({ t: Date.now(), tokens: chunkTokens });
       };
 
-      try {
-        await runChunk();
-      } catch (err: any) {
-        if (isTpmError(err.message) && !disconnected && !abortController.signal.aborted) {
-          // TPM 限流：等窗口滑出后重试一次。再失败才计 chunkFail。
-          console.warn('[Dualang] super-fine chunk TPM, retrying', { chunkIndex: ci, backoffMs: TPM_BACKOFF_MS });
-          await sleep(TPM_BACKOFF_MS);
+      // 本 chunk 在 pool 里最多尝试 slots.length 次；每个 slot 最多试一次，挂了就冷却切下一个
+      const triedLabels = new Set<string>();
+      let chunkSucceeded = false;
+      while (triedLabels.size < slots.length && !disconnected && !abortController.signal.aborted) {
+        // 挑 slot：没有立即可用的就 sleep 到最早恢复时间
+        let slot = pickSlot(slots);
+        while (!slot) {
+          const nextAt = nextAvailableAt(slots);
+          const waitMs = Math.max(500, nextAt - Date.now() + 500);
+          console.log('[Dualang] super-fine all slots busy, sleeping', { waitMs });
+          await sleep(waitMs);
           if (disconnected || abortController.signal.aborted) return;
-          try {
-            await runChunk();
-          } catch (retryErr: any) {
-            console.warn('[Dualang] super-fine chunk fail after retry', { chunkIndex: ci, error: retryErr.message });
-            if (!disconnected) port.postMessage({ action: 'chunkFail', chunkIndex: ci, error: retryErr.message });
-          }
-        } else {
-          console.warn('[Dualang] super-fine chunk fail', { chunkIndex: ci, error: err.message });
-          if (!disconnected) port.postMessage({ action: 'chunkFail', chunkIndex: ci, error: err.message });
+          slot = pickSlot(slots);
         }
+        if (triedLabels.has(slot.label)) {
+          // 所有未试过的 slot 都挂了，再试过的也不行 —— 跳出，报 chunkFail
+          break;
+        }
+        if (slot.label !== lastSlotLabel) {
+          console.log('[Dualang] super-fine relay', { chunkIndex: ci, slot: slot.label });
+          lastSlotLabel = slot.label;
+        }
+        try {
+          await runChunkOn(slot);
+          chunkSucceeded = true;
+          break;
+        } catch (err: any) {
+          triedLabels.add(slot.label);
+          const msg = err.message || String(err);
+          if (isPermanentError(msg)) {
+            slot.disabled = true;
+            console.warn('[Dualang] super-fine slot DISABLED (permanent error)', {
+              chunkIndex: ci, slot: slot.label, error: msg.slice(0, 160),
+            });
+          } else {
+            const isTpm = isTpmError(msg);
+            slot.cooldownUntil = Date.now() + (isTpm ? TPM_COOLDOWN_MS : NONTPM_COOLDOWN_MS);
+            console.warn('[Dualang] super-fine slot cooldown', {
+              chunkIndex: ci, slot: slot.label, tpm: isTpm,
+              cooldownMs: isTpm ? TPM_COOLDOWN_MS : NONTPM_COOLDOWN_MS,
+              error: msg.slice(0, 120),
+            });
+          }
+        }
+      }
+
+      if (!chunkSucceeded && !disconnected) {
+        console.warn('[Dualang] super-fine chunk fail (all slots tried)', { chunkIndex: ci, tried: [...triedLabels] });
+        port.postMessage({ action: 'chunkFail', chunkIndex: ci, error: 'all providers exhausted' });
       }
 
       if (!disconnected) {
         port.postMessage({ action: 'progress', completed: Math.min(start + chunk.length, paragraphs.length), total: paragraphs.length });
       }
-      // 节流：下一 chunk 前强制间隔，把峰值 TPM 压到 50K/min 以下
+      // 单路节流：下一 chunk 前间隔，避免同一 slot 被瞬间多次击中
       if (ci < totalChunks - 1 && !disconnected && !abortController.signal.aborted) {
         await sleep(THROTTLE_MS);
       }
