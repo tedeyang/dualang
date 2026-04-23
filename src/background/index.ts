@@ -100,6 +100,15 @@ async function handleRouterSample(
       { provider, apiKey },
       signal,
       (caseResult: SamplerCaseResult) => {
+        // 控制台里完整输出一行便于线下调优；不发给 UI，防污染 popup。
+        const tail = caseResult.outputHead?.slice(0, 80) || '';
+        const reasons = (caseResult.verdict as any)?.reasons?.join('；') || '';
+        console.log(
+          `[router.sample] ${provider.id} ${caseResult.name}`,
+          `ok=${caseResult.ok}`, `rtt=${caseResult.rttMs}ms`,
+          reasons ? `fail="${reasons}"` : '',
+          tail ? `out="${tail}"` : '',
+        );
         try { port.postMessage({ type: 'case', result: caseResult }); } catch (_) {}
       },
     );

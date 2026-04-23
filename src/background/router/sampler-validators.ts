@@ -55,9 +55,13 @@ export function validateTranslation(
   translated: string,
   opts: ValidateOptions = {},
 ): QualityVerdict {
+  // 阈值校准（2026-04-23 Moonshot 实测）：
+  //   科技推文里模型 *应该* 保留品牌名（Anthropic / Claude / Vercel 等）。
+  //   太严的 englishLeak / cjkRatio 会把正常译文误判成失败。0.55 / 0.25 兼顾
+  //   "brand names 正常保留" 与 "整句没翻"；更精细的品牌名扣除留给 V2 判分。
   const {
-    minCjkRatio = 0.3,
-    maxEnglishLeak = 0.3,
+    minCjkRatio = 0.25,
+    maxEnglishLeak = 0.55,
     lengthRatioMin = 0.15,
     lengthRatioMax = 3.0,
   } = opts;
