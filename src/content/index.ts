@@ -713,14 +713,22 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
 
     let finished = false;
     let port: chrome.runtime.Port | null = null;
-    const timeout = setTimeout(() => {
-      if (finished) return;
-      finished = true;
-      try { port?.disconnect(); } catch (_) {}
-      bubble.setBubbleState(articleId, 'failed');
-      updateLongArticleCta(article, 'failed');
-      logBiz('translation.superFine.fail', { error: 'timeout' }, 'warn');
-    }, SUPER_FINE_TIMEOUT_MS);
+    // 心跳式超时：免费 TPM 下 300+ 段长文要跑 10+ 分钟；固定倒计时会把"慢但活着"
+    // 的流也杀掉。改成 partial/progress 每来一次就 reset，只有 SUPER_FINE_TIMEOUT_MS
+    // 真无声才算卡死。
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const armTimeout = () => {
+      if (timeout) clearTimeout(timeout);
+      timeout = setTimeout(() => {
+        if (finished) return;
+        finished = true;
+        try { port?.disconnect(); } catch (_) {}
+        bubble.setBubbleState(articleId, 'failed');
+        updateLongArticleCta(article, 'failed');
+        logBiz('translation.superFine.fail', { error: 'idle-timeout' }, 'warn');
+      }, SUPER_FINE_TIMEOUT_MS);
+    };
+    armTimeout();
 
     try {
       port = chrome.runtime.connect(undefined, { name: 'super-fine' });
@@ -743,8 +751,10 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
         metaBaseUrl = msg.baseUrl;
       } else if (msg.action === 'partial') {
         fillSlot(article, msg.index, msg.translated);
+        armTimeout();  // 有段落回来就 reset idle 倒计时
       } else if (msg.action === 'progress') {
         bubble.setBubbleState(articleId, 'translating', { completed: msg.completed, total: msg.total });
+        armTimeout();
       } else if (msg.action === 'chunkFail') {
         logBiz('translation.superFine.chunkFail', { chunkIndex: msg.chunkIndex, error: msg.error }, 'warn');
       } else if (msg.action === 'done') {
