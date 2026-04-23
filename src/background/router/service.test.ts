@@ -296,6 +296,48 @@ describe('selectCandidates — smart mode', () => {
     expect(single.map((c) => c.id).sort()).toEqual(['p1', 'p2']);
   });
 
+  it('failover skips COOLING primary, falls to secondary', async () => {
+    await storageMod.saveProviders([
+      mkEntry('p1', 'https://a/v1', 'Ma'),
+      mkEntry('p2', 'https://b/v1', 'Mb'),
+    ]);
+    await storageMod.setApiKey('p1', 'k1');
+    await storageMod.setApiKey('p2', 'k2');
+    await storageMod.setCircuit('p1', {
+      ...createCircuitRecord(),
+      state: 'COOLING',
+      cooldownUntil: Date.now() + 60_000,
+      cooldownMs: 60_000,
+    });
+    await storageMod.setRoutingSettings({
+      mode: 'failover', preference: 0.5, concurrency: 1,
+      primaryId: 'p1', secondaryId: 'p2',
+    });
+    const cands = await selectCandidates({ kind: 'batch' });
+    expect(cands.map((c) => c.id)).toEqual(['p2']);
+  });
+
+  it('failover lazy-unfreezes primary past cooldown (→ PROBING, picked up again)', async () => {
+    await storageMod.saveProviders([mkEntry('p1', 'https://a/v1', 'Ma')]);
+    await storageMod.setApiKey('p1', 'k1');
+    await storageMod.setCircuit('p1', {
+      ...createCircuitRecord(),
+      state: 'COOLING',
+      cooldownUntil: Date.now() - 1,
+      cooldownMs: 60_000,
+    });
+    await storageMod.setRoutingSettings({
+      mode: 'failover', preference: 0.5, concurrency: 1,
+      primaryId: 'p1',
+    });
+    const cands = await selectCandidates({ kind: 'batch' });
+    expect(cands.map((c) => c.id)).toEqual(['p1']);
+    expect(cands[0].probeWeight).toBeCloseTo(0.1);
+    // persisted transition
+    const persisted = await storageMod.getCircuit('p1');
+    expect(persisted!.state).toBe('PROBING');
+  });
+
   it('PROBING probeWeight shrinks score (still included but demoted)', async () => {
     await storageMod.saveProviders([
       mkEntry('p-probing', 'https://a/v1', 'M'),

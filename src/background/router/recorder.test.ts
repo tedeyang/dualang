@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { tierOf, applyOutcome } from './recorder';
+import { tierOf, applyOutcome, nextCircuit } from './recorder';
 import { createEWMA } from '../../shared/ewma';
-import type { PerformanceProfile } from '../../shared/router-types';
+import { createCircuitRecord, type PerformanceProfile } from '../../shared/router-types';
 
 describe('tierOf', () => {
   it('short ≤ 120 chars', () => {
@@ -86,5 +86,44 @@ describe('applyOutcome', () => {
       originalChars: 50, rttMs: NaN, success: true,
     });
     expect(p.rttMs.short.count).toBe(0);
+  });
+});
+
+describe('nextCircuit', () => {
+  const NOW = 1_000_000;
+
+  it('no prev circuit + success → HEALTHY', () => {
+    const c = nextCircuit(undefined, { originalChars: 50, rttMs: 500, success: true }, NOW);
+    expect(c.state).toBe('HEALTHY');
+  });
+
+  it('no prev circuit + 429 → COOLING', () => {
+    const c = nextCircuit(undefined, {
+      originalChars: 50, rttMs: 500, success: false, errorKind: 'rate_limit',
+    }, NOW);
+    expect(c.state).toBe('COOLING');
+    expect(c.cooldownMs).toBe(60_000);
+  });
+
+  it('auth error → PERMANENT_DISABLED', () => {
+    const c = nextCircuit(undefined, {
+      originalChars: 50, rttMs: 500, success: false, errorKind: 'auth',
+    }, NOW);
+    expect(c.state).toBe('PERMANENT_DISABLED');
+  });
+
+  it('PROBING + success grows weight', () => {
+    const probing = { ...createCircuitRecord(), state: 'PROBING' as const, probeWeight: 0.1 };
+    const c = nextCircuit(probing, { originalChars: 50, rttMs: 500, success: true }, NOW);
+    expect(c.state).toBe('PROBING');
+    expect(c.probeWeight).toBe(0.2);
+  });
+
+  it('abort does not disturb state', () => {
+    const prev = createCircuitRecord();
+    const c = nextCircuit(prev, {
+      originalChars: 50, rttMs: 0, success: false, errorKind: 'abort',
+    }, NOW);
+    expect(c).toBe(prev);
   });
 });

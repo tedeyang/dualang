@@ -10,8 +10,16 @@
  */
 
 import { updateEWMA, createEWMA } from '../../shared/ewma';
-import type { LatencyTier, PerformanceProfile } from '../../shared/router-types';
-import { listProviders, getPerformance, setPerformance } from './storage';
+import type { LatencyTier, PerformanceProfile, CircuitRecord } from '../../shared/router-types';
+import { createCircuitRecord } from '../../shared/router-types';
+import {
+  listProviders,
+  getPerformance,
+  setPerformance,
+  getCircuit,
+  setCircuit,
+} from './storage';
+import { transitionOnFailure, transitionOnSuccess } from './circuit';
 
 export interface Outcome {
   /** 原文总字符数（用来决定放入 short/medium/long 哪个 tier） */
@@ -97,8 +105,20 @@ function emptyProfile(): PerformanceProfile {
   };
 }
 
+/** 纯函数：根据 outcome 推导下一个 circuit 状态（只处理走到这里的那一次结果） */
+export function nextCircuit(
+  prev: CircuitRecord | undefined,
+  outcome: Outcome,
+  now: number = Date.now(),
+): CircuitRecord {
+  const base = prev ?? createCircuitRecord();
+  if (outcome.success) return transitionOnSuccess(base, now);
+  const kind = outcome.errorKind || 'other';
+  return transitionOnFailure(base, kind, now);
+}
+
 /**
- * 主入口：解析 providerId → 读 profile → 合并 → 写回。
+ * 主入口：解析 providerId → 读 profile + circuit → 合并 → 写回。
  * 任何一步失败都只打日志、吞掉异常；绝不向上冒泡打断翻译主路径。
  */
 export async function recordOutcome(
@@ -109,10 +129,29 @@ export async function recordOutcome(
   try {
     const id = await resolveProviderId(model, baseUrl);
     if (!id) return;
-    const prev = await getPerformance(id);
-    const next = applyOutcome(prev, outcome);
-    await setPerformance(id, next);
+    const [prevPerf, prevCircuit] = await Promise.all([
+      getPerformance(id),
+      getCircuit(id),
+    ]);
+    const nextPerf = applyOutcome(prevPerf, outcome);
+    const nextCirc = nextCircuit(prevCircuit, outcome);
+    const writes: Promise<unknown>[] = [setPerformance(id, nextPerf)];
+    // 只在 state/key 字段变化时写回，省 IO + 减少 onChanged 事件噪声
+    if (!prevCircuit || circuitChanged(prevCircuit, nextCirc)) {
+      writes.push(setCircuit(id, nextCirc));
+    }
+    await Promise.all(writes);
   } catch (e) {
     console.warn('[router.recorder] recordOutcome failed (ignored):', e);
   }
+}
+
+function circuitChanged(a: CircuitRecord, b: CircuitRecord): boolean {
+  return (
+    a.state !== b.state
+    || a.cooldownUntil !== b.cooldownUntil
+    || a.cooldownMs !== b.cooldownMs
+    || a.probeWeight !== b.probeWeight
+    || a.probeSuccessStreak !== b.probeSuccessStreak
+  );
 }

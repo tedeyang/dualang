@@ -19,17 +19,20 @@ import {
   getApiKey,
   getRoutingSettings,
   getCircuit,
+  setCircuit,
   getPerformance,
   getLimits,
   getCapability,
 } from './storage';
 import type {
+  CircuitRecord,
   ProviderEntry,
   RoutingSettings,
 } from '../../shared/router-types';
 import { getSettings } from '../settings';
 import { tierOf } from './recorder';
 import { scoreSlot, vetoSlot, type ScoreBreakdown } from './scoring';
+import { maybeUnfreeze } from './circuit';
 
 // ============ 核心类型 ============
 
@@ -57,6 +60,21 @@ export interface RouteContext {
 
 // ============ 候选解析 ============
 
+/** 读取并懒惰解冻 circuit；转换后持久化。不修改原对象 */
+async function loadAndUnfreezeCircuit(
+  id: string,
+  now: number,
+): Promise<CircuitRecord | undefined> {
+  const prev = await getCircuit(id);
+  if (!prev) return undefined;
+  const next = maybeUnfreeze(prev, now);
+  if (next !== prev) {
+    await setCircuit(id, next);
+    return next;
+  }
+  return prev;
+}
+
 async function resolveById(
   id: string | undefined,
   byId: Map<string, ProviderEntry>,
@@ -67,8 +85,11 @@ async function resolveById(
   if (!entry || !entry.enabled) return null;
   const apiKey = await getApiKey(id);
   if (!apiKey) return null;
-  const circuit = await getCircuit(id);
+  const now = Date.now();
+  const circuit = await loadAndUnfreezeCircuit(id, now);
   if (circuit?.state === 'PERMANENT_DISABLED') return null;
+  // COOLING 期内直接屏蔽，让 failover 跳到下一条
+  if (circuit?.state === 'COOLING' && circuit.cooldownUntil > now) return null;
   return { id, entry, apiKey, probeWeight: circuit?.probeWeight ?? 1, role };
 }
 
@@ -105,14 +126,15 @@ async function selectSmart(ctx: RouteContext, routing: RoutingSettings): Promise
   const enabled = providers.filter((p) => p.enabled);
   if (!enabled.length) return [];
 
-  // 并发加载每条 provider 的画像 + 熔断 + capability + apiKey
+  const now = Date.now();
+  // 并发加载每条 provider 的画像 + 熔断 + capability + apiKey；同步跑一次懒惰解冻
   const loaded = await Promise.all(
     enabled.map(async (p) => {
       const [apiKey, profile, limits, circuit, capability] = await Promise.all([
         getApiKey(p.id),
         getPerformance(p.id),
         getLimits(p.id),
-        getCircuit(p.id),
+        loadAndUnfreezeCircuit(p.id, now),
         getCapability(p.id),
       ]);
       return { p, apiKey, snap: { profile, limits, circuit, capability } };
@@ -122,7 +144,6 @@ async function selectSmart(ctx: RouteContext, routing: RoutingSettings): Promise
   // 无 apiKey 直接丢（不算 veto，只是不可用）
   const withKey = loaded.filter((x) => x.apiKey);
 
-  const now = Date.now();
   const vetoCtx = {
     kind: ctx.kind,
     originalChars: ctx.originalChars,
