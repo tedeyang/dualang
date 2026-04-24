@@ -51,47 +51,36 @@ export type ProviderProfile = {
 //   - 原文可能碰巧含 <tN> 字符串（代码片段、HTML 教学推文等），所以每次请求用 findSafeOffset
 //     选一个不与原文冲突的起始 N（默认 0；如果 0-N 冲突则偏移 100/1000）
 
-const SINGLE_PROMPT = (lang: string) => `请将用户提供的文本翻译成${lang}。
+// ============ 默认模板（拆分为 intro + user-rules + protocol） ============
+// 用户在 popup 里只能改"翻译规则"那段（=> customs.translationRules）。
+// intro 和 protocol 是工程契约（<tN> / 媒体占位符 / 输出格式），改了下游 parser 会崩，
+// 所以锁在这里。compose 时按 intro → 翻译规则 → 协议 顺序拼。
 
-规则：
-1. 输出必须完全是${lang}；专有名词可音译或保留原样。
-2. 如果原文已经是${lang}，直接返回原文（保留段落结构）。
-3. 只输出翻译结果，不要前缀（如"翻译："）、不要解释、不要 markdown 代码块。
-4. 保留原文的段落结构（段落之间用空行分隔）。
-5. 保持原文的语气、风格（口语化、幽默、讽刺等）。
-6. 形如 [[M0]]、[[M1]] 的标记是媒体占位符，按原文出现位置原样保留，不要翻译、删除或改写里面的数字。`;
+import { applyLangToken, DEFAULT_PROMPTS, type CustomPrompts } from './custom-prompts';
 
-const BATCH_PROMPT = (lang: string) => `请将以下多条推文分别翻译成${lang}。
-每条推文在用户消息中用 XML 标签 <tN>...</tN> 包裹（N 为数字索引，用户会给出具体值）。
+const SINGLE_INTRO = `请将用户提供的文本翻译成{{LANG}}。`;
 
-输出格式（严格遵守）：
-按相同的 <tN>...</tN> 标签结构输出对应译文，标签里的 N 必须与用户消息里的 N 一一对应（不得改写、不得使用其他数字）。
+// 单条输出格式协议：纯文本，禁止结构。第 3 条媒体占位符是 [[Mn]] hard contract（content 渲染依赖）。
+const SINGLE_PROTOCOL = `输出格式：
+- 只输出翻译结果，不要前缀（如"翻译："）、不要解释、不要 markdown 代码块。
+- 保留原文的段落结构（段落之间用空行分隔）。
+- 形如 [[M0]]、[[M1]] 的标记是媒体占位符，按原文出现位置原样保留，不要翻译、删除或改写里面的数字。`;
 
-规则：
-1. 每条译文必须写在对应的 <tN> 与 </tN> 之间。
-2. 译文中的段落分隔用真实空行保留；不要 JSON 转义。
-3. 输出必须完全是${lang}；专有名词可保留原样。
-4. 不要 markdown 代码块、不要解释、不要在标签外输出任何文字。
-5. 如果某条原文已是${lang}，按原文返回（含段落结构）。
-6. 形如 [[M0]]、[[M1]] 的标记是媒体占位符，按原文出现位置原样保留，不要翻译、删除或改写里面的数字。`;
+const BATCH_INTRO = `请将以下多条推文分别翻译成{{LANG}}。
+每条推文在用户消息中用 XML 标签 <tN>...</tN> 包裹（N 为数字索引，用户会给出具体值）。`;
 
-// 严格前缀 —— 拼在单条或批量 prompt 前，用于质量重试场景。
-// 显式禁止总结、强调段落保留；行为独立于输出格式（分隔符 or 纯文本）。
-const STRICT_PREFIX = (lang: string) => `【严格模式必须遵守】
-1. 完整翻译原文每一句，严禁省略、合并、总结或概括。
-2. 原文有 N 段（空行分隔）→ 译文必须 N 段，段与段之间保留空行。
-3. 输出必须完全是${lang}；不得整句保留原文英文。
-4. 保留 URL / @用户名 / #话题词 的原样（不翻译这些 token）。
+// 批量输出格式协议 —— 这是硬契约，标签结构 / N 对应关系 / 媒体占位符都是
+// parseDelimitedBatch 解析时依赖的不变量；用户改了就只能 throw "解析失败"。
+const BATCH_PROTOCOL = `输出格式（严格遵守）：
+- 按相同的 <tN>...</tN> 标签结构输出对应译文，标签里的 N 必须与用户消息里的 N 一一对应（不得改写、不得使用其他数字）。
+- 每条译文必须写在对应的 <tN> 与 </tN> 之间。
+- 译文中的段落分隔用真实空行保留；不要 JSON 转义。
+- 不要 markdown 代码块、不要解释、不要在标签外输出任何文字。
+- 形如 [[M0]]、[[M1]] 的标记是媒体占位符，按原文出现位置原样保留，不要翻译、删除或改写里面的数字。`;
 
-`;
-
-// Combined call（翻译 + 字典融合）：仅在 batch 里追加。user message 会给需要字典的
-// 条目在 <tN> 的开始标签上加 `dict="word1 word2 ..."` 属性；模型按 ---DICT--- 段输出。
-//
-// level 用中国学生熟悉的考试分级（详见 docs/superpowers/reports/2026-04-20-glm-mixed-request-benchmark.md）：
-// GLM-4-9B 在 32 词金标集上 cet4/cet6/ielts/kaoyan 四分类 96.88% 准确。
-// 候选词已经在插件端用 Zipf + 音节 + 词长 本地预筛 —— 模型只需给 IPA / 释义 / level。
-const BATCH_DICT_SUFFIX = (lang: string) => `
+// Combined call（翻译 + 字典融合）后缀：仅 batch + smartDict 拼接。
+// 含 ---DICT--- / 四段式竖线分隔等硬契约，由 parseDelimitedBatchWithDict 消费 —— 锁。
+const BATCH_DICT_SUFFIX = `
 
 【字典融合】
 开始标签带 dict 属性的条目（形如 <tN dict="word1 word2">）需在译文后、关闭标签 </tN> 前追加字典块；无 dict 属性的条目不要加字典块。
@@ -102,36 +91,58 @@ dict 属性里的词是预筛过的高难候选，字典条目只能从这些候
 <tN dict="w1 w2 w3">
 <译文>
 ---DICT---
-原词|/IPA/|${lang}释义|level
-原词2|/IPA/|${lang}释义|level
+原词|/IPA/|{{LANG}}释义|level
+原词2|/IPA/|{{LANG}}释义|level
 </tN>
 
 字典规则：
 1. 条目必须来自 dict 属性的候选词；候选外的词一律不要注释。
 2. level 从 {cet6, ielts, kaoyan} 选 —— 分别对应六级 / 雅思 / 考研。
-3. IPA 写国际音标，两头用斜线包裹；释义用${lang}，简短（≤8 字），不要整句解释。
+3. IPA 写国际音标，两头用斜线包裹；释义用{{LANG}}，简短（≤8 字），不要整句解释。
 4. 若候选都不需要注释，直接省略 ---DICT--- 段，不要写空段。
 5. 无 dict 属性的条目一律不输出 ---DICT--- 段；多写会让解析失败。`;
 
-// 试试手气 — 用户点击品牌 logo 触发的重译加强前缀。强调"精准 / 更地道 / 上下文一致"，
-// 鼓励模型给出与上次不同角度但仍然忠实的翻译。配合 temperature 上浮使用。
-const BOOST_PREFIX = (lang: string) => `【重译请求】用户对上一次译文不满意，请用更精准、地道的${lang}重新翻译。
-1. 保持原文语义完整，不得删减或合并句子。
-2. 避免机械直译；遇到固定搭配 / 专有说法，优先采用目标语自然的表达。
-3. 若上下文已明确，允许在保留原意的前提下换用不同措辞，避免与上一版雷同。
+// 把"翻译规则"段插入到 intro 与 protocol 之间，组装一段完整 prompt
+function buildBaseWithRules(intro: string, rules: string, protocol: string, lang: string): string {
+  // 用户的 rules 可能不带"翻译规则："这种 header；统一在拼装这里加，避免用户每次都要写
+  return applyLangToken(`${intro}
 
-`;
+翻译规则：
+${rules}
 
-/** 根据 profile + 是否批量 + 是否严格模式 + 是否字典融合 / 重译加强，组装最终的 system prompt */
+${protocol}`, lang);
+}
+
+const SINGLE_PROMPT = (lang: string) =>
+  buildBaseWithRules(SINGLE_INTRO, DEFAULT_PROMPTS.translationRules, SINGLE_PROTOCOL, lang);
+const BATCH_PROMPT = (lang: string) =>
+  buildBaseWithRules(BATCH_INTRO, DEFAULT_PROMPTS.translationRules, BATCH_PROTOCOL, lang);
+
+/**
+ * 拼最终 system prompt：boostPrefix + strictPrefix + base(intro+rules+protocol) + dictSuffix
+ *
+ * `customs` 只有 3 个可改字段：translationRules / strict / boost。
+ * intro / protocol / BATCH_DICT_SUFFIX 是硬契约，永远用默认。
+ */
 export function composeSystemPrompt(
   profile: ProviderProfile,
   lang: string,
   opts: { batch: boolean; strict: boolean; smartDict?: boolean; retranslateBoost?: boolean },
+  customs?: CustomPrompts,
 ): string {
-  const base = opts.batch ? profile.systemPromptBatch(lang) : profile.systemPromptSingle(lang);
-  const dictSuffix = opts.batch && opts.smartDict ? BATCH_DICT_SUFFIX(lang) : '';
-  const boostPrefix = opts.retranslateBoost ? BOOST_PREFIX(lang) : '';
-  const strictPrefix = opts.strict ? STRICT_PREFIX(lang) : '';
+  const rules = customs?.translationRules || DEFAULT_PROMPTS.translationRules;
+  // base 始终用我们的 intro/protocol；profile 上的 systemPromptSingle/Batch 已弃用，
+  // 只有 customs.translationRules 走个性化路径
+  const base = opts.batch
+    ? buildBaseWithRules(BATCH_INTRO, rules, BATCH_PROTOCOL, lang)
+    : buildBaseWithRules(SINGLE_INTRO, rules, SINGLE_PROTOCOL, lang);
+  const dictSuffix = opts.batch && opts.smartDict ? applyLangToken(BATCH_DICT_SUFFIX, lang) : '';
+  const boostPrefix = opts.retranslateBoost
+    ? applyLangToken(customs?.boost || DEFAULT_PROMPTS.boost, lang)
+    : '';
+  const strictPrefix = opts.strict
+    ? applyLangToken(customs?.strict || DEFAULT_PROMPTS.strict, lang)
+    : '';
   return boostPrefix + strictPrefix + base + dictSuffix;
 }
 

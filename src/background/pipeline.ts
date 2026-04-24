@@ -4,6 +4,7 @@
 import { cacheKey, setCache } from './cache';
 import { doTranslateBatchRequest } from './api';
 import { recordRequest, recordError } from './stats';
+import { log } from '../shared/logger';
 import type { Settings, TokenUsage, DictionaryEntry } from '../shared/types';
 
 export type BatchApiResult = {
@@ -90,7 +91,7 @@ export async function runFallback(
     const apiResult = await doTranslateBatchRequest(texts, fbSettings, null, 3, false, { smartDictIndices, perItemCandidates });
     const rtt = performance.now() - t0;
     recordRequest(fbSettings.model, true, rtt, apiResult.usage).catch(() => {});
-    console.log('[Dualang] translation.request.ok', {
+    log.info('translate.request.ok', {
       model: fbSettings.model, rttMs: Math.round(rtt),
       tokens: apiResult.usage?.total_tokens, via: 'fallback',
     });

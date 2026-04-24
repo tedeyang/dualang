@@ -29,23 +29,26 @@ import type {
 } from '../../shared/router-types';
 
 // ============ 样本文本 ============
-// 英 → 中翻译；选材偏 tech/news 风格，与扩展实际使用场景贴近。
+// 英 → 中翻译。原先用品牌密集的科技新闻（Anthropic / Claude / OpenAI / Vercel 等），
+// 导致正确译文里保留品牌名 → englishLeak 超阈值 → 正确译文被标 "broken"。
+// 现在刻意选**不含专有名词**的通用工程语料：正确译文 ≈ 纯中文，不会和品牌保留混淆。
 
-const SHORT_TEXT = 'Anthropic released Claude Opus 4.7 with native 1M context.';
+const SHORT_TEXT =
+  'Engineers often find that the real bottleneck is caching, not the model itself.';
 
 const MEDIUM_TEXT =
-  'OpenAI shipped an Agents SDK across seven sandbox providers. ' +
-  'Vercel disclosed the year\'s first AI-platform-originated breach. ' +
-  'Anthropic chose a managed runtime, OpenAI chose portable primitives. ' +
-  'The architectural bet matters more than the benchmark this week. ' +
-  'Mandiant was engaged for forensic response.';
+  'The team spent weeks tuning retrieval heuristics before the launch. ' +
+  'The bottleneck turned out to be caching rather than model latency. ' +
+  'Small synthetic tests missed the problem entirely. ' +
+  'Only production traffic surfaced the failure mode. ' +
+  'The incident review reshaped how the group plans load testing.';
 
 const LONG_TEXT =
   'When long-context models hit production, the bottleneck shifts from parameters to plumbing. ' +
   'Engineers spend weeks tuning chunk sizes, retrieval heuristics, and caching layers. ' +
   'The model ships, but so does a fleet of ad-hoc schedulers around it. ' +
   'Rate limits become load-bearing infrastructure, not afterthoughts. ' +
-  'Provider outages reveal which customers built abstractions and which wired things directly. ' +
+  'Outages reveal which customers built abstractions and which wired things directly. ' +
   'Observability tells you which prompt template actually ran, but only if you logged the template id. ' +
   'The successful teams learn to treat the model like a flaky database: isolate, hedge, degrade gracefully. ' +
   'The others rebuild every six months as the interface shifts under them. ' +
@@ -53,11 +56,11 @@ const LONG_TEXT =
   'By then, your infra looks more like distributed systems work than prompt engineering.';
 
 const BATCH_TEXTS = [
-  'Anthropic released Claude Opus 4.7 with native 1M context.',
-  'SWE-bench Verified scored 92.3% against Opus 4.6\'s 85.9%.',
-  'OpenAI shipped an Agents SDK across seven sandbox providers.',
-  'Vercel disclosed the year\'s first AI-platform-originated breach.',
-  'The architectural bet matters more than the benchmark this week.',
+  'The team often underestimates how much observability matters until production breaks.',
+  'A new cache layer reduced average latency by almost forty percent this quarter.',
+  'Small teams ship faster when they trust the build pipeline.',
+  'Most outages came from rate limits rather than from code bugs.',
+  'The post-mortem highlighted the cost of skipping load tests.',
 ];
 
 // ============ 类型 ============

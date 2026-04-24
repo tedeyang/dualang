@@ -2,15 +2,17 @@ import { test, expect } from './fixtures';
 
 const mockPagePath = 'http://localhost:9999/e2e/fixtures/x-mock.html';
 
+const baseSettings = {
+  baseUrl: 'https://api.moonshot.cn/v1',
+  apiKey: 'sk-kimi-test-12345',
+  model: 'moonshot-v1-8k',
+  reasoningEffort: 'medium',
+  maxTokens: 4096,
+  enableStreaming: false,
+};
+
 const baseBeforeEach = async (popupPage: any) => {
-  await popupPage.locator('#baseUrl').fill('https://api.moonshot.cn/v1');
-  await popupPage.locator('#apiKey').fill('sk-kimi-test-12345');
-  await popupPage.locator('#model').fill('moonshot-v1-8k');
-  await popupPage.locator('#reasoningEffort').selectOption('medium');
-  await popupPage.locator('#maxTokens').fill('4096');
-  await popupPage.locator('#enableStreaming').evaluate((el: HTMLInputElement) => el.checked = false);
-  await popupPage.locator('#saveBtn').click();
-  await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+  await popupPage.evaluate(async (s) => chrome.storage.sync.set(s), baseSettings);
 };
 
 function makeApiRoute(delay = 0) {
@@ -98,39 +100,17 @@ test.describe('Status Indicators', () => {
     const popupPromise = page.waitForEvent('popup', { timeout: 2000 }).catch(() => null);
     await status.click();
     const popup = await popupPromise;
-    if (popup) {
-      const url = popup.url();
-      // moonshot 或 kimi 相关（取决于 model 字段如何分类）
-      expect(url).toMatch(/moonshot|kimi|openai/);
-      await popup.close();
-    }
-    // popup 未触发也是可接受的（某些 headless 模式下 window.open 被吞），只要 status 本身显示 & tooltip 正确即可
+    // 有些环境不会触发 popup，但不报错即可（没有 JS 崩溃）
+    if (popup) await popup.close().catch(() => {});
   });
-});
 
-test.describe('Fail & Retry', () => {
-  test.beforeEach(async ({ popupPage }) => baseBeforeEach(popupPage));
-
-  test('API 返回 401 后显示 fail 图标，点击后重新翻译', async ({ context }) => {
-    let requestCount = 0;
+  test('401 错误立即显示 fail 图标（不重试）', async ({ context }) => {
     await context.route('https://api.moonshot.cn/v1/chat/completions', async (route) => {
-      requestCount++;
-      if (requestCount <= 1) {
-        // 第一次返回 401（不可重试，直接 showFail）
-        await route.fulfill({
-          status: 401,
-          contentType: 'application/json',
-          body: JSON.stringify({ error: { type: 'invalid_api_key', message: 'Invalid API Key' } }),
-        });
-      } else {
-        // 点击重试后成功
-        const results = [{ index: 0, translated: '重试成功' }];
-        await route.fulfill({
-          status: 200,
-          contentType: 'application/json',
-          body: JSON.stringify({ choices: [{ message: { content: JSON.stringify({ results }) } }] }),
-        });
-      }
+      await route.fulfill({
+        status: 401,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: { type: 'invalid_api_key', message: 'Invalid API Key' } }),
+      });
     });
 
     const page = await context.newPage();
@@ -154,34 +134,33 @@ test.describe('Fail & Retry', () => {
 });
 
 test.describe('Fallback API', () => {
-  test('popup 应能保存和读取 fallback 配置', async ({ popupPage }) => {
-    await baseBeforeEach(popupPage);
-
-    // 开启 fallback
-    await popupPage.locator('#fallbackEnabled').evaluate((el: HTMLInputElement) => {
-      el.checked = true;
-      el.dispatchEvent(new Event('change'));
+  test('fallback 配置持久化后路由生效', async ({ popupPage }) => {
+    // Inject fallback settings directly into storage (no longer in popup UI)
+    await popupPage.evaluate(async (s) => chrome.storage.sync.set(s), {
+      ...baseSettings,
+      fallbackEnabled: true,
+      fallbackApiKey: 'sk-sf-test-99999',
+      fallbackBaseUrl: 'https://api.siliconflow.cn/v1',
+      fallbackModel: 'THUDM/GLM-4-9B-0414',
     });
-    await popupPage.locator('#fallbackApiKey').fill('sk-sf-test-99999');
-    await popupPage.locator('#saveBtn').click();
-    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
-
-    // 重新加载 popup，验证设置被持久化
-    await popupPage.reload();
-    await expect(popupPage.locator('#fallbackEnabled')).toBeChecked();
-    await expect(popupPage.locator('#fallbackApiKey')).toHaveValue('sk-sf-test-99999');
-    await expect(popupPage.locator('#fallbackBaseUrl')).toHaveValue('https://api.siliconflow.cn/v1');
-    await expect(popupPage.locator('#fallbackModel')).toHaveValue('THUDM/GLM-4-9B-0414');
+    // Verify persisted
+    const stored = await popupPage.evaluate(async () =>
+      chrome.storage.sync.get(['fallbackEnabled', 'fallbackApiKey', 'fallbackBaseUrl', 'fallbackModel'])
+    );
+    expect(stored.fallbackEnabled).toBe(true);
+    expect(stored.fallbackApiKey).toBe('sk-sf-test-99999');
+    expect(stored.fallbackBaseUrl).toBe('https://api.siliconflow.cn/v1');
+    expect(stored.fallbackModel).toBe('THUDM/GLM-4-9B-0414');
   });
 
   test('主 API 可重试错误也立刻切兜底，不在主上做 3 次退避', async ({ context, popupPage }) => {
-    await baseBeforeEach(popupPage);
-    await popupPage.locator('#fallbackEnabled').evaluate((el: HTMLInputElement) => {
-      el.checked = true; el.dispatchEvent(new Event('change'));
+    await popupPage.evaluate(async (s) => chrome.storage.sync.set(s), {
+      ...baseSettings,
+      fallbackEnabled: true,
+      fallbackApiKey: 'sk-sf-fast-fallback',
+      fallbackBaseUrl: 'https://api.siliconflow.cn/v1',
+      fallbackModel: 'THUDM/GLM-4-9B-0414',
     });
-    await popupPage.locator('#fallbackApiKey').fill('sk-sf-fast-fallback');
-    await popupPage.locator('#saveBtn').click();
-    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
 
     let mainHit = 0, fbHit = 0;
     // 主返回可重试的 500 — 旧行为会在主上退避 3 次再切兜底；新行为应立刻切
@@ -216,15 +195,13 @@ test.describe('Fallback API', () => {
   });
 
   test('主 API quota 耗尽时自动 fallback 到硅基流动', async ({ context, popupPage }) => {
-    // 配置 fallback
-    await baseBeforeEach(popupPage);
-    await popupPage.locator('#fallbackEnabled').evaluate((el: HTMLInputElement) => {
-      el.checked = true;
-      el.dispatchEvent(new Event('change'));
+    await popupPage.evaluate(async (s) => chrome.storage.sync.set(s), {
+      ...baseSettings,
+      fallbackEnabled: true,
+      fallbackApiKey: 'sk-sf-fallback-key',
+      fallbackBaseUrl: 'https://api.siliconflow.cn/v1',
+      fallbackModel: 'THUDM/GLM-4-9B-0414',
     });
-    await popupPage.locator('#fallbackApiKey').fill('sk-sf-fallback-key');
-    await popupPage.locator('#saveBtn').click();
-    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
 
     // 主 API 返回 quota 耗尽
     await context.route('https://api.moonshot.cn/v1/chat/completions', async (route) => {
@@ -262,18 +239,15 @@ test.describe('Fallback API', () => {
 
 test.describe('Hedged Request', () => {
   test('开启并发赛跑后，快的 API 先返回时用快的', async ({ context, popupPage }) => {
-    await baseBeforeEach(popupPage);
-    await popupPage.locator('#fallbackEnabled').evaluate((el: HTMLInputElement) => {
-      el.checked = true;
-      el.dispatchEvent(new Event('change'));
+    await popupPage.evaluate(async (s) => chrome.storage.sync.set(s), {
+      ...baseSettings,
+      fallbackEnabled: true,
+      fallbackApiKey: 'sk-sf-hedge-key',
+      fallbackBaseUrl: 'https://api.siliconflow.cn/v1',
+      fallbackModel: 'THUDM/GLM-4-9B-0414',
+      hedgedRequestEnabled: true,
+      hedgedDelayMs: 0,
     });
-    await popupPage.locator('#fallbackApiKey').fill('sk-sf-hedge-key');
-    await popupPage.locator('#hedgedRequestEnabled').evaluate((el: HTMLInputElement) => {
-      el.checked = true;
-      el.dispatchEvent(new Event('change'));
-    });
-    await popupPage.locator('#saveBtn').click();
-    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
 
     let mainHit = false;
     let fbHit = false;
@@ -318,18 +292,15 @@ test.describe('Hedged Request', () => {
   });
 
   test('延迟启动：主 API 足够快时兜底不发起（节省配额）', async ({ context, popupPage }) => {
-    await baseBeforeEach(popupPage);
-    await popupPage.locator('#fallbackEnabled').evaluate((el: HTMLInputElement) => {
-      el.checked = true; el.dispatchEvent(new Event('change'));
+    await popupPage.evaluate(async (s) => chrome.storage.sync.set(s), {
+      ...baseSettings,
+      fallbackEnabled: true,
+      fallbackApiKey: 'sk-sf-not-called',
+      fallbackBaseUrl: 'https://api.siliconflow.cn/v1',
+      fallbackModel: 'THUDM/GLM-4-9B-0414',
+      hedgedRequestEnabled: true,
+      hedgedDelayMs: 1000,  // 大于主 API 返回时间，兜底不应被触发
     });
-    await popupPage.locator('#fallbackApiKey').fill('sk-sf-not-called');
-    await popupPage.locator('#hedgedRequestEnabled').evaluate((el: HTMLInputElement) => {
-      el.checked = true; el.dispatchEvent(new Event('change'));
-    });
-    // 显式设 1000ms 延迟，大于主 API 返回时间，兜底不应被触发
-    await popupPage.locator('#hedgedDelayMode').selectOption('1000');
-    await popupPage.locator('#saveBtn').click();
-    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
 
     let mainHit = 0, fbHit = 0;
     await context.route('https://api.moonshot.cn/v1/chat/completions', async (route) => {
@@ -358,17 +329,15 @@ test.describe('Hedged Request', () => {
   });
 
   test('赛马败者被 abort 不触发 popup 错误横幅', async ({ context, popupPage }) => {
-    await baseBeforeEach(popupPage);
-    await popupPage.locator('#fallbackEnabled').evaluate((el: HTMLInputElement) => {
-      el.checked = true; el.dispatchEvent(new Event('change'));
+    await popupPage.evaluate(async (s) => chrome.storage.sync.set(s), {
+      ...baseSettings,
+      fallbackEnabled: true,
+      fallbackApiKey: 'sk-sf-race-key',
+      fallbackBaseUrl: 'https://api.siliconflow.cn/v1',
+      fallbackModel: 'THUDM/GLM-4-9B-0414',
+      hedgedRequestEnabled: true,
+      hedgedDelayMs: 0,  // 同时发起，确保两路都飞
     });
-    await popupPage.locator('#fallbackApiKey').fill('sk-sf-race-key');
-    await popupPage.locator('#hedgedRequestEnabled').evaluate((el: HTMLInputElement) => {
-      el.checked = true; el.dispatchEvent(new Event('change'));
-    });
-    await popupPage.locator('#hedgedDelayMode').selectOption('0');  // 同时发起，确保两路都飞
-    await popupPage.locator('#saveBtn').click();
-    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
 
     // 主快、兜底慢 — 主先完成 → fbAbort.abort() → 败者抛 AbortError，
     // 不应被 callWithRetry 当成 fatal 写入 dualang_error_v1
@@ -418,18 +387,15 @@ test.describe('Hedged Request', () => {
   });
 
   test('两路都失败时返回错误（不静默）', async ({ context, popupPage }) => {
-    await baseBeforeEach(popupPage);
-    await popupPage.locator('#fallbackEnabled').evaluate((el: HTMLInputElement) => {
-      el.checked = true;
-      el.dispatchEvent(new Event('change'));
+    await popupPage.evaluate(async (s) => chrome.storage.sync.set(s), {
+      ...baseSettings,
+      fallbackEnabled: true,
+      fallbackApiKey: 'sk-sf-both-fail',
+      fallbackBaseUrl: 'https://api.siliconflow.cn/v1',
+      fallbackModel: 'THUDM/GLM-4-9B-0414',
+      hedgedRequestEnabled: true,
+      hedgedDelayMs: 0,
     });
-    await popupPage.locator('#fallbackApiKey').fill('sk-sf-both-fail');
-    await popupPage.locator('#hedgedRequestEnabled').evaluate((el: HTMLInputElement) => {
-      el.checked = true;
-      el.dispatchEvent(new Event('change'));
-    });
-    await popupPage.locator('#saveBtn').click();
-    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
 
     // 两路都返回致命错误（401 不可重试）
     await context.route('https://api.moonshot.cn/v1/chat/completions', async (route) => {

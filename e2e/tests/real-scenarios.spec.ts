@@ -29,14 +29,14 @@ function installApi(context: any) {
 }
 
 async function savePopup(popupPage: any) {
-  await popupPage.locator('#baseUrl').fill('https://api.moonshot.cn/v1');
-  await popupPage.locator('#apiKey').fill('sk-test-real');
-  await popupPage.locator('#model').fill('moonshot-v1-8k');
-  await popupPage.locator('#reasoningEffort').selectOption('medium');
-  await popupPage.locator('#maxTokens').fill('4096');
-  await popupPage.locator('#enableStreaming').evaluate((el: HTMLInputElement) => el.checked = false);
-  await popupPage.locator('#saveBtn').click();
-  await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+  await popupPage.evaluate(async (s) => chrome.storage.sync.set(s), {
+    baseUrl: 'https://api.moonshot.cn/v1',
+    apiKey: 'sk-test-real',
+    model: 'moonshot-v1-8k',
+    reasoningEffort: 'medium',
+    maxTokens: 4096,
+    enableStreaming: false,
+  });
 }
 
 test.describe('Realistic X.com DOM scenarios', () => {

@@ -33,6 +33,7 @@ import { getSettings } from '../settings';
 import { tierOf } from './recorder';
 import { scoreSlot, vetoSlot, type ScoreBreakdown } from './scoring';
 import { maybeUnfreeze } from './circuit';
+import { log } from '../../shared/logger';
 
 // ============ 核心类型 ============
 
@@ -95,17 +96,61 @@ async function resolveById(
 
 /**
  * 按 routing 配置返回有序候选。
- *   failover: [primary, secondary]，filter 掉禁用 / 无 key / 永久熔断
- *   smart:    枚举所有 enabled providers → vetoSlot 硬过滤 → scoreSlot 加权 → 分数降序
+ *   failover:         [primary, secondary]，filter 掉禁用 / 无 key / 永久熔断
+ *   smart:            枚举所有 enabled providers → vetoSlot 硬过滤 → scoreSlot 加权 → 分数降序
+ *   super-fine-chunk: 枚举所有 enabled providers，固定顺序 primary → secondary → others
  */
 export async function selectCandidates(
   ctx: RouteContext = { kind: 'batch' },
 ): Promise<ResolvedProvider[]> {
   const routing = await getRoutingSettings();
-  if (routing.mode === 'smart') {
-    return selectSmart(ctx, routing);
+  let candidates: ResolvedProvider[];
+  if (ctx.kind === 'super-fine-chunk') {
+    candidates = await selectSuperFine(routing);
+  } else if (routing.mode === 'smart') {
+    candidates = await selectSmart(ctx, routing);
+  } else {
+    candidates = await selectFailover(routing);
   }
-  return selectFailover(routing);
+  // 路由决策可观测：每次 selectCandidates 都打一条，便于定位"为什么走了这个 provider"。
+  // Smart 模式额外带 top 3 分数便于分析评分权重。
+  if (candidates.length > 0) {
+    log.info('router.select', {
+      kind: ctx.kind,
+      mode: routing.mode,
+      total: candidates.length,
+      chosen: `${candidates[0].role}:${candidates[0].entry.model}`,
+      top3: routing.mode === 'smart'
+        ? candidates.slice(0, 3).map((c) => ({
+            model: c.entry.model,
+            score: c.scoring?.score?.toFixed(2),
+          }))
+        : undefined,
+    });
+  } else {
+    log.warn('router.select.empty', { kind: ctx.kind, mode: routing.mode });
+  }
+  return candidates;
+}
+
+/** 精翻接力池：primary → secondary → 其余 enabled，全部通过 resolveById 过滤熔断 */
+async function selectSuperFine(routing: RoutingSettings): Promise<ResolvedProvider[]> {
+  const providers = await listProviders();
+  const byId = new Map(providers.map((p) => [p.id, p]));
+
+  const priorityIds = [routing.primaryId, routing.secondaryId].filter(Boolean) as string[];
+  const prioritySet = new Set(priorityIds);
+  const otherIds = providers
+    .filter((p) => p.enabled && !prioritySet.has(p.id))
+    .map((p) => p.id);
+
+  const roleOf = (id: string): ResolvedProvider['role'] =>
+    id === routing.primaryId ? 'primary' : id === routing.secondaryId ? 'secondary' : 'other';
+
+  const resolved = await Promise.all(
+    [...priorityIds, ...otherIds].map((id) => resolveById(id, byId, roleOf(id))),
+  );
+  return resolved.filter((r): r is ResolvedProvider => r !== null);
 }
 
 async function selectFailover(routing: RoutingSettings): Promise<ResolvedProvider[]> {

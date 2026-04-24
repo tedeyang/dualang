@@ -48,13 +48,14 @@ export async function getSettings() {
   // bench v2 实测：1.9s / 质量 8.7 / 稳定性完美 / 完全免费；
   // 优于 Qwen2.5（后者 T=0.3 默认时约 30% 概率陷入退化循环）。
   // 默认思考模式：关闭 — 翻译任务不需要推理，省 token 省延迟。
+  // enableStreaming / maxTokens / hedgedRequestEnabled / hedgedDelayMs 已从 UI 移除，
+  // popup 打开时会从 storage 里清掉；这里不再提供默认值 —— 若内部代码需要
+  // (super-fine / sampler)，它们走 Settings 对象的 in-memory 传递。
   const s = await chrome.storage.sync.get({
     apiKey: localConfig?.providers?.siliconflow?.apiKey || defaultApiKey,
     baseUrl: 'https://api.siliconflow.cn/v1',
     model: 'THUDM/GLM-4-9B-0414',
     providerType: 'openai',
-    enableStreaming: false,
-    maxTokens: 4096,
     reasoningEffort: 'none',
     targetLang: 'zh-CN',
     lineFusionEnabled: false,
@@ -63,7 +64,6 @@ export async function getSettings() {
     fallbackBaseUrl: 'https://api.siliconflow.cn/v1',
     fallbackApiKey: defaultFallbackApiKey,
     fallbackModel: 'THUDM/GLM-4-9B-0414',
-    hedgedRequestEnabled: false
   });
   if (!s.apiKey) s.apiKey = defaultApiKey;
   if (!s.fallbackApiKey) s.fallbackApiKey = defaultFallbackApiKey;

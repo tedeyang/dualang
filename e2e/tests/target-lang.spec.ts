@@ -4,11 +4,6 @@ const mockPagePath = 'http://localhost:9999/e2e/fixtures/x-mock.html';
 
 test.describe('Target Language Setting', () => {
   test('popup 应能保存和读取目标语言', async ({ popupPage }) => {
-    await popupPage.locator('#baseUrl').fill('https://api.moonshot.cn/v1');
-    await popupPage.locator('#apiKey').fill('sk-kimi-test-12345');
-    await popupPage.locator('#model').fill('moonshot-v1-8k');
-    await popupPage.locator('#reasoningEffort').selectOption('medium');
-    await popupPage.locator('#maxTokens').fill('4096');
     await popupPage.locator('#targetLang').selectOption('ja');
     await popupPage.locator('#saveBtn').click();
     await expect(popupPage.locator('#status')).toHaveText('设置已保存');
@@ -29,14 +24,12 @@ test.describe('Target Language Setting', () => {
     const { extensionId } = await getExtensionId(context);
     await popupPage.goto(`chrome-extension://${extensionId}/popup.html`);
 
-    await popupPage.locator('#baseUrl').fill('https://api.moonshot.cn/v1');
-    await popupPage.locator('#apiKey').fill('sk-kimi-test-12345');
-    await popupPage.locator('#model').fill('moonshot-v1-8k');
-    await popupPage.locator('#reasoningEffort').selectOption('medium');
-    await popupPage.locator('#maxTokens').fill('4096');
-    await popupPage.locator('#targetLang').selectOption('zh-CN');
-    await popupPage.locator('#saveBtn').click();
-    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+    await popupPage.evaluate(async (s) => chrome.storage.sync.set(s), {
+      baseUrl: 'https://api.moonshot.cn/v1',
+      apiKey: 'sk-kimi-test-12345',
+      model: 'moonshot-v1-8k',
+      targetLang: 'zh-CN',
+    });
 
     const requestBodies: string[] = [];
     await context.route('https://api.moonshot.cn/v1/chat/completions', async (route) => {
@@ -70,14 +63,12 @@ test.describe('Target Language Setting', () => {
     const { extensionId } = await getExtensionId(context);
     await popupPage.goto(`chrome-extension://${extensionId}/popup.html`);
 
-    await popupPage.locator('#baseUrl').fill('https://api.moonshot.cn/v1');
-    await popupPage.locator('#apiKey').fill('sk-kimi-test-12345');
-    await popupPage.locator('#model').fill('moonshot-v1-8k');
-    await popupPage.locator('#reasoningEffort').selectOption('medium');
-    await popupPage.locator('#maxTokens').fill('4096');
-    await popupPage.locator('#targetLang').selectOption('en');
-    await popupPage.locator('#saveBtn').click();
-    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+    await popupPage.evaluate(async (s) => chrome.storage.sync.set(s), {
+      baseUrl: 'https://api.moonshot.cn/v1',
+      apiKey: 'sk-kimi-test-12345',
+      model: 'moonshot-v1-8k',
+      targetLang: 'en',
+    });
 
     const requestBodies: string[] = [];
     await context.route('https://api.moonshot.cn/v1/chat/completions', async (route) => {
@@ -92,8 +83,6 @@ test.describe('Target Language Setting', () => {
       });
     });
 
-    // 目标语言是英文时，中文推文（tweet-4）不应被跳过（需要翻译成英文）
-    // 英文推文（tweet-1）因为已经是目标语言，应该被跳过
     const page = await context.newPage();
     await page.goto(mockPagePath);
     await page.setViewportSize({ width: 1280, height: 800 });

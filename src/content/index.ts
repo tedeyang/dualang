@@ -7,7 +7,7 @@ import { telemetry } from './telemetry';
 import { normalizeDisplayMode, type DisplayMode } from './display-mode';
 import { requestTranslationChunked } from './long-article-chunked';
 import { findAndPrepareGrokCards, GROK_DISCLAIMER_PREFIXES } from './grok-card';
-import { ctaTranslateNow, ctaCancel } from '../shared/i18n';
+import { ctaTranslateNow, ctaCancel, detectDefaultUiLang, type UiLang } from '../shared/i18n';
 import { renderTranslation } from './render';
 import { isLikelyEnglishText, extractDictionaryCandidates, applyDictionaryAnnotations, clearDictionaryAnnotations, type DictEntry } from './smart-dict';
 import {
@@ -15,7 +15,7 @@ import {
   TRANSLATION_CACHE_MAX, TRANSLATION_CACHE_TTL_MS,
   SCHEDULER_URGENT_DELAY_MS, SCHEDULER_IDLE_DELAY_MS, SCHEDULER_MAX_AGGREGATE_MS,
   SHOW_MORE_STABLE_MS,
-  REQUEST_TIMEOUT_MS, LONG_CHUNK_TIMEOUT_MS, STREAM_TIMEOUT_MS, SUPER_FINE_TIMEOUT_MS, adaptiveTimeoutMs,
+  REQUEST_TIMEOUT_MS, LONG_CHUNK_TIMEOUT_MS, SUPER_FINE_TIMEOUT_MS, adaptiveTimeoutMs,
 } from './constants';
 
 type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCache?: boolean };
@@ -35,7 +35,8 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
   let displayMode: DisplayMode = 'append';
   let lineFusionEnabled = false;
   let smartDictEnabled = false;
-  let enableStreaming = false;
+  // 界面语言 —— 独立于 targetLang，控制 CTA 按钮等 UI 文案。缺省走浏览器检测。
+  let uiLang: UiLang = detectDefaultUiLang();
 
   // Article 级别的状态通过 WeakMap<Element, ArticleState> 管理（见 article-state.ts）
   // TweetArticle 只是 Element 的别名，保留供 JSDoc / 可读性
@@ -300,7 +301,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       bilingualMode: false,
       lineFusionEnabled: false,
       smartDictEnabled: false,
-      enableStreaming: false,
+      uiLang: null,  // null → 首次走 detectDefaultUiLang
     });
     enabled         = settings.enabled;
     targetLang      = settings.targetLang   || 'zh-CN';
@@ -309,7 +310,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     displayMode     = normalizeDisplayMode(settings.displayMode, settings.bilingualMode);
     lineFusionEnabled = !!settings.lineFusionEnabled;
     smartDictEnabled = !!settings.smartDictEnabled;
-    enableStreaming  = !!settings.enableStreaming;
+    if (settings.uiLang) uiLang = settings.uiLang as UiLang;
     perfLog('init', {
       enabled, targetLang, autoTranslate, displayMode, lineFusionEnabled, smartDictEnabled,
       initCostMs: (performance.now() - t0).toFixed(2)
@@ -582,6 +583,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     if (changes.enabled !== undefined)        applyEnabledChange(changes.enabled.newValue !== false);
     if (changes.targetLang)                   targetLang     = changes.targetLang.newValue    || 'zh-CN';
     if (changes.autoTranslate !== undefined)  autoTranslate  = changes.autoTranslate.newValue !== false;
+    if (changes.uiLang !== undefined)         uiLang         = (changes.uiLang.newValue as UiLang) || detectDefaultUiLang();
     if (changes.displayMode !== undefined) {
       const prev = displayMode;
       displayMode = normalizeDisplayMode(changes.displayMode.newValue, false);
@@ -600,7 +602,6 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       // 一次 toggle 可能同时发几十条 API 请求；span-only 快速通路避开这类放大。
       if (prev !== smartDictEnabled && enabled) toggleDictionaryAcrossVisible(smartDictEnabled);
     }
-    if (changes.enableStreaming !== undefined) enableStreaming = !!changes.enableStreaming.newValue;
     // baseUrl / model / apiKey 变化：content 侧不需要做什么；background 的
     // settingsCache 已通过同一 onChanged 失效，下次请求即用新 provider
   });
@@ -1232,11 +1233,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       prepMs: (performance.now() - flushT0).toFixed(2)
     });
 
-    if (enableStreaming) {
-      flushQueueStreaming(batch);
-    } else {
-      flushQueueSendMessage(batch);
-    }
+    flushQueueSendMessage(batch);
   }
 
   // ========== sendMessage 模式（非流式）==========
@@ -1309,114 +1306,6 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     }
 
     if (!hitCap) scheduler.request();
-  }
-
-  // ========== 流式模式（port 推送，逐条渲染）==========
-  function flushQueueStreaming(batch: BatchItem[]) {
-    if (activeRequests >= MAX_CONCURRENT) {
-      for (const item of batch) {
-        if (!pendingQueueSet.has(item.article)) {
-          pendingQueueSet.add(item.article);
-          showStatus(item.article, 'queued');
-          if (item.highPriority) pendingQueue.unshift(item.article);
-          else pendingQueue.push(item.article);
-        }
-      }
-      perfLog('concurrentCap', { capped: batch.length, activeRequests });
-      return;
-    }
-
-    for (const item of batch) {
-      showStatus(item.article, 'loading');
-      translatingSet.add(item.article);
-    }
-
-    const texts = batch.map(b => b.text);
-    const hasHighPriority = batch.some(b => b.highPriority);
-    const apiT0 = performance.now();
-
-    activeRequests++;
-    bubble.setTranslationActivity(activeRequests);
-    // 恰好一次释放 slot。done/error/timeout/onDisconnect 均可到达，
-    // 但 activeRequests-- 与 scheduler.request() 只能执行一次。
-    let slotReleased = false;
-    const releaseSlot = () => {
-      if (slotReleased) return;
-      slotReleased = true;
-      activeRequests--;
-      bubble.setTranslationActivity(activeRequests);
-      scheduler.request();
-    };
-
-    const port = chrome.runtime.connect(undefined, { name: 'translate-stream' });
-
-    port.onMessage.addListener((msg) => {
-      if (msg.action === 'partial') {
-        const idx = msg.index;
-        if (idx >= 0 && idx < batch.length && msg.translated) {
-          renderAndCacheResult(batch[idx], msg.translated, { model: msg.model, baseUrl: msg.baseUrl });
-        }
-      } else if (msg.action === 'done') {
-        const rtt = performance.now() - apiT0;
-        telemetry.inc("apiCalls");
-        telemetry.add("apiTotalRtt", rtt);
-        perfLog('streamDone', { batchSize: batch.length, rttMs: rtt.toFixed(1), activeRequests });
-        for (let j = 0; j < batch.length; j++) {
-          if (translatingSet.has(batch[j].article)) {
-            translatingSet.delete(batch[j].article);
-            hideStatus(batch[j].article);
-          }
-        }
-        releaseSlot();
-        try { port.disconnect(); } catch (_) {}
-      } else if (msg.action === 'error') {
-        const rtt = performance.now() - apiT0;
-        telemetry.inc("apiCalls");
-        telemetry.add("apiTotalRtt", rtt);
-        releaseSlot();
-        const e: any = new Error(msg.error || '流式翻译失败');
-        e.retryable = msg.retryable !== false;
-        handleSubBatchError(e, batch, apiT0, rtt);
-        try { port.disconnect(); } catch (_) {}
-      }
-    });
-
-    port.onDisconnect.addListener(() => {
-      // port 意外断开（Service Worker 冷重启在 done/error 之前即触发此路径）。
-      // 若 slot 未释放过，这里兜底释放；否则什么都不做。
-      for (const item of batch) {
-        if (translatingSet.has(item.article)) {
-          translatingSet.delete(item.article);
-          if (!pendingQueueSet.has(item.article) && !item.article.querySelector('.dualang-translation')) {
-            pendingQueueSet.add(item.article);
-            showStatus(item.article, 'queued');
-            pendingQueue.unshift(item.article);
-          }
-        }
-      }
-      releaseSlot();
-    });
-
-    port.postMessage({ action: 'translate', payload: { texts, priority: hasHighPriority ? 1 : 0 } });
-
-    // 按总字符量动态超时，长文单次 batch 也能撑到完成
-    const streamTotalChars = texts.reduce((a, t) => a + t.length, 0);
-    const streamTimeoutMs = adaptiveTimeoutMs(streamTotalChars, STREAM_TIMEOUT_MS);
-    setTimeout(() => {
-      if (slotReleased) return;
-      let anyStuck = false;
-      for (const item of batch) {
-        if (translatingSet.has(item.article)) { anyStuck = true; break; }
-      }
-      if (anyStuck) {
-        perfLog('streamTimeout', { batchSize: batch.length, timeoutMs: streamTimeoutMs });
-        releaseSlot();
-        const e: any = new Error(`流式翻译超时 (${Math.round(streamTimeoutMs / 1000)}s)`);
-        e.retryable = true;
-        handleSubBatchError(e, batch, apiT0, performance.now() - apiT0);
-        try { port.disconnect(); } catch (_) {}
-      }
-    }, streamTimeoutMs);
   }
 
   // ========== 渲染单条翻译结果 + 写入内容 ID 缓存 ==========
@@ -1846,7 +1735,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     const cta = document.createElement('a');
     cta.className = 'dualang-long-cta';
     cta.href = 'javascript:void(0)';
-    cta.textContent = ctaTranslateNow(targetLang);
+    cta.textContent = ctaTranslateNow(uiLang);
     cta.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -1868,12 +1757,12 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     if (!cta) return;
     cta.dataset.state = state;
     if (state === 'translating') {
-      cta.textContent = ctaCancel(targetLang);
+      cta.textContent = ctaCancel(uiLang);
     } else if (state === 'done') {
       cta.style.display = 'none';
     } else {
       // failed → 恢复为"立即翻译"，允许重试
-      cta.textContent = ctaTranslateNow(targetLang);
+      cta.textContent = ctaTranslateNow(uiLang);
     }
   }
 

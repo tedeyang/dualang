@@ -54,8 +54,8 @@ describe('circuitBadge', () => {
 describe('validateProviderForm', () => {
   const base = { label: 'l', baseUrl: 'https://a.b/v1', model: 'm', apiKey: 'k' };
   it('accepts valid', () => expect(validateProviderForm(base)).toBeNull());
-  it('label required', () => {
-    expect(validateProviderForm({ ...base, label: '' })).toMatch(/名称/);
+  it('label is optional (empty label still valid)', () => {
+    expect(validateProviderForm({ ...base, label: '' })).toBeNull();
   });
   it('baseUrl required', () => {
     expect(validateProviderForm({ ...base, baseUrl: '' })).toMatch(/API 地址/);
@@ -80,20 +80,19 @@ describe('validateProviderForm', () => {
 describe('buildProviderEntry', () => {
   it('derives id from baseUrl + model', () => {
     const e = buildProviderEntry(
-      { label: 'GLM', baseUrl: 'https://api.siliconflow.cn/v1', model: 'THUDM/GLM-4-9B-0414', tags: '' },
+      { label: 'GLM', baseUrl: 'https://api.siliconflow.cn/v1', model: 'THUDM/GLM-4-9B-0414' },
       1_700_000_000_000,
     );
     expect(e.id).toBe('sf:THUDM/GLM-4-9B-0414');
     expect(e.apiKeyRef).toBe(e.id);
     expect(e.enabled).toBe(true);
-    expect(e.tags).toBeUndefined();
   });
-  it('parses tags by whitespace', () => {
+  it('label defaults to empty string when not provided', () => {
     const e = buildProviderEntry(
-      { label: 'X', baseUrl: 'https://api.siliconflow.cn/v1', model: 'M', tags: '  free  fast  ' },
+      { label: '', baseUrl: 'https://api.siliconflow.cn/v1', model: 'M' },
       0,
     );
-    expect(e.tags).toEqual(['free', 'fast']);
+    expect(e.label).toBe('');
   });
 });
 

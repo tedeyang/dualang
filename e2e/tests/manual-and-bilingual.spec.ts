@@ -20,17 +20,16 @@ async function setupApi(context: any, translatedText = '翻译结果。') {
 
 test.describe('Manual Translate Button (autoTranslate=false)', () => {
   test.beforeEach(async ({ popupPage }) => {
-    await popupPage.locator('#baseUrl').fill('https://api.moonshot.cn/v1');
-    await popupPage.locator('#apiKey').fill('sk-kimi-test-12345');
-    await popupPage.locator('#model').fill('moonshot-v1-8k');
-    await popupPage.locator('#reasoningEffort').selectOption('medium');
-    await popupPage.locator('#maxTokens').fill('4096');
-    await popupPage.locator('#targetLang').selectOption('zh-CN');
-    // 关闭自动翻译
-    await popupPage.locator('#autoTranslate').evaluate((el: HTMLInputElement) => { el.checked = false; });
-    await popupPage.locator('#displayMode').selectOption('append');
-    await popupPage.locator('#saveBtn').click();
-    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+    await popupPage.evaluate(async (s) => chrome.storage.sync.set(s), {
+      baseUrl: 'https://api.moonshot.cn/v1',
+      apiKey: 'sk-kimi-test-12345',
+      model: 'moonshot-v1-8k',
+      reasoningEffort: 'medium',
+      maxTokens: 4096,
+      targetLang: 'zh-CN',
+      displayMode: 'append',
+      autoTranslate: false,
+    });
   });
 
   test('关闭自动翻译后推文应显示「译」按钮而非自动翻译', async ({ context }) => {
@@ -76,27 +75,36 @@ test.describe('Manual Translate Button (autoTranslate=false)', () => {
     expect(stored.autoTranslate).toBe(false);
 
     await popupPage.reload();
-    await expect(popupPage.locator('#autoTranslate')).not.toBeChecked();
+    await expect(popupPage.locator('#autoTranslateSeg [data-auto="false"]')).toHaveClass(/active/);
   });
 });
 
-async function saveDisplayMode(popupPage: any, mode: 'append' | 'translation-only' | 'inline' | 'bilingual') {
-  await popupPage.locator('#baseUrl').fill('https://api.moonshot.cn/v1');
-  await popupPage.locator('#apiKey').fill('sk-kimi-test-12345');
-  await popupPage.locator('#model').fill('moonshot-v1-8k');
-  await popupPage.locator('#reasoningEffort').selectOption('medium');
-  await popupPage.locator('#maxTokens').fill('4096');
-  await popupPage.locator('#targetLang').selectOption('zh-CN');
-  await popupPage.locator('#autoTranslate').evaluate((el: HTMLInputElement) => { el.checked = true; });
-  await popupPage.locator('#lineFusionEnabled').evaluate((el: HTMLInputElement) => { el.checked = false; });
-  await popupPage.locator('#smartDictEnabled').evaluate((el: HTMLInputElement) => { el.checked = false; });
-  await popupPage.locator('#displayMode').selectOption(mode);
-  await popupPage.locator('#saveBtn').click();
-  await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+/**
+ * 把 "displayMode + lineFusionEnabled" 直接写入 storage。
+ * 新 UI 通过 3 主按钮 + 2 sub 按钮联合控制，但对 inline 模式没有 UI 入口；
+ * 测试需要任意 (displayMode, lineFusion) 组合时用直接 set 最省心。
+ */
+async function saveDisplayState(
+  popupPage: any,
+  displayMode: 'append' | 'translation-only' | 'inline' | 'bilingual',
+  lineFusionEnabled = false,
+) {
+  await popupPage.evaluate(async (s) => chrome.storage.sync.set(s), {
+    baseUrl: 'https://api.moonshot.cn/v1',
+    apiKey: 'sk-kimi-test-12345',
+    model: 'moonshot-v1-8k',
+    reasoningEffort: 'medium',
+    maxTokens: 4096,
+    targetLang: 'zh-CN',
+    autoTranslate: true,
+    displayMode,
+    lineFusionEnabled,
+    smartDictEnabled: false,
+  });
 }
 
-test.describe('Display Mode: append（默认，原文保留 + 译文附加）', () => {
-  test.beforeEach(async ({ popupPage }) => saveDisplayMode(popupPage, 'append'));
+test.describe('Display Mode: append（整段追加，lineFusion=false）', () => {
+  test.beforeEach(async ({ popupPage }) => saveDisplayState(popupPage, 'append', false));
 
   test('append 模式下原文 tweetText 仍可见', async ({ context }) => {
     await setupApi(context, '火星将会令人惊叹。');
@@ -113,8 +121,8 @@ test.describe('Display Mode: append（默认，原文保留 + 译文附加）', 
   });
 });
 
-test.describe('Display Mode: translation-only（隐藏原文）', () => {
-  test.beforeEach(async ({ popupPage }) => saveDisplayMode(popupPage, 'translation-only'));
+test.describe('Display Mode: translation-only（覆盖原文）', () => {
+  test.beforeEach(async ({ popupPage }) => saveDisplayState(popupPage, 'translation-only', false));
 
   test('translation-only 模式下原文 tweetText 被 CSS 隐藏', async ({ context }) => {
     await setupApi(context, '火星将会令人惊叹。');
@@ -131,10 +139,10 @@ test.describe('Display Mode: translation-only（隐藏原文）', () => {
   });
 });
 
-test.describe('Display Mode: inline（段落对照）', () => {
-  test.beforeEach(async ({ popupPage }) => saveDisplayMode(popupPage, 'inline'));
+test.describe('Display Mode: inline（段落对照，storage 直写，UI 无入口）', () => {
+  test.beforeEach(async ({ popupPage }) => saveDisplayState(popupPage, 'inline', false));
 
-  test('inline 模式下每段原文克隆 + 译文交错', async ({ context }) => {
+  test('inline 模式下每段原文克隆 + 译文交错（content.js 行为保留）', async ({ context }) => {
     await setupApi(context, '火星将会令人惊叹。\n\n我们将让生命成为多行星物种。');
     const page = await context.newPage();
     await page.goto(mockPagePath);
@@ -153,7 +161,7 @@ test.describe('Display Mode: inline（段落对照）', () => {
 });
 
 test.describe('Display Mode: bilingual（整体对照）', () => {
-  test.beforeEach(async ({ popupPage }) => saveDisplayMode(popupPage, 'bilingual'));
+  test.beforeEach(async ({ popupPage }) => saveDisplayState(popupPage, 'bilingual', false));
 
   test('bilingual 模式：原生 tweetText 可见（变暗）+ card 带 dualang-bilingual 类', async ({ context }) => {
     await setupApi(context, '火星将会令人惊叹。');
@@ -162,7 +170,6 @@ test.describe('Display Mode: bilingual（整体对照）', () => {
     await page.setViewportSize({ width: 1280, height: 800 });
 
     // 新方案：tweetText 不再隐藏，避免切换 append↔bilingual 时页面跳动
-    // 强调通过 CSS 色彩实现（原生 tweetText 变暗 + 译文原生色）
     await expect(page.locator('#tweet-1 .dualang-bilingual')).toBeVisible({ timeout: 5000 });
     await expect(page.locator('#tweet-1 [data-testid="tweetText"]')).toBeVisible();
     // 不再克隆原文到 card 内部
@@ -172,26 +179,33 @@ test.describe('Display Mode: bilingual（整体对照）', () => {
   });
 });
 
-test.describe('Display Mode: 持久化与迁移', () => {
-  test('保存 displayMode=inline 后刷新回显', async ({ popupPage }) => {
-    await saveDisplayMode(popupPage, 'inline');
+test.describe('Display Mode: UI 持久化与迁移', () => {
+  test('按行交替 + 高亮翻译 保存后刷新回显对照 + bilingual sub', async ({ popupPage }) => {
+    await popupPage.locator('#displaySegment [data-mode="contrast"]').click();
+    await popupPage.locator('#contrastStyleRow [data-style="bilingual"]').click();
+    await popupPage.locator('#saveBtn').click();
+    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
     const stored = await popupPage.evaluate(async () =>
-      chrome.storage.sync.get(['displayMode'])
+      chrome.storage.sync.get(['displayMode', 'lineFusionEnabled'])
     );
-    expect(stored.displayMode).toBe('inline');
+    expect(stored.displayMode).toBe('bilingual');
+    expect(stored.lineFusionEnabled).toBe(true);
 
     await popupPage.reload();
-    await expect(popupPage.locator('#displayMode')).toHaveValue('inline');
+    await expect(popupPage.locator('#displaySegment [data-mode="contrast"]')).toHaveClass(/active/);
+    await expect(popupPage.locator('#contrastStyleRow [data-style="bilingual"]')).toHaveClass(/active/);
   });
 
-  test('老 bilingualMode=true 在未设 displayMode 时迁移为 inline', async ({ popupPage }) => {
+  test('老 bilingualMode=true 迁移到 按行交替 + 高亮原文 UI', async ({ popupPage }) => {
     // 清掉 displayMode，只留旧 bilingualMode=true，模拟老用户配置
     await popupPage.evaluate(async () => {
-      await chrome.storage.sync.set({ bilingualMode: true });
+      await chrome.storage.sync.set({ bilingualMode: true, lineFusionEnabled: false });
       await chrome.storage.sync.remove('displayMode');
     });
     await popupPage.reload();
-    await expect(popupPage.locator('#displayMode')).toHaveValue('inline');
+    // 旧 bilingualMode=true → displayMode='inline' → UI 映射到 按行交替 + 高亮原文
+    await expect(popupPage.locator('#displaySegment [data-mode="contrast"]')).toHaveClass(/active/);
+    await expect(popupPage.locator('#contrastStyleRow [data-style="append"]')).toHaveClass(/active/);
   });
 });
 
@@ -233,10 +247,8 @@ async function setupDictApi(
 
 test.describe('Enhancements: line fusion + smart dictionary', () => {
   test('bilingual + 逐行融合：多行原文渲染 line-fusion pair 并隐藏 tweetText', async ({ popupPage, context }) => {
-    await saveDisplayMode(popupPage, 'bilingual');
-    await popupPage.locator('#lineFusionEnabled').evaluate((el: HTMLInputElement) => { el.checked = true; });
-    await popupPage.locator('#saveBtn').click();
-    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+    // 按行交替 + 高亮翻译 = displayMode=bilingual + lineFusion=true
+    await saveDisplayState(popupPage, 'bilingual', true);
 
     await setupApi(context, '第一行译文。\n第二行译文。');
     const page = await context.newPage();
@@ -249,10 +261,8 @@ test.describe('Enhancements: line fusion + smart dictionary', () => {
   });
 
   test('append + 逐行融合：pair 内含原文行（不再是孤立分隔线）', async ({ popupPage, context }) => {
-    await saveDisplayMode(popupPage, 'append');
-    await popupPage.locator('#lineFusionEnabled').evaluate((el: HTMLInputElement) => { el.checked = true; });
-    await popupPage.locator('#saveBtn').click();
-    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+    // 按行交替 + 高亮原文 = displayMode=append + lineFusion=true
+    await saveDisplayState(popupPage, 'append', true);
 
     await setupApi(context, '第一行译文。\n第二行译文。');
     const page = await context.newPage();
@@ -270,10 +280,7 @@ test.describe('Enhancements: line fusion + smart dictionary', () => {
   });
 
   test('单行原文不触发逐行融合', async ({ popupPage, context }) => {
-    await saveDisplayMode(popupPage, 'append');
-    await popupPage.locator('#lineFusionEnabled').evaluate((el: HTMLInputElement) => { el.checked = true; });
-    await popupPage.locator('#saveBtn').click();
-    await expect(popupPage.locator('#status')).toHaveText('设置已保存');
+    await saveDisplayState(popupPage, 'append', true);
 
     await setupApi(context, '紧凑模式单行翻译。');
     const page = await context.newPage();
@@ -288,7 +295,7 @@ test.describe('Enhancements: line fusion + smart dictionary', () => {
   });
 
   test('智能字典：英文原文在 append 模式下出现【音标 释义】注释（真实 DOM span）', async ({ popupPage, context }) => {
-    await saveDisplayMode(popupPage, 'append');
+    await saveDisplayState(popupPage, 'append', false);
     await popupPage.locator('#smartDictEnabled').evaluate((el: HTMLInputElement) => { el.checked = true; });
     await popupPage.locator('#saveBtn').click();
     await expect(popupPage.locator('#status')).toHaveText('设置已保存');
@@ -300,15 +307,13 @@ test.describe('Enhancements: line fusion + smart dictionary', () => {
     await expect(page.locator('#tweet-1 .dualang-translation')).toBeVisible({ timeout: 5000 });
     const defSpan = page.locator('#tweet-1 [data-testid="tweetText"] .dualang-dict-term .dualang-dict-def').first();
     await expect(defSpan).toBeVisible({ timeout: 5000 });
-    // 格式：【释义 /ipa/】 —— 译文在前，IPA 在后；不再显示 level 徽章
     await expect(defSpan).toHaveText('【惊艳 /əˈmeɪzɪŋ/】');
-    // level 仍持久化到 data-level，便于未来扩展，但不影响文本渲染
     await expect(defSpan).toHaveAttribute('data-level', 'cet6');
     await page.close();
   });
 
   test('translation-only 模式下跳过字典注释（原文被隐藏）', async ({ popupPage, context }) => {
-    await saveDisplayMode(popupPage, 'translation-only');
+    await saveDisplayState(popupPage, 'translation-only', false);
     await popupPage.locator('#smartDictEnabled').evaluate((el: HTMLInputElement) => { el.checked = true; });
     await popupPage.locator('#saveBtn').click();
     await expect(popupPage.locator('#status')).toHaveText('设置已保存');
@@ -318,14 +323,13 @@ test.describe('Enhancements: line fusion + smart dictionary', () => {
     await page.goto(mockPagePath);
     await page.setViewportSize({ width: 1280, height: 800 });
     await expect(page.locator('#tweet-1 .dualang-translation')).toBeVisible({ timeout: 5000 });
-    // 等够时间，确认字典 span 始终不出现
     await page.waitForTimeout(800);
     await expect(page.locator('#tweet-1 .dualang-dict-term')).toHaveCount(0);
     await page.close();
   });
 
   test('中文原文不触发字典（非英文短路）', async ({ popupPage, context }) => {
-    await saveDisplayMode(popupPage, 'append');
+    await saveDisplayState(popupPage, 'append', false);
     await popupPage.locator('#smartDictEnabled').evaluate((el: HTMLInputElement) => { el.checked = true; });
     await popupPage.locator('#saveBtn').click();
     await expect(popupPage.locator('#status')).toHaveText('设置已保存');
@@ -334,14 +338,13 @@ test.describe('Enhancements: line fusion + smart dictionary', () => {
     const page = await context.newPage();
     await page.goto(mockPagePath);
     await page.setViewportSize({ width: 1280, height: 800 });
-    // tweet-4 是简体中文 —— 扩展识别后被跳过翻译；dict 同样短路
     await page.waitForTimeout(1500);
     await expect(page.locator('#tweet-4 .dualang-dict-term')).toHaveCount(0);
     await page.close();
   });
 
   test('字典 API 失败不影响主翻译（译文卡仍正常渲染）', async ({ popupPage, context }) => {
-    await saveDisplayMode(popupPage, 'append');
+    await saveDisplayState(popupPage, 'append', false);
     await popupPage.locator('#smartDictEnabled').evaluate((el: HTMLInputElement) => { el.checked = true; });
     await popupPage.locator('#saveBtn').click();
     await expect(popupPage.locator('#status')).toHaveText('设置已保存');
@@ -352,7 +355,6 @@ test.describe('Enhancements: line fusion + smart dictionary', () => {
     await page.setViewportSize({ width: 1280, height: 800 });
     await expect(page.locator('#tweet-1 .dualang-translation')).toBeVisible({ timeout: 5000 });
     await expect(page.locator('#tweet-1 .dualang-translation')).toContainText('火星将会令人惊叹');
-    // 等字典请求确实跑完
     await page.waitForTimeout(800);
     await expect(page.locator('#tweet-1 .dualang-dict-term')).toHaveCount(0);
     await page.close();

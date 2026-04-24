@@ -1,6 +1,6 @@
 // background.js —— Service Worker 编排层（orchestrator）
 
-import { getCache, getCacheBatch, setCache, cacheKey } from './cache';
+import { getCache, getCacheBatch, setCache, cacheKey, clearAllCache } from './cache';
 import { getSettings, invalidateSettingsCache, getMoonshotKey, getProviderKeyFromConfig } from './settings';
 import { rateLimiter } from './rate-limiter';
 import { doTranslateSingle, doTranslateBatchRequest, doTranslateBatchStream, doAnnotateDictionary } from './api';
@@ -23,7 +23,8 @@ import {
   getPerformance as routerGetPerformance,
 } from './router/storage';
 import { recordOutcome as routerRecordOutcome, classifyErrorKind } from './router/recorder';
-import { getEffectiveSettings } from './router/service';
+import { getEffectiveSettings, selectCandidates as routerSelectCandidates } from './router/service';
+import { log } from '../shared/logger';
 
 // ===================== Router 数据迁移（幂等）=====================
 // SW 启动和 popup 打开都会触发；版本戳控制单次执行。
@@ -48,7 +49,7 @@ async function maybeRunRouterMigration() {
       cfg,
     );
   } catch (e) {
-    console.warn('[router] migration failed (non-fatal):', e);
+    log.warn('router.migration.fail', { error: (e as Error)?.message || String(e) });
   }
 }
 maybeRunRouterMigration();
@@ -104,15 +105,16 @@ async function handleRouterSample(
       { provider, apiKey },
       signal,
       (caseResult: SamplerCaseResult) => {
-        // 控制台里完整输出一行便于线下调优；不发给 UI，防污染 popup。
-        const tail = caseResult.outputHead?.slice(0, 80) || '';
+        // 控制台详细输出便于线下调优；不发给 UI，防污染 popup。
         const reasons = (caseResult.verdict as any)?.reasons?.join('；') || '';
-        console.log(
-          `[router.sample] ${provider.id} ${caseResult.name}`,
-          `ok=${caseResult.ok}`, `rtt=${caseResult.rttMs}ms`,
-          reasons ? `fail="${reasons}"` : '',
-          tail ? `out="${tail}"` : '',
-        );
+        log.info('router.sample.case', {
+          providerId: provider.id,
+          name: caseResult.name,
+          ok: caseResult.ok,
+          rttMs: caseResult.rttMs,
+          fail: reasons || undefined,
+          outHead: caseResult.outputHead?.slice(0, 80) || undefined,
+        });
         try { port.postMessage({ type: 'case', result: caseResult }); } catch (_) {}
       },
     );
@@ -147,11 +149,67 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 // ===================== 生命周期 & 菜单 =====================
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('[Dualang] 扩展已安装');
+  log.info('extension.installed');
   initContextMenu();
   chrome.storage.sync.get({ enabled: true }).then(({ enabled }) => {
     updateContextMenu(enabled);
   });
+});
+
+// ===================== 配置变更可观测 =====================
+// 集中在 background 打日志：不管是 popup 保存、bubble 快切还是其他路径写 storage，
+// 都能在 SW 控制台看到 `[Dualang] config.change.*` 事件。高频 key（bubble 的 dualang_error_v1 /
+// 画像写入等）不在这张白名单里，不会刷屏。
+const LOGGED_CONFIG_KEYS: Record<string, string> = {
+  enabled: 'enabled',
+  autoTranslate: 'autoTranslate',
+  displayMode: 'displayMode',
+  lineFusionEnabled: 'lineFusionEnabled',
+  smartDictEnabled: 'smartDictEnabled',
+  targetLang: 'targetLang',
+  uiLang: 'uiLang',
+  reasoningEffort: 'reasoningEffort',
+  baseUrl: 'baseUrl',
+  model: 'model',
+  fallbackEnabled: 'fallbackEnabled',
+  fallbackModel: 'fallbackModel',
+};
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'sync') {
+    for (const key of Object.keys(changes)) {
+      if (!(key in LOGGED_CONFIG_KEYS)) continue;
+      const { oldValue, newValue } = changes[key];
+      // apiKey 明文不进日志，只报 key 本身变了
+      if (key === 'apiKey' || key === 'fallbackApiKey') {
+        log.info('config.change', { key, changed: true });
+      } else {
+        log.info('config.change', { key, from: oldValue, to: newValue });
+      }
+    }
+    // providers 数组特殊处理：只报长度 + id 序列，避免打印 full entry
+    if (changes.providers) {
+      const prev = (changes.providers.oldValue as any[]) || [];
+      const next = (changes.providers.newValue as any[]) || [];
+      log.info('config.change.providers', {
+        prevCount: prev.length,
+        nextCount: next.length,
+        order: next.map((p) => p.id),
+      });
+    }
+    if (changes.dualang_routing_v1) {
+      log.info('config.change.routing', {
+        from: changes.dualang_routing_v1.oldValue,
+        to: changes.dualang_routing_v1.newValue,
+      });
+    }
+  } else if (area === 'local') {
+    if (changes.dualang_custom_prompts_v1) {
+      const next = (changes.dualang_custom_prompts_v1.newValue || {}) as Record<string, string>;
+      log.info('config.change.customPrompts', {
+        overriddenKeys: Object.keys(next),
+      });
+    }
+  }
 });
 
 const MENU_ID = 'dualang-toggle';
@@ -282,6 +340,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     resetStats().then(() => sendResponse({ success: true }));
     return true;
   }
+  if (request.action === 'clearCache') {
+    clearAllCache().then(() => sendResponse({ success: true }));
+    return true;
+  }
   if (request.action === 'getProviderKey') {
     // content script 切换模型时需要 provider 对应的 key；content 不能直接 fetch config.json
     // （不在 web_accessible_resources 里，硬声明又会把 key 泄露给任意 X 页面）。
@@ -309,7 +371,7 @@ async function handleAnnotateDictionary(payload: any) {
   // 降到 6 后输出体积减半，RTT 预计降到 5-7s，且学习价值"前 6 个最难"已经足够。
   const hardCandidates = filterHardCandidates(rawCandidates, { threshold: 0.5, max: 6 });
   if (hardCandidates.length === 0) {
-    console.log('[Dualang] dict.skip.allEasy', {
+    log.debug('dict.skip.allEasy', {
       raw: rawCandidates.length, hard: 0, textLen: text.length,
     });
     return { entries: [] };
@@ -333,7 +395,7 @@ async function handleAnnotateDictionary(payload: any) {
     const result = await doAnnotateDictionary(text, dictSettings, hardCandidates, controller.signal);
     const rtt = performance.now() - t0;
     recordRequest(settings.model, true, rtt).catch(() => {});
-    console.log('[Dualang] dict.request.ok', {
+    log.info('dict.request.ok', {
       model: settings.model, rttMs: Math.round(rtt),
       raw: rawCandidates.length, hard: hardCandidates.length, entries: result.entries.length,
     });
@@ -342,7 +404,7 @@ async function handleAnnotateDictionary(payload: any) {
     if (err?.name !== 'AbortError') {
       recordRequest(settings.model, false, performance.now() - t0).catch(() => {});
       recordError(settings.model, err?.message || 'dict error').catch(() => {});
-      console.warn('[Dualang] dict.request.fail', {
+      log.warn('dict.request.fail', {
         model: settings.model, error: err?.message,
         raw: rawCandidates.length, hard: hardCandidates.length,
       });
@@ -358,7 +420,18 @@ async function handleTranslate(payload: any) {
   // P5: router 把 primary provider 注入到 settings 的 {apiKey,baseUrl,model} 字段，
   // secondary 注入到 {fallback*}。无 primary 时 fall back 到 legacy getSettings。
   const settings = await getEffectiveSettings({ kind: 'batch' });
-  console.log('[Dualang] translate config baseUrl=', settings.baseUrl, 'model=', settings.model, 'priority=', payload.priority);
+  log.info('translate.request', {
+    texts: Array.isArray(payload.texts) ? payload.texts.length : 1,
+    chars: Array.isArray(payload.texts)
+      ? payload.texts.reduce((a: number, t: string) => a + (t?.length || 0), 0)
+      : (payload.text?.length || 0),
+    priority: payload.priority || 0,
+    model: settings.model,
+    baseUrl: settings.baseUrl,
+    smartDict: !!payload.smartDict,
+    strictMode: !!payload.strictMode,
+    retranslateBoost: !!payload.retranslateBoost,
+  });
 
   if (payload.texts && Array.isArray(payload.texts)) {
     // 试试手气重译：temperature 上浮 + prompt 加强。复制 settings 到本次调用，
@@ -383,10 +456,8 @@ async function handleTranslate(payload: any) {
 
   // 单条模式（向后兼容）
   const hash = cacheKey(payload.text, settings.targetLang, settings.model, settings.baseUrl);
-  if (!settings.enableStreaming) {
-    const cached = await getCache(hash);
-    if (cached) return { translated: cached.translated, fromCache: true };
-  }
+  const cached = await getCache(hash);
+  if (cached) return { translated: cached.translated, fromCache: true };
   if (inFlight.has(hash)) {
     const result = await inFlight.get(hash);
     return { translated: result.translated, fromCache: false };
@@ -394,9 +465,7 @@ async function handleTranslate(payload: any) {
 
   const flightPromise = doTranslateSingle(payload.text, settings)
     .then(async (result) => {
-      if (!settings.enableStreaming) {
-        await setCache(hash, { text: payload.text, translated: result.translated, lang: settings.targetLang, model: settings.model, ts: Date.now() });
-      }
+      await setCache(hash, { text: payload.text, translated: result.translated, lang: settings.targetLang, model: settings.model, ts: Date.now() });
       return result;
     })
     .finally(() => { inFlight.delete(hash); });
@@ -587,57 +656,58 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
 
   try {
     const baseSettings = await getSettings();
-    // Provider 池：多 provider 接力，单路限流时自动切到下一路，冷却期满再回来。
-    // 同一账号的不同模型共享 TPM 桶（硅基），所以只把"不同账号/不同服务商"并列。
+
+    // wantsMoonshot：用户明确指定 Moonshot 模型 → Moonshot 必须排首位
     const wantsMoonshot = typeof payload.model === 'string' &&
       (payload.model.startsWith('moonshot-') || payload.model.startsWith('kimi-'));
-    const moonshotKey = await getMoonshotKey();
 
-    const slots: Slot[] = [];
-    // 主路：用户主设置。wantsMoonshot=true 时主路就是 Moonshot，primary 作为接力兜底。
+    // 从 router 枚举所有可用 provider（primary → secondary → 其余 enabled）
+    let candidates = await routerSelectCandidates({ kind: 'super-fine-chunk' });
+
     if (wantsMoonshot) {
-      if (!moonshotKey) throw new Error('Moonshot 模型需要 API Key；请在 config.json 的 providers.moonshot.apiKey 填入');
-      slots.push({
-        label: `moonshot:${payload.model}`, budget: MOONSHOT_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
-        mode: 'batch',
-        settings: buildSuperFineSettings(baseSettings, { model: payload.model, apiKey: moonshotKey }),
-      });
-      if (baseSettings.apiKey) {
-        slots.push({
-          label: `primary:${baseSettings.model}`, budget: SF_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
-          mode: 'batch',
-          settings: buildSuperFineSettings(baseSettings),
-        });
-      }
-    } else {
+      const moonshotCand = candidates.find((c) => c.entry.baseUrl.includes('moonshot'));
+      if (!moonshotCand) throw new Error('Moonshot 模型需要 API Key；请在 config.json 的 providers.moonshot.apiKey 填入');
+      // Moonshot 排首位，其余保序
+      candidates = [moonshotCand, ...candidates.filter((c) => c !== moonshotCand)];
+    }
+
+    const slots: Slot[] = candidates.map((c) => {
+      const isMoonshot = c.entry.baseUrl.includes('moonshot');
+      return {
+        label: `${c.role}:${c.entry.model}`,
+        budget: isMoonshot ? MOONSHOT_TPM_BUDGET : SF_TPM_BUDGET,
+        tpmLog: [], cooldownUntil: 0,
+        mode: 'batch' as const,
+        settings: isMoonshot
+          ? buildSuperFineSettings(baseSettings, { model: c.entry.model, apiKey: c.apiKey })
+          : { ...buildSuperFineSettings(baseSettings), apiKey: c.apiKey, baseUrl: c.entry.baseUrl, model: c.entry.model },
+      };
+    });
+
+    // 若 router 无任何候选（迁移尚未完成或 providers 全部禁用），退回旧主设置
+    if (slots.length === 0) {
       if (!baseSettings.apiKey) throw new Error('精翻需要 API Key；请在 popup 设置或 config.json 填入 SiliconFlow key');
       slots.push({
         label: `primary:${baseSettings.model}`, budget: SF_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
         mode: 'batch',
         settings: buildSuperFineSettings(baseSettings),
       });
-      // 硅基同账号接力（实测：同账号不同模型是独立 TPM 桶）。
-      // batch 协议候选模型实测都崩（Qwen2.5-7B 标签全乱、Qwen3.5-9B reasoning 漏字、
-      // internlm 服务端 500），但 single 调用质量都过关。
-      // 用 single 模式接力 —— 多花 ~2-3x token 换更广接力面 + 0 协议风险。
-      if (!/Qwen2\.5-7B/i.test(baseSettings.model || '')) {
-        slots.push({
-          label: 'sf-single:Qwen/Qwen2.5-7B-Instruct',
-          budget: SF_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
-          mode: 'single', singleConcurrency: 3,
-          settings: { ...buildSuperFineSettings(baseSettings), model: 'Qwen/Qwen2.5-7B-Instruct' },
-        });
-      }
-      // Moonshot 锦上添花（独立账号 = 完全独立桶，且 batch 协议稳）
-      if (moonshotKey) {
-        slots.push({
-          label: 'moonshot:moonshot-v1-8k', budget: MOONSHOT_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
-          mode: 'batch',
-          settings: buildSuperFineSettings(baseSettings, { model: 'moonshot-v1-8k', apiKey: moonshotKey }),
-        });
-      }
     }
-    console.log('[Dualang] super-fine provider pool', { slots: slots.map((s) => s.label) });
+
+    // 硅基同账号 Qwen2.5-7B single-mode 接力尾槽：
+    // batch 协议在该模型实测不稳（标签全乱），用 single 模式绕开；多花 ~2-3x token 换接力面。
+    // 只在以下情况追加：router candidates 里没有它、主路本身不是它、且不是 Moonshot 专属路径
+    const hasQwen = candidates.some((c) => /Qwen2\.5-7B/i.test(c.entry.model));
+    const primaryIsQwen = /Qwen2\.5-7B/i.test(baseSettings.model || '');
+    if (!hasQwen && !primaryIsQwen && !wantsMoonshot) {
+      slots.push({
+        label: 'sf-single:Qwen/Qwen2.5-7B-Instruct',
+        budget: SF_TPM_BUDGET, tpmLog: [], cooldownUntil: 0,
+        mode: 'single', singleConcurrency: 3,
+        settings: { ...buildSuperFineSettings(baseSettings), model: 'Qwen/Qwen2.5-7B-Instruct' },
+      });
+    }
+    log.info('super-fine.pool', { slots: slots.map((s) => s.label) });
     // 兼容旧代码：`settings` 指向主 slot（emit meta 用）
     const settings = slots[0].settings;
 
@@ -658,7 +728,7 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
       baseUrl: settings.baseUrl,
     });
     const totalChars = paragraphs.reduce((s, p) => s + p.length, 0);
-    console.log('[Dualang] super-fine stream start', {
+    log.info('super-fine.start', {
       paragraphs: paragraphs.length, chunks: totalChunks, chars: totalChars,
     });
 
@@ -673,7 +743,7 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
       if (disconnected || abortController.signal.aborted) return;
       // 所有 slot 永久故障 → pool 报废，整体失败
       if (slots.every((s) => s.disabled)) {
-        console.warn('[Dualang] super-fine pool exhausted (all slots disabled)');
+        log.warn('super-fine.pool.exhausted');
         if (!disconnected) port.postMessage({ action: 'error', error: '所有 provider 永久不可用（auth / model 错误）' });
         return;
       }
@@ -755,7 +825,7 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
         while (!slot) {
           const nextAt = nextAvailableAt(slots);
           const waitMs = Math.max(500, nextAt - Date.now() + 500);
-          console.log('[Dualang] super-fine all slots busy, sleeping', { waitMs });
+          log.info('super-fine.sleep', { waitMs });
           await sleep(waitMs);
           if (disconnected || abortController.signal.aborted) return;
           slot = pickSlot(slots);
@@ -765,7 +835,7 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
           break;
         }
         if (slot.label !== lastSlotLabel) {
-          console.log('[Dualang] super-fine relay', { chunkIndex: ci, slot: slot.label });
+          log.info('super-fine.relay', { chunkIndex: ci, slot: slot.label });
           lastSlotLabel = slot.label;
         }
         const slotStartedAt = Date.now();
@@ -791,13 +861,13 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
           });
           if (isPermanentError(msg)) {
             slot.disabled = true;
-            console.warn('[Dualang] super-fine slot DISABLED (permanent error)', {
+            log.warn('super-fine.slot.disabled', {
               chunkIndex: ci, slot: slot.label, error: msg.slice(0, 160),
             });
           } else {
             const isTpm = isTpmError(msg);
             slot.cooldownUntil = Date.now() + (isTpm ? TPM_COOLDOWN_MS : NONTPM_COOLDOWN_MS);
-            console.warn('[Dualang] super-fine slot cooldown', {
+            log.warn('super-fine.slot.cooldown', {
               chunkIndex: ci, slot: slot.label, tpm: isTpm,
               cooldownMs: isTpm ? TPM_COOLDOWN_MS : NONTPM_COOLDOWN_MS,
               error: msg.slice(0, 120),
@@ -807,7 +877,7 @@ async function handleSuperFineStream(payload: any, port: chrome.runtime.Port) {
       }
 
       if (!chunkSucceeded && !disconnected) {
-        console.warn('[Dualang] super-fine chunk fail (all slots tried)', { chunkIndex: ci, tried: [...triedLabels] });
+        log.warn('super-fine.chunk.fail', { chunkIndex: ci, tried: [...triedLabels] });
         port.postMessage({ action: 'chunkFail', chunkIndex: ci, error: 'all providers exhausted' });
       }
 
@@ -906,7 +976,7 @@ async function raceMainAndFallback(
     ]);
     if (winner.src === 'main') fbAbort.abort();
     else mainAbort.abort();
-    console.log('[Dualang] hedged.winner', {
+    log.info('hedged.winner', {
       src: winner.src, delayMs: hedgeDelayMs, count: texts.length,
     });
     const useSettings = winner.src === 'main' ? settings : fallbackSettings;
@@ -988,7 +1058,7 @@ async function handleTranslateBatch(
   // 全命中：不占 rate limiter、不做 in-flight 登记
   if (toTranslateTexts.length === 0) {
     recordCacheHit(texts.length).catch(() => {});
-    console.log('[Dualang] cache.hit.full', { count: texts.length, model: settings.model });
+    log.info('cache.hit.full', { count: texts.length, model: settings.model });
     return { translations: results, model: settings.model, baseUrl: settings.baseUrl, fromCache: true };
   }
   if (toTranslateTexts.length < texts.length) {
@@ -1075,7 +1145,7 @@ async function handleTranslateBatch(
         totalTokens: apiResult.usage?.total_tokens,
         translatedTexts: apiResult.translations,
       });
-      console.log('[Dualang] translation.request.ok', {
+      log.info('translate.request.ok', {
         model: usedModel, rttMs: Math.round(rtt), tokens: apiResult.usage?.total_tokens, count: toTranslateTexts.length,
       });
       await applyBatchResult(texts, toTranslateIndices, apiResult, results, settings, usedModel, dictOut, smartDictIndices);
@@ -1101,14 +1171,14 @@ async function handleTranslateBatch(
         success: false,
         errorKind: classifyErrorKind(err),
       });
-      console.warn('[Dualang] translation.request.fail', {
+      log.warn('translate.request.fail', {
         model: settings.model, rttMs: Math.round(rtt), error: err.message, retryable: err.retryable,
       });
       // hedged 模式下主+兜底已并发尝试过；非 hedged 且 fallback 已配置 → 立刻切换
       // （不在主上浪费 3 次指数退避 ≈ 14s 的等待）
       if (shouldHedge(settings, priority) || !isFallbackConfigured(settings)) throw err;
 
-      console.log('[Dualang] fallback.activated', {
+      log.warn('fallback.activated', {
         reason: err.message, retryable: !!err.retryable, to: settings.fallbackModel,
       });
       const fbStartedAt = performance.now();

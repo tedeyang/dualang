@@ -21,6 +21,7 @@ import {
 } from './storage';
 import { transitionOnFailure, transitionOnSuccess } from './circuit';
 import { cjkRatio, englishLeakRatio } from './sampler-validators';
+import { log } from '../../shared/logger';
 
 export interface Outcome {
   /** 原文总字符数（用来决定放入 short/medium/long 哪个 tier） */
@@ -173,7 +174,7 @@ export async function recordOutcome(
     }
     await Promise.all(writes);
   } catch (e) {
-    console.warn('[router.recorder] recordOutcome failed (ignored):', e);
+    log.warn('router.recorder.fail', { error: (e as Error)?.message || String(e) });
   }
 }
 

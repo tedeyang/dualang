@@ -11,6 +11,16 @@ const CACHE_MAX_SIZE = 500;
 const MEM_CACHE_MAX = 2000;
 const memCacheMap = new Map();
 
+/** 清空 L1 + L2 翻译缓存（popup "清除缓存" 按钮用）；统计/画像不动 */
+export async function clearAllCache(): Promise<void> {
+  memCacheMap.clear();
+  try {
+    await chrome.storage.local.remove(CACHE_KEY);
+  } catch {
+    // 环境里没有 chrome.storage 时（单测）静默
+  }
+}
+
 /** L1 内存缓存读取；命中后重新插入以维持 LRU 序。 */
 function memCacheGet(hash: string) {
   if (!memCacheMap.has(hash)) return null;

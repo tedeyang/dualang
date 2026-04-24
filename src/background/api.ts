@@ -12,6 +12,11 @@ import {
 } from './profiles';
 import { iterateSseDeltas } from './sse';
 import { filterHardCandidates } from './difficulty';
+import { getCustomPrompts, applyLangToken } from './custom-prompts';
+import { log } from '../shared/logger';
+
+// 独立字典注释 prompt：JSON 输出契约（{"entries":[...]}）由解析器消费 —— 锁定，不接收用户自定义。
+const ANNOTATE_DICT_PROMPT = `你是英文词汇助手。为给定的高难英文词（已经本地预筛）生成 IPA 音标 + {{LANG}}释义 + 难度级别。输出严格 JSON：{"entries":[{"term":"","ipa":"","gloss":"","level":"cet6|ielts|kaoyan"}]}。level 从 {cet6, ielts, kaoyan} 选 —— 六级 / 雅思 / 考研，按词的实际难度判断。gloss 用{{LANG}}，简短（≤8 字），不要整句解释。候选词都应该收录；若某词确实不该注释可以省略。每个条目必须有 term 和（ipa 或 gloss）。`;
 import type { Settings, TokenUsage, DictionaryEntry } from '../shared/types';
 
 // ===================== 思考模式控制 =====================
@@ -59,33 +64,38 @@ export function applyThinkingMode(body: any, settings: Settings, profile?: Provi
 const MAX_TOKENS_HARD_CAP = 32_000;
 
 /**
- * 自适应 max_tokens：把 user 设置的 per-item 上限与输入字符量两个信号取较大者。
+ * 自适应 max_tokens：纯基于输入字符量估算 —— UI 不再暴露配置。
  *
- * 为什么不是固定 4096：
+ * 为什么不是固定数：
  *   - 20k 字符的 X 长文翻译输出约 10-14k tokens（EN→ZH 译文字符约为输入 70%；CJK
  *     每字 ~1.5 token；标签 / 段落开销另计）。固定 4096 会在模型中途被 max_tokens
  *     截断，表现为返回 713 左右字符的"被掐头"译文，触发质量重试死循环。
- *   - 短推文不降低：当 estimate 小于 userCap × count 时用 userCap × count 保底，
- *     维持和旧逻辑一致的"宽裕"行为，避免意外踩到短文本模型输出偏长的边界。
+ *   - 底线 2048/条：极短推文的正常译文 < 200 tokens，留足安全冗余；模型不会因为
+ *     max_tokens 过低而切断正常翻译。
  *
- * 比率 chars/2：按 EN→ZH 经验估值，1 输入字符 ≈ 0.5 输出 token（包含 JSON 结构开销
- * 已单独计入 items × 120）。比旧公式的 chars/3 更宽，给 CJK 展开留安全空间。
+ * 比率 chars/2：按 EN→ZH 经验估值，1 输入字符 ≈ 0.5 输出 token（JSON 结构开销
+ * 单独计入 items × 120）。给 CJK 展开留安全空间。
+ *
+ * `settings.maxTokens` 仅作为**内部 override 通道**保留（super-fine 给 moonshot 拔到 8192）；
+ * UI 不会写该字段，popup 打开时还会主动清理 storage 里的历史值。
  */
-export function computeMaxTokens(settings: Settings, texts: string[]): number | undefined {
-  const userCap = parseInt(String(settings.maxTokens ?? ''), 10);
-  if (isNaN(userCap) || userCap <= 0) return undefined;
+const DEFAULT_MAX_TOKENS_PER_ITEM = 2048;
+
+export function computeMaxTokens(settings: Settings, texts: string[]): number {
+  const override = parseInt(String(settings.maxTokens ?? ''), 10);
+  const perItemFloor = (isNaN(override) || override <= 0) ? DEFAULT_MAX_TOKENS_PER_ITEM : override;
   const inputChars = texts.reduce((sum, t) => sum + t.length, 0);
   const estimated = Math.ceil(inputChars / 2) + texts.length * 120;
-  const userFloor = userCap * Math.max(1, texts.length);
-  return Math.min(MAX_TOKENS_HARD_CAP, Math.max(userFloor, estimated));
+  const floor = perItemFloor * Math.max(1, texts.length);
+  return Math.min(MAX_TOKENS_HARD_CAP, Math.max(floor, estimated));
 }
 
 // 向后兼容的细分别名 —— 当前仅供 tests / 外部调用。新代码统一用 computeMaxTokens。
-function maxTokensPerItem(settings: Settings): number | undefined {
-  return computeMaxTokens(settings, ['']);  // 1 条空串 → 返回 userFloor
+function maxTokensPerItem(settings: Settings): number {
+  return computeMaxTokens(settings, ['']);
 }
 
-function maxTokensForBatch(settings: Settings, texts: string[]): number | undefined {
+function maxTokensForBatch(settings: Settings, texts: string[]): number {
   return computeMaxTokens(settings, texts);
 }
 
@@ -170,7 +180,9 @@ export async function callWithRetry(fn: () => Promise<any>, maxRetries = 3, sett
         throw err;
       }
       const delay = (err.retryAfter || Math.pow(2, i)) * 1000;
-      console.log(`[Dualang] API 请求失败，${delay}ms 后重试 (${i + 1}/${maxRetries}): ${err.message}`);
+      log.warn('api.retry', {
+        delayMs: delay, attempt: i + 1, maxRetries, error: err.message,
+      });
       await new Promise(r => setTimeout(r, delay));
     }
   }
@@ -192,9 +204,10 @@ export async function doTranslateSingle(text: string, settings: Settings, signal
   const endpoint = resolveEndpoint(profile, settings.baseUrl || 'https://api.moonshot.cn/v1');
   const targetLangDisplay = LANG_DISPLAY[settings.targetLang] || settings.targetLang;
 
+  const customs = await getCustomPrompts();
   const systemPrompt = composeSystemPrompt(profile, targetLangDisplay, {
     batch: false, strict: strictMode, retranslateBoost: !!(settings as any).retranslateBoost,
-  });
+  }, customs);
 
   const body: any = {
     model: settings.model || 'kimi-k2.5',
@@ -203,11 +216,10 @@ export async function doTranslateSingle(text: string, settings: Settings, signal
       { role: 'user', content: text }
     ],
     temperature: effectiveTemperature(profile, settings),
-    stream: profile.supportsStreaming && !!settings.enableStreaming,
+    stream: false,  // 用户级流式已移除；super-fine / long-article 走 doTranslateBatchStream
   };
 
-  const mt = computeMaxTokens(settings, [text]);
-  if (mt !== undefined) body.max_tokens = mt;
+  body.max_tokens = computeMaxTokens(settings, [text]);
   applyThinkingMode(body, settings, profile);
 
   const data = await callWithRetry(() => fetch(endpoint, {
@@ -237,12 +249,8 @@ export async function doAnnotateDictionary(
 
   // level 用 GLM 金标校准的考试分级（docs/superpowers/reports/2026-04-20-glm-mixed-request-benchmark.md）
   // 策略：候选已在本地难度阈值以上筛出；模型只做"打标签 + 给 IPA/释义"两件事，不再做筛选判断。
-  const systemPrompt =
-    `你是英文词汇助手。为给定的高难英文词（已经本地预筛）生成 IPA 音标 + ${targetLangDisplay}释义 + 难度级别。` +
-    `输出严格 JSON：{"entries":[{"term":"","ipa":"","gloss":"","level":"cet6|ielts|kaoyan"}]}。` +
-    `level 从 {cet6, ielts, kaoyan} 选 —— 六级 / 雅思 / 考研，按词的实际难度判断。` +
-    `gloss 用${targetLangDisplay}，简短（≤8 字），不要整句解释。` +
-    `候选词都应该收录；若某词确实不该注释可以省略。每个条目必须有 term 和（ipa 或 gloss）。`;
+  // ANNOTATE_DICT_PROMPT 不接收用户自定义 —— JSON 输出协议是硬契约。
+  const systemPrompt = applyLangToken(ANNOTATE_DICT_PROMPT, targetLangDisplay);
 
   const body: any = {
     model: settings.model || 'kimi-k2.5',
@@ -319,10 +327,11 @@ export async function doTranslateBatchStream(
 
   const isSingle = texts.length === 1;
   const tagOffset = isSingle ? 0 : findSafeOffset(texts, texts.length);
+  const customs = await getCustomPrompts();
   const systemPrompt = composeSystemPrompt(profile, targetLangDisplay, {
     batch: !isSingle, strict: strictMode,
     retranslateBoost: !!(settings as any).retranslateBoost,
-  });
+  }, customs);
   const userContent = isSingle
     ? texts[0]
     : buildBatchUserContent(texts, undefined, undefined, tagOffset);
@@ -337,8 +346,7 @@ export async function doTranslateBatchStream(
     stream: true,
   };
 
-  const mt = maxTokensForBatch(settings, texts);
-  if (mt !== undefined) body.max_tokens = mt;
+  body.max_tokens = maxTokensForBatch(settings, texts);
   applyThinkingMode(body, settings, profile);
 
   const response = await callWithRetry(() => fetch(endpoint, {
@@ -470,10 +478,11 @@ export async function doTranslateBatchRequest(
   const useStructured = !isSingle || !!dictIndices;
   // 避免原文里碰巧含 <tN> 字符串（如 AI 教学 / 代码推文）打断 parser
   const tagOffset = useStructured ? findSafeOffset(texts, texts.length) : 0;
+  const customs = await getCustomPrompts();
   const systemPrompt = composeSystemPrompt(profile, targetLangDisplay, {
     batch: useStructured, strict: strictMode, smartDict: !!dictIndices,
     retranslateBoost: !!(settings as any).retranslateBoost,
-  });
+  }, customs);
   const userContent = useStructured
     ? buildBatchUserContent(texts, dictIndices, options.perItemCandidates, tagOffset)
     : texts[0];
@@ -489,10 +498,8 @@ export async function doTranslateBatchRequest(
   };
 
   const mt = maxTokensForBatch(settings, texts);
-  if (mt !== undefined) {
-    // 字典融合会让输出变长（每条条目额外 ~30-60 tokens）；按字典条目数轻度放大
-    body.max_tokens = dictIndices ? Math.ceil(mt * 1.25) + dictIndices.size * 120 : mt;
-  }
+  // 字典融合会让输出变长（每条条目额外 ~30-60 tokens）；按字典条目数轻度放大
+  body.max_tokens = dictIndices ? Math.ceil(mt * 1.25) + dictIndices.size * 120 : mt;
   applyThinkingMode(body, settings, profile);
 
   const data = await callWithRetry(() => fetch(endpoint, {
@@ -526,7 +533,7 @@ export async function doTranslateBatchRequest(
     // 小模型偶尔被"<tN dict=...> + ---DICT---"的双层结构打懵 ——
     // 输出退化为重复词 / 闭合标签丢失。重试一次但不带字典请求：丢字典，保住翻译主路径。
     recordCombinedFailure(settings.model);
-    console.warn('[Dualang] combined call parse failed, retrying without smartDict', {
+    log.warn('combined.parse.fail', {
       model: settings.model,
       failures: combinedFailures.get(settings.model || ''),
       rawPreview: raw.slice(0, 200),

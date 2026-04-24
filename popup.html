@@ -3,225 +3,147 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>X 光速翻译 · 设置</title>
+  <title data-i18n="app.title">X 光速翻译 · 设置</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
   <div class="container">
     <div id="errorBanner" class="error-banner" style="display:none;"></div>
     <div class="header">
-      <h1>X 光速翻译</h1>
-      <p class="subtitle">译文追得上你的滚动</p>
+      <h1 data-i18n="app.title">X 光速翻译</h1>
+      <p class="subtitle" data-i18n="app.subtitle">译文追得上你的滚动</p>
     </div>
 
-    <div class="hint" style="margin-bottom:10px; color:#71767b; font-size:12px;">
+    <div class="hint" style="margin-bottom:10px; color:#71767b; font-size:12px;" data-i18n="app.rightClickHint">
       右键页面空白处可快速开启/关闭翻译
     </div>
 
     <div class="tabs" role="tablist">
-      <button class="tab-button active" data-tab="translation" role="tab">翻译</button>
-      <button class="tab-button" data-tab="providers" role="tab">Providers</button>
-      <button class="tab-button" data-tab="main" role="tab">主（旧）</button>
-      <button class="tab-button" data-tab="speed" role="tab">兜底 & 加速</button>
-      <button class="tab-button" data-tab="stats" role="tab">统计</button>
-      <button class="tab-button" data-tab="advanced" role="tab">高级</button>
+      <button class="tab-button active" data-tab="translation" role="tab" data-i18n="tab.translation">翻译</button>
+      <button class="tab-button" data-tab="providers" role="tab" data-i18n="tab.providers">AI模型</button>
+      <button class="tab-button" data-tab="stats" role="tab" data-i18n="tab.stats">状态</button>
+      <button class="tab-button" data-tab="advanced" role="tab" data-i18n="tab.advanced">高级</button>
     </div>
 
-    <!-- ===== Tab: 翻译（全局翻译行为 —— 与具体 provider 无关） ===== -->
+    <!-- ===== Tab: 翻译 ===== -->
     <div class="tab-panel active" data-panel="translation">
+      <div class="top-row">
+        <div class="top-col">
+          <label data-i18n="translation.autoTimingLabel">翻译时机</label>
+          <div class="seg-group" id="autoTranslateSeg">
+            <button type="button" class="seg-btn" data-auto="true" data-i18n="translation.autoOn">自动</button>
+            <button type="button" class="seg-btn" data-auto="false" data-i18n="translation.autoOff">手动</button>
+          </div>
+        </div>
+        <div class="top-col">
+          <label for="targetLang" data-i18n="translation.targetLangLabel">翻译成</label>
+          <select id="targetLang">
+            <option value="zh-CN">简体中文</option>
+            <option value="zh-TW">繁体中文</option>
+            <option value="en">English</option>
+            <option value="ja">日本語</option>
+            <option value="ko">한국어</option>
+            <option value="fr">Français</option>
+            <option value="de">Deutsch</option>
+            <option value="es">Español</option>
+            <option value="ru">Русский</option>
+            <option value="pt">Português</option>
+          </select>
+        </div>
+      </div>
+
       <div class="form-group">
-        <label for="targetLang">目标语言</label>
-        <select id="targetLang">
-          <option value="zh-CN">简体中文</option>
-          <option value="zh-TW">繁体中文</option>
-          <option value="en">English（英语）</option>
-          <option value="ja">日本語（日语）</option>
-          <option value="ko">한국어（韩语）</option>
-          <option value="fr">Français（法语）</option>
-          <option value="de">Deutsch（德语）</option>
-          <option value="es">Español（西班牙语）</option>
-          <option value="ru">Русский（俄语）</option>
-          <option value="pt">Português（葡萄牙语）</option>
-        </select>
+        <label data-i18n="translation.displayLabel">翻译怎么显示</label>
+        <div class="seg-group" id="displaySegment">
+          <button type="button" class="seg-btn" data-mode="translation-only" data-i18n="translation.displayCover">覆盖原文</button>
+          <button type="button" class="seg-btn" data-mode="append" data-i18n="translation.displayAppend">整段追加</button>
+          <button type="button" class="seg-btn" data-mode="contrast" data-i18n="translation.displayContrast">按行交替</button>
+        </div>
+        <div id="contrastStyleRow" style="display:none; margin-top:8px;">
+          <div class="seg-group">
+            <button type="button" class="seg-btn" data-style="append" data-i18n="translation.emphasizeOrig">高亮原文</button>
+            <button type="button" class="seg-btn" data-style="bilingual" data-i18n="translation.emphasizeTrans">高亮翻译</button>
+          </div>
+        </div>
       </div>
 
-      <div class="form-group toggle-group">
-        <label class="toggle"><input type="checkbox" id="autoTranslate"><span class="slider"></span></label>
-        <span class="toggle-label">自动翻译推文</span>
-      </div>
-      <p class="hint" style="margin-top:-8px; margin-bottom:10px;">关闭后每条推文显示「译」按钮手动触发</p>
-
-      <div class="form-group">
-        <label for="displayMode">展示模式</label>
-        <select id="displayMode">
-          <option value="append">译文下方（保留原文）</option>
-          <option value="translation-only">仅译文（不显示原文）</option>
-          <option value="inline">段落对照（原文 + 译文逐段交错）</option>
-          <option value="bilingual">整体对照（原文 + 译文分块）</option>
-        </select>
-        <p class="hint">模式切换后，已翻译的推文保留旧模式；刷新页面可全量应用新模式。</p>
-      </div>
-
-      <div class="form-group toggle-group">
-        <label class="toggle"><input type="checkbox" id="lineFusionEnabled"><span class="slider"></span></label>
-        <span class="toggle-label">逐行融合（多行原文）</span>
-      </div>
+      <div class="feature-divider"></div>
 
       <div class="form-group toggle-group">
         <label class="toggle"><input type="checkbox" id="smartDictEnabled"><span class="slider"></span></label>
-        <span class="toggle-label">智能字典（仅英文原文）</span>
+        <span class="toggle-label">
+          <span data-i18n="translation.smartDictLabel">难词字典</span>
+          <span class="muted" data-i18n="translation.smartDictNote">(仅英文原文)</span>
+        </span>
       </div>
 
-      <div class="form-group toggle-group">
-        <label class="toggle"><input type="checkbox" id="enableStreaming"><span class="slider"></span></label>
-        <span class="toggle-label">流式输出（SSE）</span>
-      </div>
-      <p class="hint" style="margin-top:-8px; margin-bottom:10px;">逐条翻译结果实时渲染，但缓存对此模式不生效</p>
-    </div>
-
-    <!-- ===== Tab: 主（旧） —— Providers 没配好时的回退，仅为老用户保留 ===== -->
-    <div class="tab-panel" data-panel="main">
-      <p class="hint" style="margin-bottom:10px;">
-        💡 推荐在 <strong>Providers</strong> 标签中管理模型；此处仅作为 Providers 列表为空时的回退配置，
-        保留是为了老用户无缝迁移。
-      </p>
       <div class="form-group">
-        <label for="preset">模型提供方</label>
-        <select id="preset">
-          <optgroup label="⭐ 推荐（bench v2 实测）">
-            <option value="siliconflow-glm-4-9b">SiliconFlow GLM-4-9B · 1.9s · 质量 8.7 · 免费（默认）</option>
-          </optgroup>
-          <optgroup label="其他免费">
-            <option value="siliconflow-qwen3-8b">SiliconFlow Qwen3-8B · 4.0s · 质量 8.5</option>
-          </optgroup>
-          <option value="custom">自定义</option>
+        <label for="reasoningEffort" data-i18n="translation.reasoningLabel">强化翻译</label>
+        <select id="reasoningEffort">
+          <option value="none" data-i18n="translation.reasoningNone">不思考（推荐）</option>
+          <option value="low" data-i18n="translation.reasoningLow">低思考</option>
+          <option value="medium" data-i18n="translation.reasoningMedium">中思考</option>
+          <option value="high" data-i18n="translation.reasoningHigh">高思考</option>
         </select>
-        <p class="hint">延迟与质量来自内部基准测试（2026-04-18）。</p>
-      </div>
-      <div class="form-group">
-        <label for="baseUrl">API 地址</label>
-        <input type="text" id="baseUrl" placeholder="https://api.siliconflow.cn/v1">
-      </div>
-      <div class="form-group">
-        <label for="apiKey">API Key</label>
-        <input type="password" id="apiKey" placeholder="sk-...">
-        <p class="hint" id="apiKeyHint">在 <a href="https://cloud.siliconflow.cn/" target="_blank">SiliconFlow</a> 获取免费 API Key</p>
-      </div>
-      <div class="form-group">
-        <label for="model">模型名</label>
-        <input type="text" id="model" placeholder="THUDM/GLM-4-9B-0414">
+        <p class="hint" data-i18n="translation.reasoningHint">翻译任务通常不需要模型"想"—— 关闭省 token / 省延迟</p>
       </div>
     </div>
 
     <!-- ===== Tab: Providers（智能路由器） ===== -->
     <div class="tab-panel" data-panel="providers">
       <div class="routing-config">
-        <div class="routing-config__title">路由模式</div>
+        <div class="routing-config__title" data-i18n="providers.routingModeTitle">路由模式</div>
         <div class="routing-config__modes">
-          <label><input type="radio" name="routingMode" value="failover" id="rmFailover"> 主从（按固定顺序）</label>
-          <label><input type="radio" name="routingMode" value="smart" id="rmSmart"> 智能（按评分动态选）</label>
+          <label><input type="radio" name="routingMode" value="failover" id="rmFailover"> <span data-i18n="providers.modeFailover">默认首个模型，顺位替补</span></label>
+          <label><input type="radio" name="routingMode" value="smart" id="rmSmart"> <span data-i18n="providers.modeSmart">智能动态选择模型</span></label>
         </div>
         <div class="routing-config__pref" id="prefRow">
-          <span>最快</span>
+          <span data-i18n="providers.prefFastest">最快</span>
           <input type="range" min="0" max="100" step="5" id="prefSlider" value="50">
-          <span>最好</span>
+          <span data-i18n="providers.prefBest">最好</span>
           <span class="routing-config__pref-val" id="prefValLabel">50%</span>
         </div>
-        <p class="hint" id="routingHint">主从等价于现有行为：primary → secondary 顺序回退。</p>
+        <p class="hint" id="routingHint" data-i18n="providers.routingHintFailover">列表从上到下依次作为首选 / 替补；可拖动卡片调整顺序。</p>
       </div>
 
-      <p class="hint" style="margin-bottom:10px;">
-        管理用于翻译的模型 API。主从模式下首条是主、次条是备；智能模式下按综合评分挑选。
+      <p class="hint" style="margin-bottom:10px;" data-i18n="providers.tabIntro">
+        管理翻译使用的 AI 模型。列表顺序决定优先级（首条是主，其余按位替补）；智能模式下按综合评分挑选。
         每条可单独测试能力（短/中/长 + 批量 + 流式）。
       </p>
 
       <div id="providerAddForm" class="provider-add" style="display:none;">
         <div class="form-group">
-          <label for="pfLabel">名称</label>
+          <label for="pfLabel">
+            <span data-i18n="providers.fieldLabel">名称</span>
+            <span class="muted" data-i18n="providers.fieldLabelOpt">(选填)</span>
+          </label>
           <input type="text" id="pfLabel" placeholder="GLM-4-9B · SiliconFlow">
         </div>
         <div class="form-group">
-          <label for="pfBaseUrl">API 地址</label>
+          <label for="pfBaseUrl" data-i18n="providers.fieldBaseUrl">API 地址</label>
           <input type="text" id="pfBaseUrl" placeholder="https://api.siliconflow.cn/v1">
         </div>
         <div class="form-group">
-          <label for="pfModel">模型名</label>
+          <label for="pfModel" data-i18n="providers.fieldModel">模型名</label>
           <input type="text" id="pfModel" placeholder="THUDM/GLM-4-9B-0414">
         </div>
         <div class="form-group">
-          <label for="pfApiKey">API Key</label>
+          <label for="pfApiKey" data-i18n="providers.fieldApiKey">API Key</label>
           <input type="password" id="pfApiKey" placeholder="sk-...">
         </div>
-        <div class="form-group">
-          <label for="pfTags">标签（空格分隔，可选）</label>
-          <input type="text" id="pfTags" placeholder="free fast">
-        </div>
         <div style="display:flex; gap:8px;">
-          <button id="pfSaveBtn" class="btn-primary" style="flex:1;">保存</button>
-          <button id="pfCancelBtn" class="btn-secondary" style="flex:1;">取消</button>
+          <button id="pfSaveBtn" class="btn-primary" style="flex:1;" data-i18n="providers.save">保存</button>
+          <button id="pfCancelBtn" class="btn-secondary" style="flex:1;" data-i18n="providers.cancel">取消</button>
         </div>
         <div id="pfError" class="status" style="display:none;"></div>
       </div>
 
-      <button id="providerAddBtn" class="btn-secondary" style="width:100%; margin-bottom:10px;">
+      <button id="providerAddBtn" class="btn-secondary" style="width:100%; margin-bottom:10px;" data-i18n="providers.addBtn">
         ＋ 添加 Provider
       </button>
 
       <div id="providerList" class="provider-list">
-        <div class="stats-empty">加载中...</div>
-      </div>
-    </div>
-
-    <!-- ===== Tab: 兜底 & 加速 ===== -->
-    <div class="tab-panel" data-panel="speed">
-      <div class="form-group toggle-group">
-        <label class="toggle"><input type="checkbox" id="fallbackEnabled"><span class="slider"></span></label>
-        <span class="toggle-label">启用兜底 API</span>
-      </div>
-      <p class="hint" style="margin-top:-8px; margin-bottom:10px;">主 API 返回 401 / 额度耗尽时自动切换到此 API</p>
-
-      <div id="fallbackConfig">
-        <div class="form-group">
-          <label for="fallbackPreset">兜底提供方</label>
-          <select id="fallbackPreset">
-            <optgroup label="⭐ 推荐兜底">
-              <option value="siliconflow-glm-4-9b">SiliconFlow GLM-4-9B · 1.9s · 最稳 · 免费</option>
-            </optgroup>
-            <option value="siliconflow-qwen3-8b">SiliconFlow Qwen3-8B · 4.0s · 免费</option>
-            <option value="custom">自定义</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label for="fallbackBaseUrl">兜底 API 地址</label>
-          <input type="text" id="fallbackBaseUrl" placeholder="https://api.siliconflow.cn/v1">
-        </div>
-        <div class="form-group">
-          <label for="fallbackApiKey">兜底 API Key</label>
-          <input type="password" id="fallbackApiKey" placeholder="sk-...">
-        </div>
-        <div class="form-group">
-          <label for="fallbackModel">兜底模型</label>
-          <input type="text" id="fallbackModel" placeholder="THUDM/GLM-4-9B-0414">
-        </div>
-
-        <div class="form-group toggle-group">
-          <label class="toggle"><input type="checkbox" id="hedgedRequestEnabled"><span class="slider"></span></label>
-          <span class="toggle-label">赛马（主 + 兜底竞争）</span>
-        </div>
-        <p class="hint" style="margin-top:-8px; margin-bottom:10px;">用户可见的推文同时或错峰请求两个 API，谁先返回用谁，败者中止以节省配额</p>
-
-        <div class="form-group">
-          <label for="hedgedDelayMode">赛马启动时机</label>
-          <select id="hedgedDelayMode">
-            <option value="auto">自适应（依据主 API 最近 RTT 的 p95，推荐）</option>
-            <option value="0">即时并发（主 + 兜底同时发起，高体验高消耗）</option>
-            <option value="300">延迟 300ms</option>
-            <option value="600">延迟 600ms</option>
-            <option value="1000">延迟 1000ms</option>
-            <option value="2000">延迟 2000ms</option>
-          </select>
-          <p class="hint" id="hedgedDelayReadout">自适应：首屏前几条请求按 500ms 固定延迟；收集到样本后自动收敛到 p95</p>
-        </div>
+        <div class="stats-empty" data-i18n="providers.loading">加载中...</div>
       </div>
     </div>
 
@@ -230,58 +152,93 @@
       <div class="stats-summary">
         <div class="stats-card">
           <div class="stats-num" id="statTotalReqs">–</div>
-          <div class="stats-label">请求总数</div>
+          <div class="stats-label" data-i18n="stats.totalReqs">请求总数</div>
         </div>
         <div class="stats-card">
           <div class="stats-num" id="statTotalTokens">–</div>
-          <div class="stats-label">Tokens 合计</div>
+          <div class="stats-label" data-i18n="stats.totalTokens">Tokens 合计</div>
         </div>
         <div class="stats-card">
           <div class="stats-num" id="statCacheHitRate">–</div>
-          <div class="stats-label">缓存命中</div>
+          <div class="stats-label" data-i18n="stats.cacheHit">缓存命中</div>
         </div>
       </div>
 
-      <div class="stats-section-title">按模型 · 成功率 / 速度 / 消耗</div>
+      <div class="stats-section-title" data-i18n="stats.byModel">按模型 · 成功率 / 速度 / 消耗</div>
       <div id="modelStatsList" class="model-stats-list">
-        <div class="stats-empty">尚无数据，打开 X.com 浏览几条推文后再来看。</div>
+        <div class="stats-empty" data-i18n="stats.byModelEmpty">尚无数据，打开 X.com 浏览几条推文后再来看。</div>
       </div>
 
-      <div class="stats-section-title" style="margin-top:14px;">Provider 路由健康</div>
+      <div class="stats-section-title" style="margin-top:14px;" data-i18n="stats.routerHealth">Provider 路由健康</div>
       <div id="routerHealthList" class="router-health-list">
-        <div class="stats-empty">加载中...</div>
+        <div class="stats-empty" data-i18n="providers.loading">加载中...</div>
       </div>
 
-      <div class="stats-section-title" style="margin-top:14px;">最近错误</div>
+      <div class="stats-section-title" style="margin-top:14px;" data-i18n="stats.recentErrors">最近错误</div>
       <ul id="errorLogList" class="error-log">
-        <li class="stats-empty-li">暂无错误</li>
+        <li class="stats-empty-li" data-i18n="stats.errorsEmpty">暂无错误</li>
       </ul>
 
       <div style="display:flex; gap:8px; margin-top:12px;">
-        <button id="refreshStatsBtn" class="btn-secondary">刷新</button>
-        <button id="resetStatsBtn" class="btn-secondary btn-danger">重置</button>
+        <button id="refreshStatsBtn" class="btn-secondary" data-i18n="stats.refresh">刷新</button>
+        <button id="resetStatsBtn" class="btn-secondary btn-danger" data-i18n="stats.reset">重置</button>
       </div>
     </div>
 
     <!-- ===== Tab: 高级 ===== -->
     <div class="tab-panel" data-panel="advanced">
       <div class="form-group">
-        <label for="reasoningEffort">思考模式</label>
-        <select id="reasoningEffort">
-          <option value="none">关闭思考（推荐，翻译任务不需要推理）</option>
-          <option value="low">Low · 开启轻量思考</option>
-          <option value="medium">Medium · 中等思考</option>
-          <option value="high">High · 深度思考</option>
+        <label for="uiLang" data-i18n="advanced.uiLangLabel">界面语言</label>
+        <select id="uiLang">
+          <option value="zh-CN">简体中文</option>
+          <option value="zh-TW">繁體中文</option>
+          <option value="en">English</option>
+          <option value="ja">日本語</option>
+          <option value="ko">한국어</option>
         </select>
-        <p class="hint">翻译任务不需要模型"想"—— 关闭后省 token、省延迟。支持 Qwen / GLM-4.6+ 的模型会额外显式关闭 thinking 字段。</p>
       </div>
+
+      <div class="feature-divider"></div>
+
+      <details class="custom-prompts">
+        <summary data-i18n="advanced.customPromptsTitle">自定义 System Prompt</summary>
+        <p class="hint" style="margin-top:8px;" data-i18n="advanced.customPromptsIntro">
+          调教模型怎么翻译。占位符 <code>{{LANG}}</code> 会替换为当前目标语言（如"简体中文"）。
+          工程协议（<code>&lt;tN&gt;</code> 标签 / 字典分隔符 / JSON 格式）由插件内部维护，不在此处暴露。
+        </p>
+
+        <div class="form-group">
+          <label for="promptSelect" data-i18n="advanced.promptSelect">选择要编辑的 Prompt</label>
+          <select id="promptSelect">
+            <option value="translationRules" data-i18n="advanced.promptOptTransRules">翻译规则（单条 + 批量共用）</option>
+            <option value="strict" data-i18n="advanced.promptOptStrict">严格模式前缀（质量重试用）</option>
+            <option value="boost" data-i18n="advanced.promptOptBoost">重译加强前缀（点品牌 logo）</option>
+          </select>
+          <p class="hint" id="promptDescription"></p>
+        </div>
+
+        <div class="form-group">
+          <div class="prompt-row-head">
+            <label for="promptEditor" data-i18n="advanced.promptContentLabel">Prompt 内容</label>
+            <div style="display:flex; gap:10px; align-items:baseline;">
+              <span class="muted" id="promptDirtyBadge" style="display:none;" data-i18n="advanced.promptDirty">已改</span>
+              <button type="button" class="link-btn" id="promptResetBtn" data-i18n="advanced.promptReset">重置默认</button>
+            </div>
+          </div>
+          <textarea id="promptEditor" rows="12" class="prompt-area"></textarea>
+        </div>
+      </details>
+
+      <div class="feature-divider"></div>
+
       <div class="form-group">
-        <label for="maxTokens">最大输出 Token / 条</label>
-        <input type="number" id="maxTokens" min="1" max="128000" step="1">
+        <label data-i18n="advanced.clearCache">清除缓存</label>
+        <button id="clearCacheBtn" class="btn-secondary btn-danger" style="width:100%;" data-i18n="advanced.clearCacheBtn">清除翻译缓存</button>
+        <p class="hint" data-i18n="advanced.clearCacheHint">删除所有已缓存的译文（不影响统计、画像、API 设置）。</p>
       </div>
     </div>
 
-    <button id="saveBtn" class="btn-primary" style="margin-top:16px;">保存设置</button>
+    <button id="saveBtn" class="btn-primary" style="margin-top:16px;" data-i18n="common.save">保存设置</button>
     <div id="status" class="status"></div>
   </div>
 

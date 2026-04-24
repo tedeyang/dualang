@@ -11,6 +11,17 @@
  * onChanged 监听会自动 pickup。面板不持有应用层状态 —— 只镜像 storage。
  */
 import { VISIBLE_MODEL_PRESETS, detectPreset, type ModelPreset } from '../shared/model-presets';
+import { t, detectDefaultUiLang, type UiLang } from '../shared/i18n';
+import { log } from '../shared/logger';
+import {
+  listProviders,
+  saveProviders,
+  setApiKey as routerSetApiKey,
+  getRoutingSettings,
+  setRoutingSettings,
+} from '../background/router/storage';
+import { makeProviderId } from '../background/router/migration';
+import type { ProviderEntry } from '../shared/router-types';
 
 type State = 'idle' | 'translating' | 'done' | 'failed';
 type DisplayMode = 'append' | 'translation-only' | 'inline' | 'bilingual';
@@ -29,6 +40,7 @@ interface CurrentSettings {
   smartDictEnabled: boolean;
   baseUrl: string;
   model: string;
+  uiLang: UiLang;
 }
 
 interface BubbleCtx {
@@ -148,6 +160,7 @@ export function initBubble(callbacks: BubbleCallbacks = {}): void {
       smartDictEnabled: false,
       baseUrl: 'https://api.siliconflow.cn/v1',
       model: 'THUDM/GLM-4-9B-0414',
+      uiLang: detectDefaultUiLang(),
     },
     currentLongArticle: null,
     superFineArticle: null,
@@ -219,6 +232,7 @@ export function initBubble(callbacks: BubbleCallbacks = {}): void {
       if (changes.smartDictEnabled) { ctx.settings.smartDictEnabled = !!changes.smartDictEnabled.newValue; dirty = true; }
       if (changes.baseUrl)   { ctx.settings.baseUrl = changes.baseUrl.newValue || ''; dirty = true; }
       if (changes.model)     { ctx.settings.model = changes.model.newValue || ''; dirty = true; }
+      if (changes.uiLang)    { ctx.settings.uiLang = (changes.uiLang.newValue as UiLang) || detectDefaultUiLang(); dirty = true; }
       if (dirty) refreshPanel();
       if (enabledChanged) refreshBubbleVisual();
     } else if (area === 'local' && changes.dualang_error_v1) {
@@ -329,62 +343,84 @@ export function disposeBubble(): void {
 // ===================== 内部：面板模板与交互 =====================
 
 function renderPanelTemplate(): string {
+  // 可见文本留中文 fallback，结构上用 data-i18n 标记；applyBubbleI18n() 在
+  // 每次 refreshPanel 里按当前 uiLang 刷新 textContent + title 属性。
   return `
     <div class="dualang-bubble-panel-section dualang-bubble-top-row">
       <label class="dualang-bubble-switch">
         <input type="checkbox" data-field="enabled" />
-        <span>开启翻译</span>
+        <span data-i18n="bubble.enableTranslation">开启翻译</span>
       </label>
-      <label class="dualang-bubble-switch dualang-bubble-switch--mini" data-section="smart-dict" title="智能字典（英文原文生僻词）">
+      <label class="dualang-bubble-switch dualang-bubble-switch--mini"
+             data-section="smart-dict"
+             data-i18n-title="bubble.dictTooltip" title="智能字典（英文原文生僻词）">
         <input type="checkbox" data-field="smartDictEnabled" />
-        <span>字典</span>
+        <span data-i18n="bubble.dict">字典</span>
       </label>
     </div>
 
     <div class="dualang-bubble-panel-section" data-section="display">
       <div class="dualang-bubble-group-header">
-        <span class="dualang-bubble-group-label">显示</span>
+        <span class="dualang-bubble-group-label" data-i18n="bubble.groupDisplay">显示</span>
         <span class="dualang-bubble-group-line"></span>
       </div>
       <div class="dualang-bubble-segment">
-        <button type="button" data-display="original">只看原文</button>
-        <button type="button" data-display="translation-only">只看译文</button>
-        <button type="button" data-display="contrast">对照</button>
+        <button type="button" data-display="original" data-i18n="bubble.displayOriginal">只看原文</button>
+        <button type="button" data-display="translation-only" data-i18n="bubble.displayTranslation">只看译文</button>
+        <button type="button" data-display="contrast" data-i18n="bubble.displayContrast">对照</button>
       </div>
     </div>
 
     <div class="dualang-bubble-panel-section" data-section="style">
       <div class="dualang-bubble-group-header">
-        <span class="dualang-bubble-group-label">对照</span>
+        <span class="dualang-bubble-group-label" data-i18n="bubble.groupContrast">对照</span>
         <span class="dualang-bubble-group-line"></span>
-        <label class="dualang-bubble-switch dualang-bubble-switch--mini" data-section="line-fusion" title="多行原文时逐行融合">
+        <label class="dualang-bubble-switch dualang-bubble-switch--mini"
+               data-section="line-fusion"
+               data-i18n-title="bubble.lineFusionTooltip" title="多行原文时逐行融合">
           <input type="checkbox" data-field="lineFusionEnabled" />
-          <span>逐行</span>
+          <span data-i18n="bubble.lineFusionToggle">逐行</span>
         </label>
       </div>
       <div class="dualang-bubble-segment">
-        <button type="button" data-style="append">强调原文</button>
-        <button type="button" data-style="bilingual">强调译文</button>
+        <button type="button" data-style="append" data-i18n="bubble.styleEmphasizeOrig">强调原文</button>
+        <button type="button" data-style="bilingual" data-i18n="bubble.styleEmphasizeTrans">强调译文</button>
       </div>
     </div>
 
     <div class="dualang-bubble-panel-section" data-section="models">
       <div class="dualang-bubble-group-header">
-        <span class="dualang-bubble-group-label">模型</span>
+        <span class="dualang-bubble-group-label" data-i18n="bubble.groupModels">模型</span>
         <span class="dualang-bubble-group-line"></span>
       </div>
       <div class="dualang-bubble-models" data-slot="models"></div>
     </div>
 
     <div class="dualang-bubble-panel-section" data-section="super-fine" hidden>
-      <button type="button" class="dualang-bubble-super-fine-btn" data-action="super-fine">
+      <button type="button" class="dualang-bubble-super-fine-btn"
+              data-action="super-fine" data-i18n="bubble.superFineBtn">
         精翻此文
       </button>
-      <button type="button" class="dualang-bubble-super-fine-cancel" data-action="super-fine-cancel" hidden>
+      <button type="button" class="dualang-bubble-super-fine-cancel"
+              data-action="super-fine-cancel" data-i18n="bubble.superFineCancel" hidden>
         取消精翻
       </button>
     </div>
   `;
+}
+
+/** 按当前 uiLang 翻译 panel 里所有 data-i18n / data-i18n-title 节点 */
+function applyBubbleI18n(): void {
+  if (!ctx) return;
+  const lang = ctx.settings.uiLang;
+  ctx.panel.querySelectorAll<HTMLElement>('[data-i18n]').forEach((el) => {
+    const key = el.getAttribute('data-i18n');
+    if (key) el.textContent = t(key, lang);
+  });
+  ctx.panel.querySelectorAll<HTMLElement>('[data-i18n-title]').forEach((el) => {
+    const key = el.getAttribute('data-i18n-title');
+    if (key) el.setAttribute('title', t(key, lang));
+  });
 }
 
 function wirePanelControls(): void {
@@ -474,6 +510,9 @@ function refreshPanel(): void {
   // 模型列表
   renderModelList();
 
+  // 翻译所有 data-i18n 节点（每次 refresh 刷一遍，切换 uiLang 后生效）
+  applyBubbleI18n();
+
   // 精翻入口：仅在检测到长文且设置启用 时显示
   const sfSection = panel.querySelector<HTMLElement>('[data-section="super-fine"]');
   if (sfSection) {
@@ -528,15 +567,72 @@ function formatLatency(avgMs: number | undefined): string {
   return `${s.toFixed(s < 10 ? 1 : 0)}s`;
 }
 
+/**
+ * 用户在气球上点模型：
+ *  1. 路由模式切回 "默认首个模型，顺位替补"（failover），确保选中的优先
+ *  2. 选中模型升到 provider 列表第 1 位（已有则挪位 + 自动启用；没有则建一条）
+ *  3. 镜像到 legacy `baseUrl/model/apiKey` 存储键 —— 触发气球自身的 onChanged
+ *     更新 active 高亮，也兜底保护没跑过 router migration 的冷启动路径
+ */
 async function onPickModel(preset: ModelPreset): Promise<void> {
   if (!ctx) return;
+  const apiKey = await fetchProviderKey(preset.provider);
+  log.info('bubble.pickModel', { model: preset.model, baseUrl: preset.baseUrl });
+
+  // 1) 模型列表重排：existing → 挪到第 0 位；missing → 自动新建
+  try {
+    const providers = await listProviders();
+    const existing = providers.find(
+      (p) => p.baseUrl === preset.baseUrl && p.model === preset.model,
+    );
+    if (existing) {
+      const promoted: ProviderEntry = existing.enabled ? existing : { ...existing, enabled: true };
+      const reordered = [promoted, ...providers.filter((p) => p.id !== existing.id)];
+      log.info('bubble.provider.promote', { id: existing.id, wasDisabled: !existing.enabled });
+      await saveProviders(reordered);
+      if (apiKey) await routerSetApiKey(existing.id, apiKey);
+    } else {
+      const id = makeProviderId(preset.baseUrl, preset.model);
+      let accountGroup: string | undefined;
+      try {
+        accountGroup = new URL(preset.baseUrl).hostname.split('.').slice(-2, -1)[0];
+      } catch {}
+      const entry: ProviderEntry = {
+        id,
+        label: preset.displayName || preset.model,
+        baseUrl: preset.baseUrl,
+        model: preset.model,
+        apiKeyRef: id,
+        enabled: true,
+        accountGroup,
+        createdAt: Date.now(),
+      };
+      // 去重：可能已有同 id 但 baseUrl/model 不同的条目（极低概率）；这里兜底去一次
+      log.info('bubble.provider.autoCreate', { id, model: preset.model });
+      await saveProviders([entry, ...providers.filter((p) => p.id !== id)]);
+      if (apiKey) await routerSetApiKey(id, apiKey);
+    }
+  } catch (e) {
+    log.warn('bubble.provider.promote.fail', { error: (e as Error)?.message || String(e) });
+  }
+
+  // 2) 路由模式：失 failover（默认首个模型，顺位替补）
+  try {
+    const routing = await getRoutingSettings();
+    if (routing.mode !== 'failover') {
+      await setRoutingSettings({ ...routing, mode: 'failover' });
+    }
+  } catch (e) {
+    log.warn('bubble.routing.set.fail', { error: (e as Error)?.message || String(e) });
+  }
+
+  // 3) Legacy mirror —— 让气球 active 高亮立即刷新，也兼容 router migration 还没跑过的路径
   const patch: Record<string, unknown> = {
     baseUrl: preset.baseUrl,
     model: preset.model,
     providerType: 'openai',
   };
-  const key = await fetchProviderKey(preset.provider);
-  if (key) patch.apiKey = key;
+  if (apiKey) patch.apiKey = apiKey;
   await chrome.storage.sync.set(patch);
 }
 
@@ -562,6 +658,7 @@ async function loadSettingsFromStorage(): Promise<void> {
     smartDictEnabled: false,
     baseUrl: 'https://api.siliconflow.cn/v1',
     model: 'THUDM/GLM-4-9B-0414',
+    uiLang: null,
   });
   ctx.settings = {
     enabled: s.enabled !== false,
@@ -570,6 +667,7 @@ async function loadSettingsFromStorage(): Promise<void> {
     smartDictEnabled: !!s.smartDictEnabled,
     baseUrl: s.baseUrl || '',
     model: s.model || '',
+    uiLang: (s.uiLang as UiLang) || detectDefaultUiLang(),
   };
 }
 

@@ -3,12 +3,14 @@
  *   - 计数器（increment / add）
  *   - RTT / 渲染耗时等 running-average 场景
  *   - 定时 summary 打印（只在有新活动时打印，避免 idle 时刷屏）
- *   - perfLog / logBiz 两种语义的 console 输出
+ *   - perfLog / logBiz 两种语义的输出 —— 实际写 console 走 shared logger
  *
  * 替代散落在 content/index.ts 顶层的 perfCounters 对象 + 十几处 increment
  * + 10s setInterval 匿名函数。所有 call site 走 `telemetry.inc('enqueue')`
  * 这种单入口，新增指标只加一行。
  */
+
+import { log } from '../shared/logger';
 
 export type Level = 'log' | 'warn' | 'error';
 
@@ -32,15 +34,16 @@ export class Telemetry {
     return this.counters[name] || 0;
   }
 
-  /** 详细性能埋点：console.debug 级，DevTools verbose 才可见 */
+  /** 详细性能埋点：debug 级，DevTools verbose 才可见 */
   perf(event: string, data: any = {}): void {
-    console.debug('[Dualang:perf]', event, data);
+    log.debug(`perf.${event}`, data);
   }
 
-  /** 业务语义日志：默认 log；warn 用于非致命异常；error 用于用户可见失败 */
+  /** 业务语义日志：默认 info；warn 用于非致命异常；error 用于用户可见失败 */
   biz(event: string, data: any = {}, level: Level = 'log'): void {
-    const fn = (console as any)[level] || console.log;
-    fn('[Dualang]', event, data);
+    if (level === 'warn') log.warn(event, data);
+    else if (level === 'error') log.error(event, data);
+    else log.info(event, data);
   }
 
   /**

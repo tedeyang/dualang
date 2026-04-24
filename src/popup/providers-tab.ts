@@ -3,7 +3,9 @@
  *  - 列出已配置的 provider（由 migration 自动初始化 1-3 条）
  *  - 新增 / 编辑 / 删除 / 启用-禁用
  *  - 展示 capability + circuit 状态（pills）
- *  - "测试"按钮留占位，P3 接上 sampler
+ *  - 拖动卡片调整顺序（保存到 storage 的 providers[] 里）
+ *  - 编辑用卡片内嵌表单，baseUrl/model/apiKey 全部可改（id 保持稳定）
+ *  - "测试"按钮串行跑 sampler（short/medium/long + batch-5 + stream）
  *
  * 存储走 background/router/storage —— popup 上下文能直接访问 chrome.storage，
  * 不需要经由 background 转发，减少一次消息往返。
@@ -11,6 +13,7 @@
 
 import {
   listProviders,
+  saveProviders,
   upsertProvider,
   deleteProvider as deleteProviderRec,
   getApiKey,
@@ -22,6 +25,8 @@ import {
 } from '../background/router/storage';
 import { makeProviderId } from '../background/router/migration';
 import type { ProviderEntry, RoutingMode } from '../shared/router-types';
+import { applyI18n, tr } from './i18n-apply';
+import { log } from '../shared/logger';
 
 function escapeText(s: unknown): string {
   return String(s ?? '').replace(/[&<>"']/g, (c) =>
@@ -66,7 +71,12 @@ export function circuitBadge(circuit: Awaited<ReturnType<typeof getCircuit>> | u
   }
 }
 
-/** 纯函数：构建一条卡片的 innerHTML */
+/** label 是可选字段 —— 没填时用 model 作为显示名。 */
+function displayLabel(p: ProviderEntry): string {
+  return (p.label && p.label.trim()) || p.model;
+}
+
+/** 纯函数：构建一条卡片的 innerHTML。包含 view + edit 两个子区域（edit 默认隐藏） */
 export function renderCardHtml(data: RenderedCardData): string {
   const { provider: p, capability, maskedKey } = data;
   const pills: string[] = [];
@@ -85,26 +95,57 @@ export function renderCardHtml(data: RenderedCardData): string {
   const circuit = data.circuit;
   const badge = circuitBadge(circuit);
   if (badge) pills.push(`<span class="pill ${badge.cls}">${badge.text}</span>`);
-  if (p.tags?.length) {
-    for (const t of p.tags) pills.push(`<span class="pill">${escapeText(t)}</span>`);
-  }
   const disabled = !p.enabled ? 'is-disabled' : '';
 
+  const toggleKey = p.enabled ? 'providers.btnDisable' : 'providers.btnEnable';
+  const toggleFallback = p.enabled ? '禁用' : '启用';
   return `
-    <div class="provider-card ${disabled}" data-provider-id="${escapeText(p.id)}">
-      <div class="provider-card__head">
-        <div class="provider-card__label" title="${escapeText(p.id)}">${escapeText(p.label)}</div>
+    <div class="provider-card ${disabled}" data-provider-id="${escapeText(p.id)}" draggable="true">
+      <div class="provider-card__view">
+        <div class="provider-card__head">
+          <span class="drag-handle" data-i18n-title="providers.dragHandleTitle" title="拖动调整顺序">⋮⋮</span>
+          <div class="provider-card__label" title="${escapeText(p.id)}">${escapeText(displayLabel(p))}</div>
+        </div>
+        <div class="provider-card__sub">${escapeText(p.model)}</div>
+        <div class="provider-card__sub">${escapeText(p.baseUrl)} · key: ${escapeText(maskedKey)}</div>
+        <div class="provider-card__pills">${pills.join('')}</div>
+        <div class="provider-card__actions">
+          <button data-action="edit" class="btn-secondary" data-i18n="providers.btnEdit">编辑</button>
+          <button data-action="toggle" class="btn-secondary" data-i18n="${toggleKey}">${toggleFallback}</button>
+          <button data-action="test" class="btn-secondary" data-i18n="providers.btnTest">测试</button>
+          <button data-action="delete" class="btn-secondary btn-danger" data-i18n="providers.btnDelete">删除</button>
+        </div>
+        <div class="provider-card__sample" data-role="sample-log" style="display:none;"></div>
       </div>
-      <div class="provider-card__sub">${escapeText(p.model)}</div>
-      <div class="provider-card__sub">${escapeText(p.baseUrl)} · key: ${escapeText(maskedKey)}</div>
-      <div class="provider-card__pills">${pills.join('')}</div>
-      <div class="provider-card__actions">
-        <button data-action="edit" class="btn-secondary">编辑</button>
-        <button data-action="toggle" class="btn-secondary">${p.enabled ? '禁用' : '启用'}</button>
-        <button data-action="test" class="btn-secondary" title="串行跑 short/medium/long single + batch-5 + stream；约 10K tokens">测试</button>
-        <button data-action="delete" class="btn-secondary btn-danger">删除</button>
+      <div class="provider-card__edit" style="display:none;">
+        <div class="form-group">
+          <label>
+            <span data-i18n="providers.fieldLabel">名称</span>
+            <span class="muted" data-i18n="providers.fieldLabelOpt">(选填)</span>
+          </label>
+          <input type="text" data-edit-field="label" value="${escapeText(p.label || '')}">
+        </div>
+        <div class="form-group">
+          <label data-i18n="providers.fieldBaseUrl">API 地址</label>
+          <input type="text" data-edit-field="baseUrl" value="${escapeText(p.baseUrl)}">
+        </div>
+        <div class="form-group">
+          <label data-i18n="providers.fieldModel">模型名</label>
+          <input type="text" data-edit-field="model" value="${escapeText(p.model)}">
+        </div>
+        <div class="form-group">
+          <label>
+            <span data-i18n="providers.fieldApiKey">API Key</span>
+            <span class="muted" data-i18n="providers.editKeyHint">(留空保留原 key)</span>
+          </label>
+          <input type="password" data-edit-field="apiKey" placeholder="sk-...">
+        </div>
+        <div class="provider-card__actions">
+          <button data-action="edit-save" class="btn-primary" data-i18n="providers.save">保存</button>
+          <button data-action="edit-cancel" class="btn-secondary" data-i18n="providers.cancel">取消</button>
+        </div>
+        <div class="status error" data-role="edit-error" style="display:none;"></div>
       </div>
-      <div class="provider-card__sample" data-role="sample-log" style="display:none;"></div>
     </div>
   `;
 }
@@ -135,7 +176,11 @@ function fmtCaseLine(msg: { type: string; result?: any; error?: string }): strin
   return '';
 }
 
-/** 纯函数：校验新增 / 编辑表单输入；编辑模式可传 {requireApiKey:false} 允许 key 留空保留原值 */
+/**
+ * 纯函数：校验新增 / 编辑表单输入。
+ *  - label 选填：不校验
+ *  - baseUrl/model 必填；apiKey 在编辑模式可留空保留原值（opts.requireApiKey=false）
+ */
 export function validateProviderForm(
   input: {
     label: string;
@@ -145,7 +190,6 @@ export function validateProviderForm(
   },
   opts: { requireApiKey?: boolean } = {},
 ): string | null {
-  if (!input.label.trim()) return '请填写名称';
   if (!input.baseUrl.trim()) return '请填写 API 地址';
   try {
     const u = new URL(input.baseUrl.trim());
@@ -160,27 +204,31 @@ export function validateProviderForm(
 
 /** 纯函数：输入 → ProviderEntry（id 根据 baseUrl+model 派生） */
 export function buildProviderEntry(
-  input: { label: string; baseUrl: string; model: string; tags: string },
+  input: { label: string; baseUrl: string; model: string },
   now = Date.now(),
 ): ProviderEntry {
   const baseUrl = input.baseUrl.trim();
   const model = input.model.trim();
   const id = makeProviderId(baseUrl, model);
-  const tags = input.tags
-    .split(/\s+/)
-    .map((t) => t.trim())
-    .filter(Boolean);
+  const label = input.label.trim();
   return {
     id,
-    label: input.label.trim(),
+    label,
     baseUrl,
     model,
     apiKeyRef: id,
     enabled: true,
-    accountGroup: new URL(baseUrl).hostname.split('.').slice(-2, -1)[0],
-    tags: tags.length ? tags : undefined,
+    accountGroup: accountGroupFromBaseUrl(baseUrl),
     createdAt: now,
   };
+}
+
+function accountGroupFromBaseUrl(baseUrl: string): string | undefined {
+  try {
+    return new URL(baseUrl).hostname.split('.').slice(-2, -1)[0];
+  } catch {
+    return undefined;
+  }
 }
 
 // ============ DOM 生命周期 ============
@@ -196,7 +244,6 @@ export async function initProvidersTab(): Promise<void> {
   const baseEl = byId<HTMLInputElement>('pfBaseUrl');
   const modelEl = byId<HTMLInputElement>('pfModel');
   const keyEl = byId<HTMLInputElement>('pfApiKey');
-  const tagsEl = byId<HTMLInputElement>('pfTags');
   const rmFailover = byId<HTMLInputElement>('rmFailover');
   const rmSmart = byId<HTMLInputElement>('rmSmart');
   const prefSlider = byId<HTMLInputElement>('prefSlider');
@@ -215,8 +262,8 @@ export async function initProvidersTab(): Promise<void> {
 
   function updateRoutingHint(mode: RoutingMode) {
     routingHint.textContent = mode === 'failover'
-      ? '主从等价于现有行为：primary → secondary 顺序回退。'
-      : '智能按 speed/quality/load/stability 综合评分动态选最优 provider。';
+      ? tr('providers.routingHintFailover')
+      : tr('providers.routingHintSmart');
   }
   function updatePrefVisibility(mode: RoutingMode) {
     prefRow.style.opacity = mode === 'smart' ? '1' : '0.45';
@@ -226,6 +273,9 @@ export async function initProvidersTab(): Promise<void> {
   async function saveRouting() {
     const mode: RoutingMode = rmSmart.checked ? 'smart' : 'failover';
     const preference = parseInt(prefSlider.value, 10) / 100;
+    if (mode !== routing.mode) {
+      log.info('routing.mode.change', { from: routing.mode, to: mode });
+    }
     await setRoutingSettings({ ...routing, mode, preference });
     routing.mode = mode;
     routing.preference = preference;
@@ -240,13 +290,16 @@ export async function initProvidersTab(): Promise<void> {
   });
   prefSlider.addEventListener('change', saveRouting);
 
+  // 每个卡片有自己内嵌的编辑表单；editingId 只用来保证"同一时刻最多一张卡处于编辑态"
+  let editingId: string | null = null;
+
   async function refresh() {
+    if (editingId) return;  // 编辑中不 refresh，避免把用户输入冲掉
     const providers = await listProviders();
     if (!providers.length) {
-      listEl.innerHTML = '<div class="stats-empty">尚无 provider，点上方按钮新增一条。</div>';
+      listEl.innerHTML = `<div class="stats-empty">${tr('providers.empty')}</div>`;
       return;
     }
-    // 并发拉取每个 provider 的 key/capability/circuit
     const cards = await Promise.all(
       providers.map(async (p) => {
         const [apiKey, capability, circuit] = await Promise.all([
@@ -258,119 +311,173 @@ export async function initProvidersTab(): Promise<void> {
       }),
     );
     listEl.innerHTML = cards.join('');
+    applyI18n(listEl);  // 把新渲染的 data-i18n 节点翻译掉
   }
 
-  let editingId: string | null = null;
-
-  function resetForm() {
+  function resetAddForm() {
     labelEl.value = '';
     baseEl.value = '';
     modelEl.value = '';
     keyEl.value = '';
-    tagsEl.value = '';
     errEl.style.display = 'none';
     errEl.textContent = '';
-    // 退出编辑模式：解锁 baseUrl/model
-    baseEl.readOnly = false;
-    modelEl.readOnly = false;
-    keyEl.placeholder = 'sk-...';
-    saveBtn.textContent = '保存';
-    editingId = null;
   }
 
-  function showForm(show: boolean) {
+  function showAddForm(show: boolean) {
     form.style.display = show ? '' : 'none';
     addBtn.style.display = show ? 'none' : '';
     if (show) labelEl.focus();
   }
 
-  async function enterEditMode(id: string) {
-    const p = (await listProviders()).find((x) => x.id === id);
-    if (!p) return;
-    resetForm();
-    editingId = id;
-    labelEl.value = p.label;
-    baseEl.value = p.baseUrl;
-    modelEl.value = p.model;
-    tagsEl.value = (p.tags || []).join(' ');
-    keyEl.value = '';
-    // baseUrl + model 锁住：改了会变 provider id，等于删旧建新 —— 让用户显式删除重建
-    baseEl.readOnly = true;
-    modelEl.readOnly = true;
-    keyEl.placeholder = '留空则保留原 key';
-    saveBtn.textContent = '更新';
-    showForm(true);
-  }
-
   addBtn.addEventListener('click', () => {
-    resetForm();
-    showForm(true);
+    cancelInlineEdit();
+    resetAddForm();
+    showAddForm(true);
   });
   cancelBtn.addEventListener('click', () => {
-    resetForm();
-    showForm(false);
+    resetAddForm();
+    showAddForm(false);
   });
 
+  // ===== 新增 provider（顶部共享表单）=====
   saveBtn.addEventListener('click', async () => {
     const input = {
       label: labelEl.value,
       baseUrl: baseEl.value,
       model: modelEl.value,
       apiKey: keyEl.value,
-      tags: tagsEl.value,
     };
-    const err = validateProviderForm(input, { requireApiKey: !editingId });
+    const err = validateProviderForm(input);
     if (err) {
       errEl.textContent = err;
       errEl.className = 'status error';
       errEl.style.display = '';
       return;
     }
-    if (editingId) {
-      // 编辑：只更新 label/tags/apiKey；保留 id/baseUrl/model/enabled/accountGroup/createdAt
-      const all = await listProviders();
-      const existing = all.find((p) => p.id === editingId);
-      if (!existing) {
-        errEl.textContent = '该 provider 已被删除，无法更新';
-        errEl.className = 'status error';
-        errEl.style.display = '';
-        return;
-      }
-      const tagsArr = input.tags.split(/\s+/).map((t) => t.trim()).filter(Boolean);
-      await upsertProvider({
-        ...existing,
-        label: input.label.trim(),
-        tags: tagsArr.length ? tagsArr : undefined,
-      });
-      if (input.apiKey.trim()) {
-        await setApiKey(editingId, input.apiKey.trim());
-      }
-    } else {
-      const entry = buildProviderEntry(input);
-      await upsertProvider(entry);
-      await setApiKey(entry.id, input.apiKey.trim());
-    }
-    resetForm();
-    showForm(false);
+    const entry = buildProviderEntry(input);
+    log.info('providers.add', { id: entry.id, model: entry.model, baseUrl: entry.baseUrl });
+    await upsertProvider(entry);
+    await setApiKey(entry.id, input.apiKey.trim());
+    resetAddForm();
+    showAddForm(false);
     await refresh();
   });
 
+  // ===== 行内编辑：在卡片自身展开编辑表单 =====
+  function enterInlineEdit(card: HTMLElement, id: string) {
+    showAddForm(false);
+    cancelInlineEdit();
+    editingId = id;
+    card.classList.add('is-editing');
+    card.setAttribute('draggable', 'false');
+    const view = card.querySelector<HTMLDivElement>('.provider-card__view');
+    const edit = card.querySelector<HTMLDivElement>('.provider-card__edit');
+    if (view) view.style.display = 'none';
+    if (edit) {
+      edit.style.display = '';
+      const labelInput = edit.querySelector<HTMLInputElement>('[data-edit-field="label"]');
+      labelInput?.focus();
+      labelInput?.select();
+    }
+  }
+
+  function cancelInlineEdit() {
+    if (!editingId) return;
+    const card = listEl.querySelector<HTMLElement>(`.provider-card[data-provider-id="${CSS.escape(editingId)}"]`);
+    if (card) {
+      card.classList.remove('is-editing');
+      card.setAttribute('draggable', 'true');
+      const view = card.querySelector<HTMLDivElement>('.provider-card__view');
+      const edit = card.querySelector<HTMLDivElement>('.provider-card__edit');
+      if (view) view.style.display = '';
+      if (edit) edit.style.display = 'none';
+      const errBox = card.querySelector<HTMLDivElement>('[data-role="edit-error"]');
+      if (errBox) {
+        errBox.style.display = 'none';
+        errBox.textContent = '';
+      }
+      const keyInput = card.querySelector<HTMLInputElement>('[data-edit-field="apiKey"]');
+      if (keyInput) keyInput.value = '';
+    }
+    editingId = null;
+  }
+
+  async function saveInlineEdit(card: HTMLElement, id: string) {
+    const labelInput = card.querySelector<HTMLInputElement>('[data-edit-field="label"]');
+    const baseInput = card.querySelector<HTMLInputElement>('[data-edit-field="baseUrl"]');
+    const modelInput = card.querySelector<HTMLInputElement>('[data-edit-field="model"]');
+    const keyInput = card.querySelector<HTMLInputElement>('[data-edit-field="apiKey"]');
+    const errBox = card.querySelector<HTMLDivElement>('[data-role="edit-error"]');
+    if (!labelInput || !baseInput || !modelInput || !keyInput || !errBox) return;
+
+    const existing = (await listProviders()).find((p) => p.id === id);
+    if (!existing) {
+      errBox.textContent = '该模型已被删除，无法更新';
+      errBox.style.display = '';
+      return;
+    }
+
+    const input = {
+      label: labelInput.value,
+      baseUrl: baseInput.value,
+      model: modelInput.value,
+      apiKey: keyInput.value,
+    };
+    const err = validateProviderForm(input, { requireApiKey: false });
+    if (err) {
+      errBox.textContent = err;
+      errBox.style.display = '';
+      return;
+    }
+
+    // id 保持稳定（存 apiKey / capability / circuit 的 key 都用它），baseUrl/model 原地改
+    const newBaseUrl = input.baseUrl.trim();
+    const newModel = input.model.trim();
+    const baseUrlChanged = newBaseUrl !== existing.baseUrl;
+    await upsertProvider({
+      ...existing,
+      label: input.label.trim(),
+      baseUrl: newBaseUrl,
+      model: newModel,
+      accountGroup: baseUrlChanged ? accountGroupFromBaseUrl(newBaseUrl) : existing.accountGroup,
+    });
+    if (input.apiKey.trim()) {
+      await setApiKey(id, input.apiKey.trim());
+    }
+    editingId = null;
+    await refresh();
+  }
+
+  // ===== 卡片事件委托：按钮动作 =====
   listEl.addEventListener('click', async (ev) => {
     const target = ev.target as HTMLElement;
     const action = target.getAttribute?.('data-action');
     if (!action) return;
     const card = target.closest<HTMLElement>('.provider-card');
     const id = card?.getAttribute('data-provider-id');
-    if (!id) return;
+    if (!card || !id) return;
 
     if (action === 'delete') {
-      if (!confirm('确定删除？该 provider 的 API key / 画像 / 熔断记录都会清掉。')) return;
+      if (!confirm(tr('providers.deleteConfirm'))) return;
+      if (editingId === id) editingId = null;
+      log.info('providers.delete', { id });
       await deleteProviderRec(id);
       await refresh();
       return;
     }
     if (action === 'edit') {
-      await enterEditMode(id);
+      log.debug('providers.edit.open', { id });
+      enterInlineEdit(card, id);
+      return;
+    }
+    if (action === 'edit-save') {
+      log.info('providers.edit.save', { id });
+      await saveInlineEdit(card, id);
+      return;
+    }
+    if (action === 'edit-cancel') {
+      log.debug('providers.edit.cancel', { id });
+      cancelInlineEdit();
       return;
     }
     if (action === 'toggle') {
@@ -378,14 +485,77 @@ export async function initProvidersTab(): Promise<void> {
       const p = all.find((x) => x.id === id);
       if (!p) return;
       p.enabled = !p.enabled;
+      log.info('providers.toggle', { id, enabled: p.enabled });
       await upsertProvider(p);
       await refresh();
       return;
     }
     if (action === 'test') {
-      runTest(card!, id);
+      log.info('providers.test.start', { id });
+      runTest(card, id);
       return;
     }
+  });
+
+  // ===== 拖拽重排：改 providers[] 数组顺序后持久化 =====
+  listEl.addEventListener('dragstart', (ev) => {
+    const card = (ev.target as HTMLElement).closest<HTMLElement>('.provider-card');
+    if (!card || card.classList.contains('is-editing')) {
+      ev.preventDefault();
+      return;
+    }
+    const id = card.dataset.providerId;
+    if (!id || !ev.dataTransfer) return;
+    ev.dataTransfer.effectAllowed = 'move';
+    ev.dataTransfer.setData('text/plain', id);
+    card.classList.add('is-dragging');
+  });
+
+  listEl.addEventListener('dragend', () => {
+    listEl.querySelectorAll('.provider-card.is-dragging').forEach((c) => c.classList.remove('is-dragging'));
+    listEl.querySelectorAll('.provider-card.drop-before,.provider-card.drop-after').forEach((c) => {
+      c.classList.remove('drop-before', 'drop-after');
+    });
+  });
+
+  listEl.addEventListener('dragover', (ev) => {
+    const card = (ev.target as HTMLElement).closest<HTMLElement>('.provider-card');
+    if (!card) return;
+    ev.preventDefault();
+    if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'move';
+    const rect = card.getBoundingClientRect();
+    const insertAfter = ev.clientY > rect.top + rect.height / 2;
+    listEl.querySelectorAll('.provider-card.drop-before,.provider-card.drop-after').forEach((c) => {
+      if (c !== card) c.classList.remove('drop-before', 'drop-after');
+    });
+    card.classList.toggle('drop-before', !insertAfter);
+    card.classList.toggle('drop-after', insertAfter);
+  });
+
+  listEl.addEventListener('drop', async (ev) => {
+    ev.preventDefault();
+    const srcId = ev.dataTransfer?.getData('text/plain');
+    const targetCard = (ev.target as HTMLElement).closest<HTMLElement>('.provider-card');
+    listEl.querySelectorAll('.provider-card.drop-before,.provider-card.drop-after').forEach((c) => {
+      c.classList.remove('drop-before', 'drop-after');
+    });
+    if (!srcId || !targetCard) return;
+    const targetId = targetCard.dataset.providerId;
+    if (!targetId || targetId === srcId) return;
+    const rect = targetCard.getBoundingClientRect();
+    const insertAfter = ev.clientY > rect.top + rect.height / 2;
+
+    const list = await listProviders();
+    const moved = list.find((p) => p.id === srcId);
+    if (!moved) return;
+    const withoutSrc = list.filter((p) => p.id !== srcId);
+    const tgtIdx = withoutSrc.findIndex((p) => p.id === targetId);
+    if (tgtIdx < 0) return;
+    const insertAt = insertAfter ? tgtIdx + 1 : tgtIdx;
+    withoutSrc.splice(insertAt, 0, moved);
+    log.info('providers.reorder', { srcId, targetId, insertAfter, insertAt });
+    await saveProviders(withoutSrc);
+    await refresh();
   });
 
   function runTest(card: HTMLElement, providerId: string) {
@@ -420,7 +590,6 @@ export async function initProvidersTab(): Promise<void> {
           `<div class="sample-line"><span class="pill pill--ok">✓</span> <span>完成（${Math.round(msg.totalRttMs / 1000)}s）</span></div>`,
         );
         cleanup();
-        // 刷新卡片以应用新 capability pills
         setTimeout(() => { refresh().catch(() => {}); }, 600);
       } else if (msg.type === 'error') {
         finished = true;
