@@ -429,27 +429,42 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
    * （锚点位置变了 → scrollY 跟着调整一段，用户视觉上看到几十像素的反弹）。
    * 用 overflow-anchor:none 一帧关掉 scroll anchor，下一帧恢复。窗口期 ~16ms，X 自身
    * 的滚动行为受影响极小。
+   *
+   * 用引用计数避免并发场景下的 race —— 滚动期间多个 article 同时触发 cache-restore
+   * 时，朴素的 save/restore 会让外层 RAF 误把内层捕获的 'none' 当作"原值"恢复，
+   * 导致 anchor 永久停留在 'none'。
    */
+  let scrollAnchorDepth = 0;
+  let scrollAnchorOriginal = '';
   function withoutScrollAnchorOneFrame<T>(fn: () => T): T {
     const root = document.documentElement;
-    const prev = root.style.overflowAnchor;
-    root.style.overflowAnchor = 'none';
+    if (scrollAnchorDepth === 0) {
+      scrollAnchorOriginal = root.style.overflowAnchor;
+      root.style.overflowAnchor = 'none';
+    }
+    scrollAnchorDepth++;
     try {
       return fn();
     } finally {
-      requestAnimationFrame(() => { root.style.overflowAnchor = prev; });
+      requestAnimationFrame(() => {
+        scrollAnchorDepth--;
+        if (scrollAnchorDepth === 0) root.style.overflowAnchor = scrollAnchorOriginal;
+      });
     }
+  }
+
+  /** 通吃所有候选位置的 dict span：tweetText + 克隆块 + lineFusion 原文行。 */
+  function clearAllDictTargets(article: Element, fallback: Element): void {
+    clearDictionaryAnnotations(fallback);
+    article.querySelectorAll<HTMLElement>('.dualang-translation .dualang-original-html')
+      .forEach((el) => clearDictionaryAnnotations(el));
+    article.querySelectorAll<HTMLElement>('.dualang-line-fusion-orig')
+      .forEach((el) => clearDictionaryAnnotations(el));
   }
 
   function applyDictWithBaseline(article: Element, fallback: Element, entries: DictEntry[]): void {
     withoutScrollAnchorOneFrame(() => {
-      // 清残留：旧 mode 下打过字典 → 切到新 mode → 老位置的 span 得先扫干净
-      clearDictionaryAnnotations(fallback);
-      article.querySelectorAll<HTMLElement>('.dualang-translation .dualang-original-html')
-        .forEach((el) => clearDictionaryAnnotations(el));
-      article.querySelectorAll<HTMLElement>('.dualang-line-fusion-orig')
-        .forEach((el) => clearDictionaryAnnotations(el));
-      // 按当前 mode 决定目标，注入
+      clearAllDictTargets(article, fallback);
       const targets = dictTargetEls(article, fallback);
       for (const t of targets) applyDictionaryAnnotations(t, entries);
       ensureState(article as TweetArticle).lastText = fallback.textContent || '';
@@ -458,12 +473,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
 
   function clearDictWithBaseline(article: Element, fallback: Element): void {
     withoutScrollAnchorOneFrame(() => {
-      // clear 通吃：tweetText + 所有克隆块 + lineFusion 原文行都清一遍（防 mode 切换后残留）
-      clearDictionaryAnnotations(fallback);
-      article.querySelectorAll<HTMLElement>('.dualang-translation .dualang-original-html')
-        .forEach((el) => clearDictionaryAnnotations(el));
-      article.querySelectorAll<HTMLElement>('.dualang-line-fusion-orig')
-        .forEach((el) => clearDictionaryAnnotations(el));
+      clearAllDictTargets(article, fallback);
       ensureState(article as TweetArticle).lastText = fallback.textContent || '';
     });
   }
@@ -838,9 +848,8 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
 
     if (isRecycled) return;
 
-    // 真正的 Show more / 文本变化：立即翻译
-    // 不再 delete contentId 缓存：multi-variant 设计下旧文本的 variant 仍然有效
-    // （DOM 若回到旧文本能命中），新文本翻完会追加 variant。dictCache 同理保持。
+    // 真正的 Show more / 文本变化：立即翻译。
+    // 旧文本 variant 留在 cache 里：DOM 若再回到旧文本能直接命中，无需作废。
     telemetry.inc("showMoreDetected");
     clearDictWithBaseline(article, tweetTextEl);
     perfLog('showMore', {

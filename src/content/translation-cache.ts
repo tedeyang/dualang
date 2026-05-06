@@ -77,9 +77,12 @@ export function createTranslationCache(opts?: {
       }
     },
     delete(contentId: string): void { map.delete(contentId); },
-    /** 仅供测试。 */
-    _size(): number { return map.size; },
-    _bucket(contentId: string): CachedBucket | undefined { return map.get(contentId); },
+    /** 仅供测试用：返回 contentId 桶内变体数量；活的 bucket 不暴露，避免外部改坏内部状态。 */
+    __test_variantCount(contentId: string): number {
+      return map.get(contentId)?.variants.length ?? 0;
+    },
+    /** 仅供测试用：当前桶总数。 */
+    __test_size(): number { return map.size; },
   };
 }
 

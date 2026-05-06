@@ -19,7 +19,7 @@ describe('translationCache (multi-variant)', () => {
 
     expect(c.match('tweet1', 'truncated text')?.translated).toBe('short');
     expect(c.match('tweet1', 'full longer text!!')?.translated).toBe('long');
-    expect(c._bucket('tweet1')?.variants.length).toBe(2);
+    expect(c.__test_variantCount('tweet1')).toBe(2);
   });
 
   it('upsert — same original replaces in place, no extra variant', () => {
@@ -28,7 +28,7 @@ describe('translationCache (multi-variant)', () => {
     c.set('id1', { translated: 'new', original: 'A', model: 'm2' });
     expect(c.match('id1', 'A')?.translated).toBe('new');
     expect(c.match('id1', 'A')?.model).toBe('m2');
-    expect(c._bucket('id1')?.variants.length).toBe(1);
+    expect(c.__test_variantCount('id1')).toBe(1);
   });
 
   it('per-bucket LRU — over variantsPerId pops the oldest', () => {
@@ -38,7 +38,7 @@ describe('translationCache (multi-variant)', () => {
     }
     expect(c.match('id1', 'A')).toBeUndefined();          // 最旧被弹
     expect(c.match('id1', 'D')?.translated).toBe('T_D');
-    expect(c._bucket('id1')?.variants.length).toBe(3);
+    expect(c.__test_variantCount('id1')).toBe(3);
   });
 
   it('any() returns the most recently appended variant', () => {
@@ -57,7 +57,7 @@ describe('translationCache (multi-variant)', () => {
       expect(c.match('id1', 'A')?.translated).toBe('T');
       vi.advanceTimersByTime(600);
       expect(c.match('id1', 'A')).toBeUndefined();
-      expect(c._bucket('id1')).toBeUndefined();
+      expect(c.__test_variantCount('id1')).toBe(0);
     } finally {
       vi.useRealTimers();
     }
@@ -71,7 +71,7 @@ describe('translationCache (multi-variant)', () => {
     c.set('id4', { translated: 'T4', original: 'A' });   // id1 应被弹
     expect(c.match('id1', 'A')).toBeUndefined();
     expect(c.match('id4', 'A')?.translated).toBe('T4');
-    expect(c._size()).toBe(3);
+    expect(c.__test_size()).toBe(3);
   });
 
   it('repro of stale-loop bug: ping-pong between two variants never invalidates', () => {
@@ -94,7 +94,7 @@ describe('translationCache (multi-variant)', () => {
     }
     expect(hits).toBe(100);
     expect(misses).toBe(0);
-    expect(c._bucket('tweet')?.variants.length).toBe(2);
+    expect(c.__test_variantCount('tweet')).toBe(2);
   });
 
   it('delete drops the entire bucket', () => {
