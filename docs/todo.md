@@ -816,3 +816,23 @@ P54 落地后发现 popup 信息量爆炸（6 tabs，兜底+主从+流式+hedged
 - [ ] popup 自定义 prompt 编辑器缺"重置为默认"按钮
 - [ ] `config.change.<key>` 日志覆盖 11 个 key，还有零散的 routing / custom-prompts 变更未纳入，需统一走 storage.onChanged
 - [ ] Router status tab 展示的是静态快照，需要接实时推送或 3s 轮询
+
+---
+
+## P56: X.com Status 页滚动跳动 bug（部分修复，2026-05-06）
+
+**触发**：长 reply thread 上"滚到底 → 等翻完 → 上滚一页 → 等"出现自动滑回底；后续 cache 修复后仍有几十像素小跳。
+
+**已落地**：
+- [x] `src/content/translation-cache.ts` 新模块 + 9 条单测 —— 多 variant per contentId，根除"重翻 → DOM 重渲染 → 再重翻"死循环（auto-scroll-to-bottom 主因）
+- [x] `withoutScrollAnchorOneFrame()` 包裹 `applyDictWithBaseline` / `clearDictWithBaseline` / `reRenderAllForModeChange` / scanAndQueue cache-restore / handleShowMoreOrRecycle —— 我方 DOM 改动同帧禁用 scroll anchor，避开 anchor 反向补偿
+
+**未解决**：
+- [ ] X 自家虚拟化的 `css-175oi2r` 批量 attribute mutation 仍触发小幅 reflow 抖动（~几十 px），属浏览器 anchor 行为对 X 内部 DOM 改动的正常补偿，我们拦不住
+- [ ] 备选治本路径（按改动量从小到大）：bilingual 模式渲染隐藏 mirror tweetText 给 dict 用 / dict 改 hover tooltip / scroll lock when stationary
+
+**详细调查**：见 `docs/decisions/scroll-jump-investigation.md`（含探针脚本、Playwright cookie-inject 复现路径、走过的弯路）
+
+**commits**（待提交）：
+- `feat(cache): multi-variant translationCache to break stale-loop bug`
+- `fix(scroll): wrap DOM-mutating paths in overflow-anchor:none for one frame`

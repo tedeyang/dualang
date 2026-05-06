@@ -8,6 +8,7 @@ import { normalizeDisplayMode, type DisplayMode } from './display-mode';
 import { requestTranslationChunked } from './long-article-chunked';
 import { findAndPrepareGrokCards, GROK_DISCLAIMER_PREFIXES } from './grok-card';
 import { ctaTranslateNow, ctaCancel, detectDefaultUiLang, type UiLang } from '../shared/i18n';
+import { createTranslationCache } from './translation-cache';
 import { renderTranslation } from './render';
 import { isLikelyEnglishText, extractDictionaryCandidates, applyDictionaryAnnotations, clearDictionaryAnnotations, type DictEntry } from './smart-dict';
 import {
@@ -47,38 +48,8 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
   const pendingQueueSet = new Set<Element>();
   const translatingSet = new Set<Element>();
 
-  // 按内容 ID 缓存翻译结果（不依赖 DOM 引用，虚拟 DOM 回收后可恢复）
-  // 同时记录模型信息，以便 scanAndQueue 恢复时也能显示品牌图标
-  type TranslationCacheEntry = { translated: string; original: string; model?: string; baseUrl?: string; ts: number };
-  /**
-   * LRU + TTL 两道淘汰：
-   *   - 容量上限：触顶时淘汰最旧插入项（Map 自然保留插入序）
-   *   - TTL：get 命中但超龄视为 miss 并删除，长会话里老译文不会永远占位
-   * set 本身不会回写 ts；每次 set 都是新鲜的。
-   */
-  const translationCache = {
-    _map: new Map<string, TranslationCacheEntry>(),
-    get(key: string): TranslationCacheEntry | undefined {
-      const entry = this._map.get(key);
-      if (!entry) return undefined;
-      if (Date.now() - entry.ts > TRANSLATION_CACHE_TTL_MS) {
-        this._map.delete(key);
-        return undefined;
-      }
-      return entry;
-    },
-    has(key: string): boolean {
-      return this.get(key) !== undefined;
-    },
-    set(key: string, value: Omit<TranslationCacheEntry, 'ts'>) {
-      this._map.set(key, { ...value, ts: Date.now() });
-      if (this._map.size > TRANSLATION_CACHE_MAX) {
-        const firstKey = this._map.keys().next().value!;
-        this._map.delete(firstKey);
-      }
-    },
-    delete(key: string) { this._map.delete(key); },
-  };
+  // 按 contentId 分桶、桶内多 variant 的翻译缓存。详见 translation-cache.ts。
+  const translationCache = createTranslationCache();
   type DictCacheEntry = { entries: DictEntry[]; ts: number };
   // 与 translationCache 同结构：TTL 过期 + 超出 MAX 时淘汰最旧（Map 迭代顺序即插入顺序）。
   // 之前无上限 —— 长会话滚动会无声地把 Map 撑到数万条。
@@ -405,14 +376,16 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     let reRendered = 0;
     for (const article of roots) {
       const contentId = getContentId(article);
-      const entry = contentId ? translationCache.get(contentId) : undefined;
+      const entry = contentId ? translationCache.any(contentId) : undefined;
       if (!entry) continue;
       const tweetTextEl = findTweetTextEl(article);
       if (!tweetTextEl) continue;
-      article.querySelector('.dualang-translation')?.remove();
-      article.removeAttribute('data-dualang-mode');
-      article.removeAttribute('data-dualang-line-fusion');
-      renderTranslationLocal(article, tweetTextEl, entry.translated, entry.original);
+      withoutScrollAnchorOneFrame(() => {
+        article.querySelector('.dualang-translation')?.remove();
+        article.removeAttribute('data-dualang-mode');
+        article.removeAttribute('data-dualang-line-fusion');
+        renderTranslationLocal(article, tweetTextEl, entry.translated, entry.original);
+      });
       if (smartDictEnabled) {
         void maybeApplySmartDictionary(article, tweetTextEl, entry.original, contentId || undefined);
       } else {
@@ -451,27 +424,48 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
    * 同时在 apply 时先清掉所有候选位置（tweetText + 所有克隆块）的残留 span ——
    * mode 切换后旧位置可能有遗留。
    */
+  /**
+   * dict span 注入会改变 tweetText 行宽/行数，触发 Chrome scroll anchor 的"补偿"位移
+   * （锚点位置变了 → scrollY 跟着调整一段，用户视觉上看到几十像素的反弹）。
+   * 用 overflow-anchor:none 一帧关掉 scroll anchor，下一帧恢复。窗口期 ~16ms，X 自身
+   * 的滚动行为受影响极小。
+   */
+  function withoutScrollAnchorOneFrame<T>(fn: () => T): T {
+    const root = document.documentElement;
+    const prev = root.style.overflowAnchor;
+    root.style.overflowAnchor = 'none';
+    try {
+      return fn();
+    } finally {
+      requestAnimationFrame(() => { root.style.overflowAnchor = prev; });
+    }
+  }
+
   function applyDictWithBaseline(article: Element, fallback: Element, entries: DictEntry[]): void {
-    // 清残留：旧 mode 下打过字典 → 切到新 mode → 老位置的 span 得先扫干净
-    clearDictionaryAnnotations(fallback);
-    article.querySelectorAll<HTMLElement>('.dualang-translation .dualang-original-html')
-      .forEach((el) => clearDictionaryAnnotations(el));
-    article.querySelectorAll<HTMLElement>('.dualang-line-fusion-orig')
-      .forEach((el) => clearDictionaryAnnotations(el));
-    // 按当前 mode 决定目标，注入
-    const targets = dictTargetEls(article, fallback);
-    for (const t of targets) applyDictionaryAnnotations(t, entries);
-    ensureState(article as TweetArticle).lastText = fallback.textContent || '';
+    withoutScrollAnchorOneFrame(() => {
+      // 清残留：旧 mode 下打过字典 → 切到新 mode → 老位置的 span 得先扫干净
+      clearDictionaryAnnotations(fallback);
+      article.querySelectorAll<HTMLElement>('.dualang-translation .dualang-original-html')
+        .forEach((el) => clearDictionaryAnnotations(el));
+      article.querySelectorAll<HTMLElement>('.dualang-line-fusion-orig')
+        .forEach((el) => clearDictionaryAnnotations(el));
+      // 按当前 mode 决定目标，注入
+      const targets = dictTargetEls(article, fallback);
+      for (const t of targets) applyDictionaryAnnotations(t, entries);
+      ensureState(article as TweetArticle).lastText = fallback.textContent || '';
+    });
   }
 
   function clearDictWithBaseline(article: Element, fallback: Element): void {
-    // clear 通吃：tweetText + 所有克隆块 + lineFusion 原文行都清一遍（防 mode 切换后残留）
-    clearDictionaryAnnotations(fallback);
-    article.querySelectorAll<HTMLElement>('.dualang-translation .dualang-original-html')
-      .forEach((el) => clearDictionaryAnnotations(el));
-    article.querySelectorAll<HTMLElement>('.dualang-line-fusion-orig')
-      .forEach((el) => clearDictionaryAnnotations(el));
-    ensureState(article as TweetArticle).lastText = fallback.textContent || '';
+    withoutScrollAnchorOneFrame(() => {
+      // clear 通吃：tweetText + 所有克隆块 + lineFusion 原文行都清一遍（防 mode 切换后残留）
+      clearDictionaryAnnotations(fallback);
+      article.querySelectorAll<HTMLElement>('.dualang-translation .dualang-original-html')
+        .forEach((el) => clearDictionaryAnnotations(el));
+      article.querySelectorAll<HTMLElement>('.dualang-line-fusion-orig')
+        .forEach((el) => clearDictionaryAnnotations(el));
+      ensureState(article as TweetArticle).lastText = fallback.textContent || '';
+    });
   }
 
   function normalizeDictionaryEntries(raw: any): DictEntry[] {
@@ -564,7 +558,7 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       // 新 article 会在后续翻译完成时正常走 maybeApplySmartDictionary 的 API 路径。
       const contentId = getContentId(article);
       if (!contentId) continue;
-      const entry = translationCache.get(contentId);
+      const entry = translationCache.any(contentId);
       if (!entry) continue;
       if (!isLikelyEnglishText(entry.original)) continue;
       const cached = dictCache.get(dictCache.key(contentId, entry.original));
@@ -819,31 +813,35 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
     const prevContentId = getState(article)?.contentId;
     const isRecycled = !!(prevContentId && currentContentId && prevContentId !== currentContentId);
 
-    // 统一清理旧状态
-    article.querySelector('.dualang-translation')?.remove();
-    article.querySelector('.dualang-btn')?.remove();
-    // data-dualang-mode 控制着 CSS 对原文 tweetText 的显隐；移除旧 card 时必须同步摘掉，
-    // 否则 translation-only/inline/bilingual 模式下原文仍被 CSS 隐藏、card 也没了，
-    // article 高度瞬间塌到 0，等翻译回来再撑起来 —— 两次跳变导致页面上移。
-    article.removeAttribute('data-dualang-mode');
-    hideStatus(article, true);
-    translatingSet.delete(article);
-    processedTweets.delete(article);
-    // 新内容 / 新推文 —— 质量重试额度重置，允许它们独立触发一次重试
-    delete ensureState(article).qualityRetried;
+    // 统一清理旧状态。card 移除会让 article 高度突降 ~80px，触发 anchor 补偿
+    // （scrollY 跟着减、视觉上下方内容上移）。把移除 + 后续 rescan 裹一帧 anchor 关闭，
+    // 避开补偿。recycle 路径里 scanAndQueue 命中 cache 立即重新插入卡片，
+    // 在同一帧内完成"删 + 插"高度变化大致互抵，对 scroll anchor 几乎无感。
+    withoutScrollAnchorOneFrame(() => {
+      article.querySelector('.dualang-translation')?.remove();
+      article.querySelector('.dualang-btn')?.remove();
+      // data-dualang-mode 控制着 CSS 对原文 tweetText 的显隐；移除旧 card 时必须同步摘掉，
+      // 否则 translation-only/inline/bilingual 模式下原文仍被 CSS 隐藏、card 也没了，
+      // article 高度瞬间塌到 0，等翻译回来再撑起来 —— 两次跳变导致页面上移。
+      article.removeAttribute('data-dualang-mode');
+      hideStatus(article, true);
+      translatingSet.delete(article);
+      processedTweets.delete(article);
+      // 新内容 / 新推文 —— 质量重试额度重置，允许它们独立触发一次重试
+      delete ensureState(article).qualityRetried;
 
-    if (isRecycled) {
-      perfLog('domRecycle', { prevContentId, currentContentId });
-      scanAndQueue(article); // 回收：立即按新推文处理（命中 translationCache 时直接恢复）
-      return;
-    }
+      if (isRecycled) {
+        perfLog('domRecycle', { prevContentId, currentContentId });
+        scanAndQueue(article); // 回收：立即按新推文处理（命中 translationCache 时直接恢复）
+      }
+    });
+
+    if (isRecycled) return;
 
     // 真正的 Show more / 文本变化：立即翻译
+    // 不再 delete contentId 缓存：multi-variant 设计下旧文本的 variant 仍然有效
+    // （DOM 若回到旧文本能命中），新文本翻完会追加 variant。dictCache 同理保持。
     telemetry.inc("showMoreDetected");
-    if (currentContentId) {
-      translationCache.delete(currentContentId);
-      dictCache.dropByContentId(currentContentId);
-    }
     clearDictWithBaseline(article, tweetTextEl);
     perfLog('showMore', {
       contentId: currentContentId,
@@ -1012,40 +1010,29 @@ type TranslateMeta = { model?: string; baseUrl?: string; tokens?: number; fromCa
       const tweetTextEl = findTweetTextEl(article);
       if (tweetTextEl) state.lastText = tweetTextEl.textContent || '';
 
-      // 虚拟 DOM 回收后重现：尝试从内容 ID 缓存恢复翻译
-      if (contentId && !article.querySelector('.dualang-translation')) {
-        const cached = translationCache.get(contentId);
-        if (cached && tweetTextEl) {
-          // 精确匹配原文：内容 ID 是稳定的但内容可能被编辑/扩展/更新，
-          // 只有 extractText 输出与缓存完全一致时才信任缓存。
-          // 任何差异（编辑 / show-more 展开 / 截断→全文 / 引号空格变化）都作废缓存条目，
-          // 让它走下方正常排队流程，由 L2 文本哈希缓存按新文本命中或重新翻译。
-          const currentText = extractText(tweetTextEl);
-          const stale = !cached.original || currentText !== cached.original;
-          if (stale) {
-            translationCache.delete(contentId);
-            dictCache.dropByContentId(contentId);
-            logBiz('cache.invalidate.stale', {
-              contentId,
-              cachedLen: cached.original?.length,
-              currentLen: currentText.length,
-              reason: !cached.original ? 'no-baseline' : (currentText.length === cached.original.length ? 'edit' : 'length-diff'),
-            });
-            // 不 return，让它走后面的 Observer 注册
-          } else {
+      // 虚拟 DOM 回收后重现：按当前文本精确匹配 variant 即可还原。
+      // 多 variant cache 让截断态/完整态/编辑态共存，无需主动 invalidate ——
+      // 不命中就走下方正常排队流程，新 variant 翻完会追加。
+      if (contentId && tweetTextEl && !article.querySelector('.dualang-translation')) {
+        const currentText = extractText(tweetTextEl);
+        const cached = translationCache.match(contentId, currentText);
+        if (cached) {
+          // 卡片插入会让 article 高度增加 ~card 高，触发 anchor 补偿（scrollY 顶动几十像素）。
+          // 把插入裹一帧，避开 anchor 调整。
+          withoutScrollAnchorOneFrame(() => {
             renderTranslationLocal(article, tweetTextEl, cached.translated, cached.original);
-            if (smartDictEnabled) {
-              void maybeApplySmartDictionary(article, tweetTextEl, cached.original, contentId);
-            } else {
-              clearDictWithBaseline(article, tweetTextEl);
-            }
-            showSuccess(article, {
-              model: cached.model, baseUrl: cached.baseUrl, fromCache: true,
-            });
-            cacheRestored++;
-            newlyRegistered++;
-            return; // 已恢复，不注册 Observer
+          });
+          if (smartDictEnabled) {
+            void maybeApplySmartDictionary(article, tweetTextEl, cached.original, contentId);
+          } else {
+            clearDictWithBaseline(article, tweetTextEl);
           }
+          showSuccess(article, {
+            model: cached.model, baseUrl: cached.baseUrl, fromCache: true,
+          });
+          cacheRestored++;
+          newlyRegistered++;
+          return; // 已恢复，不注册 Observer
         }
       }
 
